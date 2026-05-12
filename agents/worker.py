@@ -43,6 +43,7 @@ class RunResponse(BaseModel):
     summary: str
     output: str
     content: str
+    images: list[str] = []
 
 
 @app.get("/health")
