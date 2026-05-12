@@ -7,35 +7,44 @@ CEO（你）只需通过看板或飞书下达方向，剩余全部由 AI 自动�
 
 ## 架构概览
 
+> 详细架构设计见 [ARCHITECTURE.md](ARCHITECTURE.md)
+
+**技术栈：** FastAPI + Celery + Redis + PostgreSQL + Vue 3
+
 ```
-~/work/company/          ← 本仓库（公司层）
+~/work/company/              ← 本仓库（公司层）
 ~/work/projects/robot-dog/   ← 项目层（CAD/固件/仿真等输出物）
 ```
 
 ```
-                    ┌─────────────────────┐
-  你（CEO）──────▶  │  看板 :8888          │  ◀── 飞书群
-                    │  dashboard.py        │
-                    └──────────┬──────────┘
-                               │ POST /run
-                    ┌──────────▼──────────┐
-                    │  Agent Worker :8080  │
-                    │  agents/worker.py    │
-                    └──────────┬──────────┘
-                               │
-              ┌────────────────┼──────────────┐
-              ▼                ▼              ▼
-         Claude API      Claude API     Claude API
-         (机械工程师)    (固件工程师)   (算法工程师) …
-              │                │              │
-              └────────────────┴──────────────┘
-                               │
-                    ┌──────────▼──────────┐
-                    │  Mattermost :8065    │  ← 状态/审批推送
-                    │  Gitea :3000         │  ← 代码仓库
-                    │  n8n :5678           │  ← 自动化流程
-                    │  PostgreSQL :5432    │  ← 数据存储
-                    └─────────────────────┘
+  你（CEO）
+     │
+     ├── 浏览器 ──▶  frontend/ (Vue3 :5173)
+     │                    │ REST + SSE
+     └── 飞书群 ──▶  feishu/ (:8089)
+                          │
+                    ┌─────▼──────────────────┐
+                    │  backend/ (FastAPI :8000)│
+                    │  /api/tasks             │
+                    │  /api/chat              │
+                    │  /api/events (SSE)      │
+                    └─────┬──────────┬────────┘
+                          │ Celery   │ SQLAlchemy
+                    ┌─────▼──────┐  ┌▼──────────┐
+                    │  Redis     │  │ PostgreSQL │
+                    │  (broker)  │  │ (状态持久化)│
+                    └─────┬──────┘  └───────────┘
+                          │ Celery tasks
+                    ┌─────▼──────────────────┐
+                    │  workers/ (Celery)      │
+                    │  PM→TechLead→Gate→      │
+                    │  机械+硬件→固件+算法→集成│
+                    └─────┬──────────────────┘
+                          │ POST /run
+                    ┌─────▼──────────────────┐
+                    │  agents/worker (:8080)  │
+                    │  Claude Code CLI agent  │
+                    └─────────────────────────┘
 ```
 
 ---
@@ -108,37 +117,54 @@ tail -f logs/feishu_bot.log    # 飞书机器人日志
 
 ```
 company/
+├── ARCHITECTURE.md           # 完整架构设计文档
 ├── start.sh                  # 一键启动脚本
 ├── stop.sh                   # 停止脚本
 ├── requirements.txt          # Python 依赖
 │
-├── agents/                   # Agent 层
-│   ├── worker.py             # FastAPI 服务，POST /run 分发任务
-│   ├── base.py               # Claude API 封装 + Mattermost 推送
-│   └── employees/            # 各员工 Agent 实现
-│       ├── mechanical.py     # 机械工程师
-│       ├── hardware.py       # 硬件工程师
-│       ├── firmware.py       # 固件工程师
-│       ├── algorithm.py      # 算法工程师
-│       ├── testing.py        # 测试工程师
-│       ├── cost.py           # 成本工程师
-│       ├── product_manager.py
-│       ├── project_manager.py
-│       └── tech_lead.py
+├── backend/                  # FastAPI 后端 (:8000)  ← 新
+│   ├── api/routes/           # tasks / employees / chat / events
+│   ├── core/                 # config + db
+│   ├── models/               # ORM (Task, TaskStep, ChatMessage)
+│   ├── schemas/              # Pydantic schema
+│   └── main.py
 │
-├── employees/                # 员工职责文档（用于 AI 角色提示）
-│   ├── management/           # product-manager / project-manager / tech-lead
-│   └── engineering/          # mechanical / hardware / firmware / …
+├── workers/                  # Celery worker  ← 新
+│   ├── celery_app.py         # Celery + Redis broker
+│   ├── pipeline.py           # chain/group/chord 流水线定义
+│   └── tasks/                # pm / techlead / engineering / integration
 │
-├── system/                   # 系统工具
-│   ├── dashboard.py          # 三栏看板服务（HTTP :8888）
-│   ├── feishu_bot.py         # 飞书 WebSocket 机器人
-│   └── feishu_register.py    # 飞书应用一键创建（扫码授权）
+├── feishu/                   # 飞书模块 (:8089)  ← 新
+│   ├── bot.py                # 事件接收 + /send 端点
+│   ├── sender.py             # 发消息/卡片
+│   └── commands/             # pipeline / approve / report / direct
+│
+├── frontend/                 # Vue 3 前端 (Vite :5173)  ← 新
+│   └── src/
+│       ├── views/            # ChatView / ProjectView
+│       ├── components/       # GroupChat / DirectChat / TaskBoard / Pipeline
+│       ├── stores/           # Pinia (tasks / chat)
+│       └── api/client.ts     # axios + SSE
+│
+├── agents/                   # Claude agent 封装（现有）
+│   ├── worker.py             # FastAPI /run (:8080)
+│   ├── base.py               # run_cli_agent()
+│   └── employees/            # 9 名员工实现
+│
+├── employees/                # 员工职责文档（现有）
+│   ├── management/
+│   └── engineering/
+│
+├── system/                   # 过渡期保留，迁移完成后退役
+│   ├── dashboard.py          # 现有看板 (:8888)
+│   ├── feishu_bot.py         # 现有飞书机器人
+│   └── feishu_register.py
 │
 └── infra/                    # 基础设施
-    ├── docker-compose.yml    # Postgres / Gitea / Mattermost / n8n
+    ├── docker-compose.yml    # postgres + redis (+ gitea/n8n/mattermost)
+    ├── alembic/              # DB migration  ← 新
     ├── .env                  # 密钥配置（不进 git）
-    └── .env.example          # 配置模板
+    └── .env.example
 ```
 
 ---
