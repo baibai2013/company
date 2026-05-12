@@ -45,7 +45,7 @@ feishu_bot.py
 | **状态持久化** | LangGraph checkpointer + PostgreSQL | graph state 持久化，重启断点恢复 |
 | **实时推送** | A2A SSE（Server-Sent Events） | 任务执行进度实时流回 |
 | **工具调用** | MCP（Model Context Protocol） | Claude Code CLI 工具接入（build123d、文件系统等） |
-| **LLM** | Claude Sonnet 4.6 | 所有员工共用，通过 `langchain_anthropic` 接入 |
+| **LLM** | Claude Sonnet 4.6（或第三方代理） | 通过 `langchain_anthropic` 接入；支持自定义 `base_url` 对接 OpenRouter / LiteLLM / 企业网关 |
 | **基础设施** | PostgreSQL + Redis | 状态存储 + 消息队列 |
 
 ### 2.1 三层协议分工
@@ -509,7 +509,82 @@ TechLead Supervisor (A2A :9000)
 
 ---
 
-## 11. 依赖
+## 11. LLM 接入配置
+
+### 11.1 统一 Claude 客户端（agents_v2/shared/claude_client.py）
+
+所有员工从这里获取 LLM 实例，`base_url` 为空时走官方 Anthropic API，填入代理地址即切换到第三方：
+
+```python
+from langchain_anthropic import ChatAnthropic
+from anthropic import Anthropic
+from pydantic_settings import BaseSettings
+
+class LLMSettings(BaseSettings):
+    ANTHROPIC_API_KEY: str
+    ANTHROPIC_BASE_URL: str = ""           # 空 = 官方；填代理地址即切换
+    ANTHROPIC_EXTRA_HEADERS: dict = {}     # 代理鉴权头
+
+    class Config:
+        env_file = "infra/.env"
+
+settings = LLMSettings()
+
+def make_langchain_llm(model: str = "claude-sonnet-4-6") -> ChatAnthropic:
+    return ChatAnthropic(
+        model=model,
+        anthropic_api_key=settings.ANTHROPIC_API_KEY,
+        base_url=settings.ANTHROPIC_BASE_URL or None,
+        default_headers=settings.ANTHROPIC_EXTRA_HEADERS,
+        timeout=120.0,
+        max_retries=2,
+    )
+
+# agents/base.py 底层 client 同步修改
+def make_anthropic_client() -> Anthropic:
+    return Anthropic(
+        api_key=settings.ANTHROPIC_API_KEY,
+        base_url=settings.ANTHROPIC_BASE_URL or None,
+    )
+```
+
+### 11.2 支持的代理方式
+
+| 代理 | ANTHROPIC_BASE_URL | ANTHROPIC_EXTRA_HEADERS | 说明 |
+|------|-------------------|------------------------|------|
+| **官方直连** | （留空） | — | 默认，无需配置 |
+| **OpenRouter** | `https://openrouter.ai/api/v1` | `{"HTTP-Referer":"...", "X-Title":"..."}` | 多模型切换，模型名用 `anthropic/claude-sonnet-4-6` |
+| **LiteLLM**（自托管） | `http://localhost:4000` | — | 本地统一代理，支持 100+ 模型 |
+| **Helicone**（监控） | `https://anthropic.helicone.ai` | `{"Helicone-Auth":"Bearer sk-..."}` | 加监控/缓存层，不换模型 |
+| **企业内网网关** | `https://your-gateway.internal` | 自定义鉴权头 | 公司 API 管控场景 |
+
+### 11.3 .env 配置示例
+
+```bash
+# infra/.env
+
+# ── 官方直连（默认）──────────────────────────────
+ANTHROPIC_API_KEY=sk-ant-xxxxx
+# ANTHROPIC_BASE_URL=                   # 留空即走官方
+
+# ── OpenRouter 代理（按需开启）──────────────────
+# ANTHROPIC_API_KEY=sk-or-xxxxx
+# ANTHROPIC_BASE_URL=https://openrouter.ai/api/v1
+# ANTHROPIC_EXTRA_HEADERS={"HTTP-Referer":"https://your-site.com","X-Title":"RobotDog"}
+
+# ── LiteLLM 本地代理（按需开启）─────────────────
+# ANTHROPIC_API_KEY=sk-litellm-xxxxx
+# ANTHROPIC_BASE_URL=http://localhost:4000
+
+# ── Helicone 监控层（按需开启）──────────────────
+# ANTHROPIC_API_KEY=sk-ant-xxxxx
+# ANTHROPIC_BASE_URL=https://anthropic.helicone.ai
+# ANTHROPIC_EXTRA_HEADERS={"Helicone-Auth":"Bearer sk-helicone-xxxxx"}
+```
+
+---
+
+## 12. 依赖
 
 ```bash
 # LangGraph + A2A
@@ -517,6 +592,7 @@ langgraph>=0.2
 langgraph-checkpoint-postgres
 langchain-anthropic          # Claude 接入
 a2a-sdk                      # pip install a2a-sdk
+pydantic-settings            # LLMSettings 配置读取
 
 # 基础设施（现有）
 fastapi
