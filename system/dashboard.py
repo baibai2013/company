@@ -95,7 +95,12 @@ def render_page(d: dict) -> str:
       </div>'''
 
     # --- task panel ---
-    task_panel = f'''
+    task_panel = '''
+      <div style="display:flex;border-bottom:1px solid #1e293b;margin-bottom:8px;flex-shrink:0">
+        <button id="tab-ms" class="tab-btn tab-active" onclick="switchTab('ms')">📋 里程碑</button>
+        <button id="tab-ai" class="tab-btn" onclick="switchTab('ai')">🎯 AI任务</button>
+      </div>
+      <div id="panel-ms" style="flex:1;overflow-y:auto;display:flex;flex-direction:column">
       <div style="font-weight:600;font-size:.9rem;margin-bottom:10px">📋 任务列表</div>
       <div style="background:#0f1626;border-radius:6px;padding:8px;margin-bottom:10px">
         <div style="display:flex;justify-content:space-between;font-size:.75rem;color:#475569;margin-bottom:4px">
@@ -122,7 +127,14 @@ def render_page(d: dict) -> str:
 
     # legend
     task_panel += '''<div style="margin-top:auto;padding-top:8px;border-top:1px solid #1e293b;display:flex;flex-wrap:wrap;gap:4px;font-size:.7rem;color:#64748b">
-      <span>✅完成</span><span>⚡进行中</span><span>🔶待你</span><span>🔑审批点</span></div>'''
+      <span>✅完成</span><span>⚡进行中</span><span>🔶待你</span><span>🔑审批点</span></div>
+      </div>'''  # close panel-ms
+    task_panel += '''
+      <div id="panel-ai" style="flex:1;overflow-y:auto;display:none;flex-direction:column;padding:2px 0">
+        <div id="aitasks-content">
+          <div style="color:#475569;text-align:center;padding:24px;font-size:.78rem">暂无 AI 任务</div>
+        </div>
+      </div>'''
 
     # blocked cards for status feed (initial)
     blocked_cards = ""
@@ -151,7 +163,12 @@ body{{font-family:-apple-system,"SF Pro Display",sans-serif;background:#080b14;c
 .send-btn{{background:#6366f1;color:#fff;border:none;border-radius:6px;padding:8px 14px;font-size:.82rem;cursor:pointer;flex-shrink:0;height:36px}}
 .send-btn:hover{{background:#4f46e5}}
 .send-btn:disabled{{background:#334155;cursor:not-allowed}}
-.taskpanel{{width:220px;background:#060910;border-left:1px solid #1e293b;padding:12px;overflow-y:auto;flex-shrink:0;display:flex;flex-direction:column;gap:0}}
+.taskpanel{{width:220px;background:#060910;border-left:1px solid #1e293b;padding:6px 6px 6px;flex-shrink:0;display:flex;flex-direction:column;gap:0;overflow:hidden}}
+.tab-btn{{flex:1;background:none;border:none;border-bottom:2px solid transparent;color:#64748b;font-size:.72rem;padding:6px 4px;cursor:pointer;transition:.15s}}
+.tab-btn:hover{{color:#a5b4fc}}
+.tab-active{{color:#a5b4fc!important;border-bottom-color:#6366f1!important}}
+.ai-card{{background:#0f1626;border-radius:6px;padding:7px 8px;margin-bottom:5px;border-left:3px solid #334155}}
+.ai-chain{{display:flex;flex-wrap:wrap;gap:2px;margin-top:4px}}
 .sec-label{{color:#475569;font-size:.7rem;font-weight:700;text-transform:uppercase;letter-spacing:.08em;padding:8px 10px 3px}}
 .ch-item:hover{{background:#1e293b!important}}
 .active-ch{{background:#1e1b4b!important}}
@@ -553,6 +570,67 @@ setInterval(async () => {{
     document.getElementById("ts").textContent = s.now;
   }} catch(e) {{}}
 }}, 10000);
+
+// ── AI任务看板 ──────────────────────────────────────────────────
+function switchTab(tab) {{
+  const ms = document.getElementById("panel-ms");
+  const ai = document.getElementById("panel-ai");
+  const btnMs = document.getElementById("tab-ms");
+  const btnAi = document.getElementById("tab-ai");
+  if (tab === "ms") {{
+    ms.style.display = "flex"; ai.style.display = "none";
+    btnMs.classList.add("tab-active"); btnAi.classList.remove("tab-active");
+  }} else {{
+    ms.style.display = "none"; ai.style.display = "flex";
+    btnMs.classList.remove("tab-active"); btnAi.classList.add("tab-active");
+    fetchTasks();
+  }}
+}}
+
+const P_COLOR = {{P0:"#ef4444", P1:"#f59e0b", P2:"#22c55e"}};
+const P_ICON  = {{P0:"🔴", P1:"🟡", P2:"🟢"}};
+const ST_LABEL = {{
+  pending:"⏳ 待分析", analysis:"📋 分析中", gate:"⏸ 等审批",
+  engineering:"🔄 执行中", done:"✅ 完成", cancelled:"❌ 取消"
+}};
+const STEP_ICON = {{done:"✅", running:"⚡", pending:"⬜", failed:"❌"}};
+
+async function fetchTasks() {{
+  try {{
+    const tasks = await (await fetch("/api/tasks")).json();
+    const box = document.getElementById("aitasks-content");
+    if (!tasks.length) {{
+      box.innerHTML = '<div style="color:#475569;text-align:center;padding:24px;font-size:.78rem">暂无 AI 任务</div>';
+      return;
+    }}
+    box.innerHTML = tasks.map(t => {{
+      const pc = P_COLOR[t.priority] || "#475569";
+      const pi = P_ICON[t.priority]  || "⬜";
+      const sl = ST_LABEL[t.status]  || t.status;
+      const steps = t.steps || {{}};
+      const stepsHtml = Object.entries(steps).map(([name, s]) =>
+        `<span class="chain-step" title="${{name}}: ${{s.summary || s.status}}" style="font-size:.7rem;background:#1e293b;border-radius:3px;padding:1px 4px;color:${{s.status==='done'?'#22c55e':s.status==='running'?'#3b82f6':'#475569'}}">${{STEP_ICON[s.status]||'⬜'}} ${{name.slice(0,4)}}</span>`
+      ).join("");
+      return `<div class="ai-card" style="border-left-color:${{pc}}">
+        <div style="display:flex;justify-content:space-between;align-items:center">
+          <span style="font-size:.68rem;font-weight:700;color:${{pc}}">${{pi}} ${{t.priority||'--'}}</span>
+          <span style="font-size:.65rem;color:#334155">${{t.estimate||'—'}}</span>
+        </div>
+        <div style="font-size:.78rem;color:#e2e8f0;margin:3px 0;white-space:nowrap;overflow:hidden;text-overflow:ellipsis" title="${{t.name}}">${{t.name}}</div>
+        <div style="font-size:.7rem;color:#64748b;margin-bottom:4px">${{sl}}</div>
+        <div class="ai-chain">${{stepsHtml || '<span style="font-size:.7rem;color:#334155">无步骤记录</span>'}}</div>
+      </div>`;
+    }}).join("");
+  }} catch(e) {{
+    document.getElementById("aitasks-content").innerHTML =
+      '<div style="color:#475569;text-align:center;padding:20px;font-size:.75rem">加载失败</div>';
+  }}
+}}
+
+// AI任务 tab 自动轮询（5s）
+setInterval(() => {{
+  if (document.getElementById("panel-ai")?.style.display !== "none") fetchTasks();
+}}, 5000);
 </script>
 </body></html>"""
 
@@ -571,7 +649,23 @@ class Handler(BaseHTTPRequestHandler):
         self.wfile.write(body)
 
     def do_GET(self):
-        if self.path == "/api/state":
+        if self.path == "/api/tasks":
+            tasks_json = self.project_path / "state" / "tasks.json"
+            try:
+                if tasks_json.exists():
+                    data = json.loads(tasks_json.read_text())
+                    priority_order = {"P0": 0, "P1": 1, "P2": 2}
+                    tasks = sorted(
+                        data.values(),
+                        key=lambda t: (priority_order.get(t.get("priority", ""), 3),
+                                       t.get("created_at", "")),
+                    )
+                    self.send_json(tasks)
+                else:
+                    self.send_json([])
+            except Exception:
+                self.send_json([])
+        elif self.path == "/api/state":
             try:
                 self.send_json(load_state(self.project_path))
             except Exception as e:
