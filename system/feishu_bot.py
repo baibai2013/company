@@ -303,36 +303,48 @@ def start_pipeline(task: str, chat_id: str) -> None:
 
 
 def _run_pipeline(task: str, chat_id: str) -> None:
-    """顺序执行 PM 分析 → TechLead 审核 → 发 Gate 卡片等待 ?approve"""
+    """
+    分析阶段：PM 需求分析 → TechLead 拆解各域子任务 → Gate 卡片等待 ?approve
+    TechLead 输出结构化子任务，工程执行阶段各员工读取对应部分。
+    """
     client = _make_client()
 
-    # Step 1: PM 分析需求
+    # Step 1: PM 需求分析
     send_text(client, chat_id, "📋 Step 1/2 — 产品经理正在分析需求…")
     pm_result = call_worker("product_manager", task)
     pm_content = pm_result.get("content", "(无输出)")
     _log_task("product_manager", task, "pipeline-pm")
 
-    # Step 2: Tech Lead 技术评审
-    send_text(client, chat_id, "🔍 Step 2/2 — 技术负责人正在评审方案…")
-    tl_task = f"请审核以下产品需求方案，给出技术可行性评估和建议：\n\n{pm_content[:2000]}"
+    # Step 2: TechLead 技术规格 + 各域子任务分配
+    send_text(client, chat_id, "🔍 Step 2/2 — 技术负责人正在拆解工程子任务…")
+    tl_task = (
+        f"请基于以下产品需求分析，制定技术架构，并为各工程域输出明确的子任务。\n\n"
+        f"【产品需求分析】\n{pm_content[:2000]}\n\n"
+        f"请严格按以下格式输出：\n"
+        f"## 技术架构\n（整体方案 200 字以内）\n\n"
+        f"## 机械工程师子任务\n（结构尺寸、材料、公差要求）\n\n"
+        f"## 硬件工程师子任务\n（主控选型、电路拓扑、接口定义）\n\n"
+        f"## 固件工程师子任务\n（通信协议、控制框架、依赖机械/硬件约束）\n\n"
+        f"## 算法工程师子任务\n（运动规划、依赖机械自由度和传感器接口）"
+    )
     tl_result = call_worker("tech_lead", tl_task, context=task)
     tl_content = tl_result.get("content", "(无输出)")
     _log_task("tech_lead", task, "pipeline-tl")
 
-    # 存入待审批队列
     _pending_pipelines[chat_id] = {
         "task": task,
         "pm_result": pm_content,
         "tl_result": tl_content,
     }
 
-    # Gate 卡片：等待 CEO ?approve
     summary = (
-        f"**需求分析（产品经理）**\n{pm_content[:800]}\n\n"
-        f"**技术评审（Tech Lead）**\n{tl_content[:800]}\n\n"
-        f"---\n回复 `?approve` 确认后，将并行派发给工程团队（{', '.join(ENGINEERING_TEAM)}）"
+        f"**需求分析（产品经理）**\n{pm_content[:500]}\n\n"
+        f"**工程规格（Tech Lead）**\n{tl_content[:700]}\n\n"
+        f"---\n"
+        f"回复 `?approve` 开始工程执行阶段：\n"
+        f"Round 1（并行）机械 + 硬件 → Round 2（并行）固件 + 算法 → TechLead 集成评审"
     )
-    send_card(client, chat_id, "⚠️ 请 CEO 确认是否继续", summary, "orange")
+    send_card(client, chat_id, "⚠️ 请 CEO 确认工程执行方案", summary, "orange")
 
 
 def handle_approve(chat_id: str) -> None:
@@ -342,24 +354,128 @@ def handle_approve(chat_id: str) -> None:
         send_text(client, chat_id, "当前没有待审批的需求流转，请先发送 ?pipeline <需求描述>")
         return
 
-    task = pending["task"]
-    pm_result = pending["pm_result"]
-    tl_result = pending["tl_result"]
-    context = (
-        f"原始需求：{task}\n\n"
-        f"产品分析：\n{pm_result[:1000]}\n\n"
-        f"技术评审：\n{tl_result[:1000]}"
-    )
-
     client = _make_client()
     send_text(client, chat_id,
-              f"✅ CEO 已确认，正在并行派发给工程团队：{', '.join(ENGINEERING_TEAM)}")
+              "✅ CEO 已确认，启动工程执行阶段\n"
+              "Round 1：机械 + 硬件 并行设计中…")
+    threading.Thread(
+        target=_run_engineering_phase, args=(pending, chat_id), daemon=True
+    ).start()
+    _log_task("CEO", pending["task"], "approved → 启动工程执行")
 
-    for employee in ENGINEERING_TEAM:
-        eng_task = f"请根据以下需求和技术方案，完成你负责领域的详细设计：\n\n{task}"
-        dispatch(employee, eng_task, chat_id, context=context)
 
-    _log_task("CEO", task, "approved → 派发给工程团队")
+def _run_engineering_phase(pending: dict, chat_id: str) -> None:
+    """
+    工程执行阶段（有序协作）：
+
+    Round 1（并行）：机械 + 硬件 各读 TechLead 规格，输出本域设计
+    Round 2（并行）：固件 + 算法 读取 Round 1 输出，基于机械/硬件约束设计
+    Round 3      ：TechLead 集成评审，识别接口冲突，输出集成行动清单
+    """
+    client = _make_client()
+    task = pending["task"]
+    tl_spec = pending["tl_result"]
+
+    # ── Round 1: 机械 + 硬件 ────────────────────────────────────────────────
+    mech_result: dict = {}
+    hw_result: dict = {}
+
+    def _run_mech() -> None:
+        ctx = f"TechLead 技术规格（请重点执行【机械工程师子任务】部分）：\n\n{tl_spec}"
+        mech_result.update(call_worker(
+            "mechanical",
+            f"请完成机械结构设计。原始需求：{task[:200]}",
+            context=ctx,
+        ))
+        content = mech_result.get("content", "(无输出)")
+        send_card(client, chat_id, "✅ 机械工程师完成", content[:1500], "green")
+        for img in mech_result.get("images", []):
+            send_image_file(client, chat_id, img)
+        _log_task("mechanical", task, "round1-完成", mech_result.get("output", ""))
+
+    def _run_hw() -> None:
+        ctx = f"TechLead 技术规格（请重点执行【硬件工程师子任务】部分）：\n\n{tl_spec}"
+        hw_result.update(call_worker(
+            "hardware",
+            f"请完成硬件电路方案设计。原始需求：{task[:200]}",
+            context=ctx,
+        ))
+        content = hw_result.get("content", "(无输出)")
+        send_card(client, chat_id, "✅ 硬件工程师完成", content[:1500], "green")
+        _log_task("hardware", task, "round1-完成", hw_result.get("output", ""))
+
+    t1 = threading.Thread(target=_run_mech, daemon=True)
+    t2 = threading.Thread(target=_run_hw, daemon=True)
+    t1.start(); t2.start()
+    t1.join(); t2.join()
+
+    mech_content = mech_result.get("content", "(机械工程师无输出)")
+    hw_content = hw_result.get("content", "(硬件工程师无输出)")
+
+    send_text(client, chat_id,
+              "Round 2：固件 + 算法 已收到机械/硬件输出，开始设计…")
+
+    # ── Round 2: 固件 + 算法（依赖 Round 1 输出）────────────────────────────
+    fw_result: dict = {}
+    algo_result: dict = {}
+    round2_context = (
+        f"TechLead 技术规格：\n{tl_spec[:600]}\n\n"
+        f"【机械工程师输出】\n{mech_content[:700]}\n\n"
+        f"【硬件工程师输出】\n{hw_content[:700]}"
+    )
+
+    def _run_fw() -> None:
+        ctx = f"{round2_context}\n\n请重点执行 TechLead 规格中【固件工程师子任务】部分，基于上方机械/硬件约束。"
+        fw_result.update(call_worker(
+            "firmware",
+            f"请完成固件架构设计。原始需求：{task[:200]}",
+            context=ctx,
+        ))
+        content = fw_result.get("content", "(无输出)")
+        send_card(client, chat_id, "✅ 固件工程师完成", content[:1500], "green")
+        _log_task("firmware", task, "round2-完成", fw_result.get("output", ""))
+
+    def _run_algo() -> None:
+        ctx = f"{round2_context}\n\n请重点执行 TechLead 规格中【算法工程师子任务】部分，基于上方机械自由度和传感器接口。"
+        algo_result.update(call_worker(
+            "algorithm",
+            f"请完成算法方案设计。原始需求：{task[:200]}",
+            context=ctx,
+        ))
+        content = algo_result.get("content", "(无输出)")
+        send_card(client, chat_id, "✅ 算法工程师完成", content[:1500], "green")
+        _log_task("algorithm", task, "round2-完成", algo_result.get("output", ""))
+
+    t3 = threading.Thread(target=_run_fw, daemon=True)
+    t4 = threading.Thread(target=_run_algo, daemon=True)
+    t3.start(); t4.start()
+    t3.join(); t4.join()
+
+    fw_content = fw_result.get("content", "(固件工程师无输出)")
+    algo_content = algo_result.get("content", "(算法工程师无输出)")
+
+    send_text(client, chat_id, "Round 3：TechLead 集成评审中…")
+
+    # ── Round 3: TechLead 集成评审 ───────────────────────────────────────────
+    integration_context = (
+        f"原始需求：{task}\n\n"
+        f"【机械工程师输出】\n{mech_content[:600]}\n\n"
+        f"【硬件工程师输出】\n{hw_content[:600]}\n\n"
+        f"【固件工程师输出】\n{fw_content[:600]}\n\n"
+        f"【算法工程师输出】\n{algo_content[:600]}"
+    )
+    final_result = call_worker(
+        "tech_lead",
+        "请对各工程域的设计方案进行集成评审：\n"
+        "1. 识别接口不一致或冲突\n"
+        "2. 确认关键参数对齐（尺寸、频率、协议等）\n"
+        "3. 输出后续集成行动清单（按优先级排列）",
+        context=integration_context,
+    )
+    final_content = final_result.get("content", "(无输出)")
+    _log_task("tech_lead", task, "集成评审完成")
+
+    send_card(client, chat_id, "🎯 工程执行完成 — TechLead 集成报告", final_content, "blue")
 
 
 # ── 消息解析 ──────────────────────────────────────────────────────────────────
