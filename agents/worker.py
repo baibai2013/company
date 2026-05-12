@@ -35,6 +35,8 @@ class RunRequest(BaseModel):
     context: str = ""
     project_root: str = ""
     is_gate: bool = False
+    image_base64: str = ""
+    image_media_type: str = "image/jpeg"
 
 
 class RunResponse(BaseModel):
@@ -54,7 +56,13 @@ def run_employee(req: RunRequest):
         raise HTTPException(status_code=400, detail=f"Unknown employee: {req.employee}. Valid: {list(REGISTRY.keys())}")
 
     fn = REGISTRY[req.employee]
-    result = fn(task=req.task, context=req.context, project_root=req.project_root)
+    result = fn(
+        task=req.task,
+        context=req.context,
+        project_root=req.project_root,
+        image_base64=req.image_base64 or None,
+        image_media_type=req.image_media_type,
+    )
 
     if STATUS_CHANNEL:
         card = format_completion_card(
