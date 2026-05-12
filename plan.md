@@ -6,17 +6,34 @@
 
 ---
 
+## 执行规则
+
+1. **逐 Phase 执行**：每个 Phase 全部 Task 跑完后，汇报验证结果，等用户确认再进入下一 Phase
+2. **每 Task 必须验证**：Task 步骤执行完毕后运行验证命令，输出结果写入汇报
+3. **遇到错误立即停**：不跳过，修复后重新验证，再继续
+4. **Phase 4 并行**：8 个员工 Agent 用 subagent 同时跑，其余 Phase 在主 session 执行
+5. **汇报格式**（每 Phase 结束后）：
+   ```
+   ✅ Phase N 完成
+   Task N.1: [验证命令] → [实际输出]
+   Task N.2: [验证命令] → [实际输出]
+   问题记录: 无 / [描述]
+   → 可以进入 Phase N+1 吗？
+   ```
+
+---
+
 ## Subagent 分配指南
 
-每个 Phase 标注了依赖关系。同一 Phase 内的 Task 可以并行分配给不同 Subagent。
+Phase 4 内的 Task 4.1 ~ 4.8 分配给不同 Subagent 同时执行。其余 Phase 在主 session 顺序执行。
 
 | 符号 | 含义 |
 |------|------|
 | 🔒 | 依赖项（必须先完成） |
-| ⚡ | 可并行（同 Phase 内） |
+| ⚡ | 可并行（同 Phase 内，subagent） |
 | 📦 | Subagent 需要的关键上下文 |
 
-**关键路径：** Phase 0 → Phase 1 → Phase 2 + Phase 3 → Phase 4（并行 8 个 subagent） → Phase 5 → Phase 6 → Phase 7
+**关键路径：** Phase 0 → Phase 1 → Phase 2 + Phase 3 → Phase 4（并行 8 subagent） → Phase 5 → Phase 6 → Phase 7
 
 ---
 

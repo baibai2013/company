@@ -81,11 +81,25 @@ services:
     volumes:
       - n8n_data:/home/node/.n8n
 
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+    ports:
+      - "6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    volumes:
+      - redis_data:/data
+
 volumes:
   postgres_data:
   gitea_data:
   mattermost_data:
   n8n_data:
+  redis_data:
 
 networks:
   default:

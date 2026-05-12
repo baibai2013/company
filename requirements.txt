@@ -1,9 +1,23 @@
 anthropic>=0.40.0
 fastapi>=0.115.0
-uvicorn>=0.32.0
+uvicorn[standard]>=0.32.0
 httpx>=0.27.0
 pyyaml>=6.0
 python-dotenv>=1.0.0
 gitpython>=3.1.0
 lark-oapi>=1.3.0
 qrcode>=7.4.2
+
+# agents_v2 — LangGraph + A2A
+langgraph>=0.2
+langgraph-checkpoint-postgres
+langchain-anthropic>=0.3
+a2a-sdk  # 已安装，A2A Server/Client 用纯 FastAPI+httpx 实现，不依赖此 SDK 的 Client 类
+pydantic-settings>=2.0
+
+# backend
+sqlalchemy[asyncio]>=2.0
+alembic>=1.13
+asyncpg>=0.29
+celery[redis]>=5.3
+redis>=5.0
