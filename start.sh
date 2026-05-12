@@ -1,6 +1,10 @@
 #!/usr/bin/env bash
 # Robot Dog Co. — 一键启动所有服务
-# Usage: ./start.sh [--no-docker] [--no-feishu]
+# Usage:
+#   ./start.sh                  启动全部（含 Docker）
+#   ./start.sh --no-docker      跳过 Docker（已在运行时用）
+#   ./start.sh --no-feishu      跳过飞书机器人
+#   ./start.sh --no-frontend    跳过前端 dev server
 set -euo pipefail
 
 COMPANY_DIR="$(cd "$(dirname "$0")" && pwd)"
@@ -9,161 +13,212 @@ LOG_DIR="$COMPANY_DIR/logs"
 VENV="$COMPANY_DIR/.venv/bin/activate"
 PID_FILE="$COMPANY_DIR/.pids"
 
-NO_DOCKER=0
-NO_FEISHU=0
+NO_DOCKER=0; NO_FEISHU=0; NO_FRONTEND=0
 for arg in "$@"; do
   case $arg in
-    --no-docker) NO_DOCKER=1 ;;
-    --no-feishu) NO_FEISHU=1 ;;
+    --no-docker)   NO_DOCKER=1 ;;
+    --no-feishu)   NO_FEISHU=1 ;;
+    --no-frontend) NO_FRONTEND=1 ;;
   esac
 done
 
-# ── 颜色 ──────────────────────────────────────────────
-GREEN='\033[0;32m'; YELLOW='\033[1;33m'; RED='\033[0;31m'; NC='\033[0m'
-ok()   { echo -e "${GREEN}✅  $*${NC}"; }
-warn() { echo -e "${YELLOW}⚠️  $*${NC}"; }
-err()  { echo -e "${RED}❌  $*${NC}"; }
+GREEN='\033[0;32m'; YELLOW='\033[1;33m'; RED='\033[0;31m'; CYAN='\033[0;36m'; NC='\033[0m'
+ok()    { echo -e "${GREEN}✅  $*${NC}"; }
+warn()  { echo -e "${YELLOW}⚠️  $*${NC}"; }
+err()   { echo -e "${RED}❌  $*${NC}"; }
+info()  { echo -e "${CYAN}▶  $*${NC}"; }
 
 echo "================================================================"
 echo " 🤖  Robot Dog Co. — 系统启动"
 echo "================================================================"
 
-# ── 前置检查 ──────────────────────────────────────────
 if [[ ! -f "$VENV" ]]; then
   err "未找到 .venv，请先运行: python3 -m venv .venv && source .venv/bin/activate && pip install -r requirements.txt"
   exit 1
 fi
 
 mkdir -p "$LOG_DIR"
-# 清空旧 PID 文件
 > "$PID_FILE"
 
-# ── 1. Docker 基础服务 ────────────────────────────────
+# ── helpers ───────────────────────────────────────────────────────────────────
+
+wait_http() {
+  local url=$1 label=$2 tries=${3:-20}
+  echo -n "   等待 $label 就绪..."
+  for i in $(seq 1 $tries); do
+    if curl -sf "$url" &>/dev/null; then echo " ok"; return 0; fi
+    sleep 1; echo -n "."
+  done
+  echo ""
+  warn "$label ${tries}s 内未响应，请查看日志"
+  return 1
+}
+
+start_py() {
+  # start_py <name> <port> <module_or_cmd...>
+  local name=$1 port=$2; shift 2
+  if lsof -ti:"$port" &>/dev/null; then
+    warn "端口 $port ($name) 已占用，跳过"
+    return
+  fi
+  nohup python "$@" > "$LOG_DIR/$name.log" 2>&1 &
+  local pid=$!
+  echo "$name $pid" >> "$PID_FILE"
+  echo -n "   等待 $name ($port) 就绪..."
+  for i in $(seq 1 20); do
+    if curl -sf "http://localhost:$port/health" &>/dev/null; then
+      echo " ok"
+      ok "$name PID=$pid  → :$port  (logs/$name.log)"
+      return
+    fi
+    sleep 1; echo -n "."
+  done
+  echo ""
+  warn "$name 20s 未响应 — 查看 logs/$name.log"
+}
+
+# ── 1. Docker 基础服务 ────────────────────────────────────────────────────────
 if [[ $NO_DOCKER -eq 0 ]]; then
   echo ""
-  echo "▶  启动 Docker 服务 (postgres / gitea / mattermost / n8n)..."
+  info "启动 Docker 服务 (postgres / redis / gitea / mattermost / n8n)..."
   if ! docker info &>/dev/null; then
     err "Docker 未运行，请先启动 Docker Desktop"
     exit 1
   fi
-
   cd "$INFRA_DIR"
   docker compose up -d --remove-orphans > "$LOG_DIR/docker.log" 2>&1
   ok "Docker Compose 已启动（日志: logs/docker.log）"
   cd "$COMPANY_DIR"
 
-  # 等待 postgres 健康
   echo -n "   等待 postgres 就绪..."
   for i in $(seq 1 30); do
-    if docker compose -f "$INFRA_DIR/docker-compose.yml" exec -T postgres pg_isready -U admin &>/dev/null 2>&1; then
-      echo " ok"
-      break
+    if docker compose -f "$INFRA_DIR/docker-compose.yml" exec -T postgres \
+        pg_isready -U admin &>/dev/null 2>&1; then
+      echo " ok"; break
     fi
-    sleep 1
-    echo -n "."
+    sleep 1; echo -n "."
     if [[ $i -eq 30 ]]; then echo ""; warn "postgres 30s 内未就绪，继续..."; fi
+  done
+
+  echo -n "   等待 redis 就绪..."
+  for i in $(seq 1 15); do
+    if docker compose -f "$INFRA_DIR/docker-compose.yml" exec -T redis \
+        redis-cli ping &>/dev/null 2>&1; then
+      echo " ok"; break
+    fi
+    sleep 1; echo -n "."
+    if [[ $i -eq 15 ]]; then echo ""; warn "redis 15s 内未就绪，继续..."; fi
   done
 else
   warn "跳过 Docker（--no-docker）"
 fi
 
-# ── 加载 venv ─────────────────────────────────────────
 source "$VENV"
+cd "$COMPANY_DIR"
 
-# ── 2. Agent Worker (port 8080) ───────────────────────
+# ── 2. Backend FastAPI (:8000) ────────────────────────────────────────────────
 echo ""
-echo "▶  启动 Agent Worker (port 8080)..."
+info "启动 Backend API (port 8000)..."
+start_py "backend" 8000 -m uvicorn backend.main:app --host 0.0.0.0 --port 8000
 
-# 检查端口是否已占用
-if lsof -ti:8080 &>/dev/null; then
-  warn "端口 8080 已被占用，跳过 Worker 启动"
-else
-  cd "$COMPANY_DIR"
-  nohup python -m uvicorn agents.worker:app \
-    --host 0.0.0.0 --port 8080 \
-    > "$LOG_DIR/worker.log" 2>&1 &
-  WORKER_PID=$!
-  echo "worker $WORKER_PID" >> "$PID_FILE"
-
-  # 等待 /health
-  echo -n "   等待 Worker 就绪..."
-  for i in $(seq 1 20); do
-    if curl -sf http://localhost:8080/health &>/dev/null; then
-      echo " ok"
-      ok "Worker PID=$WORKER_PID  → http://localhost:8080  (logs/worker.log)"
-      break
-    fi
-    sleep 1; echo -n "."
-    if [[ $i -eq 20 ]]; then
-      echo ""
-      warn "Worker 20s 未响应，请查看 logs/worker.log"
-    fi
-  done
-fi
-
-# ── 3. Dashboard (port 8888) ──────────────────────────
+# ── 3. TechLead Supervisor (:9000) ────────────────────────────────────────────
 echo ""
-echo "▶  启动 Dashboard (port 8888)..."
+info "启动 TechLead Supervisor (port 9000)..."
+start_py "tech_lead" 9000 -m agents_v2.tech_lead.main
 
-if lsof -ti:8888 &>/dev/null; then
-  warn "端口 8888 已被占用，跳过 Dashboard 启动"
-else
-  nohup python system/dashboard.py \
-    > "$LOG_DIR/dashboard.log" 2>&1 &
-  DASH_PID=$!
-  echo "dashboard $DASH_PID" >> "$PID_FILE"
-  sleep 1
-  if kill -0 "$DASH_PID" 2>/dev/null; then
-    ok "Dashboard PID=$DASH_PID  → http://localhost:8888  (logs/dashboard.log)"
+# ── 4. 员工 Agents (:9001-9008) ───────────────────────────────────────────────
+echo ""
+info "启动员工 Agents (ports 9001-9008)..."
+
+EMPLOYEES=(
+  "mechanical:9001"
+  "hardware:9002"
+  "firmware:9003"
+  "algorithm:9004"
+  "product_manager:9005"
+  "testing:9006"
+  "cost:9007"
+  "project_manager:9008"
+)
+
+for entry in "${EMPLOYEES[@]}"; do
+  name="${entry%%:*}"
+  port="${entry##*:}"
+  start_py "$name" "$port" -m "agents_v2.$name.main"
+done
+
+# ── 5. Frontend (port 5173) ───────────────────────────────────────────────────
+if [[ $NO_FRONTEND -eq 0 ]]; then
+  echo ""
+  info "启动前端 dev server (port 5173)..."
+  if lsof -ti:5173 &>/dev/null; then
+    warn "端口 5173 (frontend) 已占用，跳过"
   else
-    err "Dashboard 启动失败，查看 logs/dashboard.log"
-    cat "$LOG_DIR/dashboard.log" | tail -10
+    cd "$COMPANY_DIR/frontend"
+    nohup npm run dev > "$LOG_DIR/frontend.log" 2>&1 &
+    FRONTEND_PID=$!
+    echo "frontend $FRONTEND_PID" >> "$PID_FILE"
+    cd "$COMPANY_DIR"
+    echo -n "   等待 frontend 就绪..."
+    for i in $(seq 1 20); do
+      if curl -sf http://localhost:5173/ &>/dev/null; then
+        echo " ok"
+        ok "Frontend PID=$FRONTEND_PID  → http://localhost:5173  (logs/frontend.log)"
+        break
+      fi
+      sleep 1; echo -n "."
+      if [[ $i -eq 20 ]]; then echo ""; warn "Frontend 20s 未响应，查看 logs/frontend.log"; fi
+    done
   fi
+else
+  warn "跳过前端（--no-frontend）"
 fi
 
-# ── 4. Feishu Bot ─────────────────────────────────────
+# ── 6. Feishu Bot ─────────────────────────────────────────────────────────────
 if [[ $NO_FEISHU -eq 0 ]]; then
   echo ""
-  echo "▶  启动飞书机器人..."
-
-  # 读取 .env 检查凭证
-  ENV_FILE="$INFRA_DIR/.env"
+  info "启动飞书机器人..."
   FEISHU_APP_ID=""
-  if [[ -f "$ENV_FILE" ]]; then
-    FEISHU_APP_ID=$(grep -E '^FEISHU_APP_ID=' "$ENV_FILE" | cut -d= -f2 | tr -d '"' | tr -d "'")
+  if [[ -f "$INFRA_DIR/.env" ]]; then
+    FEISHU_APP_ID=$(grep -E '^FEISHU_APP_ID=' "$INFRA_DIR/.env" 2>/dev/null \
+      | cut -d= -f2 | tr -d '"' | tr -d "'" || true)
   fi
 
   if [[ -z "$FEISHU_APP_ID" ]]; then
     warn "未找到 FEISHU_APP_ID，跳过飞书机器人"
-    warn "请运行: python system/feishu_register.py 完成飞书授权"
   else
-    nohup python system/feishu_bot.py \
-      > "$LOG_DIR/feishu_bot.log" 2>&1 &
-    BOT_PID=$!
-    echo "feishu_bot $BOT_PID" >> "$PID_FILE"
-    sleep 2
-    if kill -0 "$BOT_PID" 2>/dev/null; then
-      ok "飞书机器人 PID=$BOT_PID  (logs/feishu_bot.log)"
+    if lsof -ti:8089 &>/dev/null; then
+      warn "端口 8089 (feishu /send) 已占用，跳过"
     else
-      err "飞书机器人启动失败，查看 logs/feishu_bot.log"
-      cat "$LOG_DIR/feishu_bot.log" | tail -10
+      nohup python -m feishu.bot > "$LOG_DIR/feishu_bot.log" 2>&1 &
+      BOT_PID=$!
+      echo "feishu_bot $BOT_PID" >> "$PID_FILE"
+      sleep 2
+      if kill -0 "$BOT_PID" 2>/dev/null; then
+        ok "飞书机器人 PID=$BOT_PID  (logs/feishu_bot.log)"
+      else
+        err "飞书机器人启动失败，查看 logs/feishu_bot.log"
+        tail -5 "$LOG_DIR/feishu_bot.log" || true
+      fi
     fi
   fi
 else
   warn "跳过飞书机器人（--no-feishu）"
 fi
 
-# ── 完成 ──────────────────────────────────────────────
+# ── 完成 ──────────────────────────────────────────────────────────────────────
 echo ""
 echo "================================================================"
 ok "系统已启动"
 echo ""
-echo "  📊 看板:       http://localhost:8888"
-echo "  🔧 Worker API: http://localhost:8080/health"
-[[ $NO_DOCKER -eq 0 ]] && echo "  💬 Mattermost: http://localhost:8065"
-[[ $NO_DOCKER -eq 0 ]] && echo "  📦 Gitea:      http://localhost:3000"
-[[ $NO_DOCKER -eq 0 ]] && echo "  🔁 n8n:        http://localhost:5678"
+echo "  🖥️  前端看板:        http://localhost:5173"
+echo "  🔧  Backend API:    http://localhost:8000/health"
+echo "  🏗️  TechLead:       http://localhost:9000/.well-known/agent.json"
+echo "  👷  员工 Agents:    :9001 ~ :9008"
+[[ $NO_DOCKER -eq 0 ]] && echo "  💬  Mattermost:     http://localhost:8065"
+[[ $NO_DOCKER -eq 0 ]] && echo "  📦  Gitea:          http://localhost:3000"
+[[ $NO_DOCKER -eq 0 ]] && echo "  🔁  n8n:            http://localhost:5678"
 echo ""
-echo "  停止所有服务: ./stop.sh"
-echo "  实时日志:     tail -f logs/worker.log logs/dashboard.log"
+echo "  停止所有服务:  ./stop.sh"
+echo "  查看日志:      tail -f logs/backend.log logs/tech_lead.log"
 echo "================================================================"
