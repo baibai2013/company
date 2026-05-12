@@ -1,4 +1,4 @@
-from contextlib import contextmanager
+from contextlib import asynccontextmanager, contextmanager
 from pathlib import Path
 
 from pydantic_settings import BaseSettings
@@ -28,17 +28,25 @@ LANGGRAPH_DSN = (
     f"@{_db.POSTGRES_HOST}:{_db.POSTGRES_PORT}/company_langgraph"
 )
 
+# AsyncPostgresSaver uses psycopg3 directly — plain postgresql:// URL
+LANGGRAPH_ASYNC_DSN = LANGGRAPH_DSN
+
 
 @contextmanager
 def checkpointer_ctx():
-    """
-    Context manager that yields a ready PostgresSaver.
-    Usage:
-        with checkpointer_ctx() as cp:
-            app = graph.compile(checkpointer=cp)
-    """
+    """Sync PostgresSaver — use only for graph compilation, not ainvoke."""
     from langgraph.checkpoint.postgres import PostgresSaver
 
     with PostgresSaver.from_conn_string(LANGGRAPH_DSN) as cp:
         cp.setup()
+        yield cp
+
+
+@asynccontextmanager
+async def async_checkpointer_ctx():
+    """Async PostgresSaver — required for ainvoke / astream."""
+    from langgraph.checkpoint.postgres.aio import AsyncPostgresSaver
+
+    async with AsyncPostgresSaver.from_conn_string(LANGGRAPH_ASYNC_DSN) as cp:
+        await cp.setup()
         yield cp

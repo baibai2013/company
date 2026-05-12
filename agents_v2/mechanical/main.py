@@ -8,7 +8,7 @@ import uvicorn
 from fastapi import FastAPI
 
 from agents_v2.shared.a2a_server import create_a2a_app
-from agents_v2.shared.db import checkpointer_ctx
+from agents_v2.shared.db import async_checkpointer_ctx
 from agents_v2.mechanical.graph import build_agent
 
 CARD_PATH = Path(__file__).parent / "agent_card.json"
@@ -17,7 +17,7 @@ _app_ref = None
 
 @asynccontextmanager
 async def lifespan(inner_app: FastAPI):
-    with checkpointer_ctx() as cp:
+    async with async_checkpointer_ctx() as cp:
         inner_app.state.agent = build_agent(cp)
         yield
 

@@ -12,7 +12,7 @@ from fastapi import FastAPI
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 
-from agents_v2.shared.db import checkpointer_ctx
+from agents_v2.shared.db import async_checkpointer_ctx
 from agents_v2.tech_lead.supervisor import build_supervisor
 
 AGENT_CARD = {
@@ -35,7 +35,7 @@ AGENT_CARD = {
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    with checkpointer_ctx() as cp:
+    async with async_checkpointer_ctx() as cp:
         app.state.supervisor = build_supervisor(cp)
         yield
 
