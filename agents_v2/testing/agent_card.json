@@ -1,0 +1,22 @@
+{
+  "name": "测试工程师",
+  "url": "http://localhost:9006",
+  "version": "1.0.0",
+  "description": "系统集成验证、跨域一致性检查、测试计划",
+  "capabilities": {
+    "streaming": false
+  },
+  "skills": [
+    {
+      "id": "integration_test",
+      "name": "集成测试",
+      "description": "输出一致性检查报告、测试计划、缺陷列表",
+      "inputModes": [
+        "text"
+      ],
+      "outputModes": [
+        "text"
+      ]
+    }
+  ]
+}

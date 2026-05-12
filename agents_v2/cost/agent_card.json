@@ -1,0 +1,22 @@
+{
+  "name": "成本工程师",
+  "url": "http://localhost:9007",
+  "version": "1.0.0",
+  "description": "整机成本核算、BOM 比价、供应商调研、预算控制",
+  "capabilities": {
+    "streaming": false
+  },
+  "skills": [
+    {
+      "id": "cost_analysis",
+      "name": "成本分析",
+      "description": "输出成本报告、BOM 汇总、替代方案建议",
+      "inputModes": [
+        "text"
+      ],
+      "outputModes": [
+        "text"
+      ]
+    }
+  ]
+}

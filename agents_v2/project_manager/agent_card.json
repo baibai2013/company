@@ -1,0 +1,22 @@
+{
+  "name": "项目经理",
+  "url": "http://localhost:9008",
+  "version": "1.0.0",
+  "description": "里程碑规划、任务分配、风险管理、周报生成",
+  "capabilities": {
+    "streaming": false
+  },
+  "skills": [
+    {
+      "id": "project_planning",
+      "name": "项目规划",
+      "description": "输出里程碑计划、任务状态、阻塞点报告",
+      "inputModes": [
+        "text"
+      ],
+      "outputModes": [
+        "text"
+      ]
+    }
+  ]
+}
