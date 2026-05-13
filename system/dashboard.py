@@ -15,7 +15,7 @@ import urllib.request
 import yaml
 
 DEFAULT_PROJECT = Path.home() / "work" / "projects" / "robot-dog"
-WORKER_URL = "http://localhost:8080"
+WORKER_URL = "http://localhost:8180"
 
 CHANNEL_EMPLOYEE = {
     "mechanical": ("机械工程", "#8b5cf6", "mechanical"),

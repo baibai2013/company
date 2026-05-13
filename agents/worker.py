@@ -88,4 +88,4 @@ def run_employee(req: RunRequest):
 
 
 if __name__ == "__main__":
-    uvicorn.run("agents.worker:app", host="0.0.0.0", port=8080, reload=True)
+    uvicorn.run("agents.worker:app", host="0.0.0.0", port=8180, reload=True)

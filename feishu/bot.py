@@ -16,9 +16,12 @@ import re
 import threading
 from pathlib import Path
 
+from dotenv import load_dotenv
+
+load_dotenv(Path(__file__).parent.parent / "infra" / ".env")
+
 import lark_oapi as lark
 import uvicorn
-from dotenv import load_dotenv
 from fastapi import FastAPI
 from lark_oapi.api.im.v1.model.p2_im_message_receive_v1 import P2ImMessageReceiveV1
 from pydantic import BaseModel
@@ -34,8 +37,6 @@ from feishu.sender import (
     send_image_file,
     send_text,
 )
-
-load_dotenv(Path(__file__).parent.parent / "infra" / ".env")
 
 BOT_SEND_PORT = int(os.getenv("BOT_SEND_PORT", "8089"))
 
@@ -133,7 +134,7 @@ def parse_command(msg_content: str) -> tuple[str, str, str]:
 
 def on_message(data: P2ImMessageReceiveV1) -> None:
     msg = data.event.message if data.event else None
-    if not msg or msg.chat_type != "group":
+    if not msg or msg.chat_type not in ("group", "p2p"):
         return
 
     mid = msg.message_id or ""
@@ -254,10 +255,53 @@ async def _do_report(chat_id: str, client) -> None:
         send_text(client, chat_id, f"❌ 获取报告失败: {exc}")
 
 
+_EMPLOYEE_DISPLAY = {
+    "product_manager": ("🎯", "小米"),
+    "project_manager": ("📋", "芳芳"),
+    "tech_lead":       ("🔧", "胖虎"),
+    "mechanical":      ("⚙️",  "Dave"),
+    "hardware":        ("🔌", "大法师"),
+    "firmware":        ("💾", "小布丁"),
+    "algorithm":       ("🧠", "喵喵球"),
+    "testing":         ("🧪", "狐妖小红娘"),
+    "cost":            ("💰", "兔子精"),
+}
+
+
 async def _dispatch_employee(employee: str, task: str, chat_id: str, client) -> None:
-    send_text(client, chat_id, f"⚡ {employee} 正在处理中，请稍候…")
-    result = await handle_dispatch(employee, task)
-    send_card(client, chat_id, f"✅ {employee} 完成", result[:2000], "green")
+    emoji, name = _EMPLOYEE_DISPLAY.get(employee, ("👤", employee))
+
+    send_text(client, chat_id, f"{emoji} {name} 收到，处理中…")
+
+    data = await handle_dispatch(employee, task, chat_id=chat_id)
+    route  = data.get("route", "WORK")
+    plan   = data.get("plan", "")
+    result = data.get("result", "(无输出)")
+    cc     = data.get("cc", [])
+
+    if route == "CHAT":
+        send_text(client, chat_id, f"{emoji} **{name}**：{result}")
+    else:
+        task_preview = task[:80] + ("…" if len(task) > 80 else "")
+        if plan:
+            send_card(client, chat_id,
+                      f"💭 {name} — 执行方案",
+                      f"**任务：** {task_preview}\n\n{plan[:800]}",
+                      "yellow")
+        send_card(client, chat_id, f"✅ {name} 完成", result[:2000], "blue")
+
+    # CC：依次让专家补充专业意见
+    if cc:
+        context = f"背景（产品经理已回复）：{result[:400]}\n\n原始消息：{task}"
+        for cc_emp in cc:
+            cc_emoji, cc_name = _EMPLOYEE_DISPLAY.get(cc_emp, ("👤", cc_emp))
+            send_text(client, chat_id, f"{cc_emoji} {cc_name} 补充意见中…")
+            try:
+                cc_data = await handle_dispatch(cc_emp, context, chat_id=chat_id)
+                cc_result = cc_data.get("result", "(无输出)")
+                send_text(client, chat_id, f"{cc_emoji} **{cc_name}**：{cc_result[:600]}")
+            except Exception as exc:
+                log.warning("cc dispatch failed for %s: %s", cc_emp, exc)
 
 
 # ── Entry point ───────────────────────────────────────────────────────────────
@@ -280,6 +324,7 @@ def main() -> None:
     handler = (
         lark.EventDispatcherHandler.builder("", "")
         .register_p2_im_message_receive_v1(on_message)
+        .register_p2_im_chat_member_bot_deleted_v1(lambda _: None)
         .build()
     )
     ws_client = lark.ws.Client(

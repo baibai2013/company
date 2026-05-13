@@ -20,8 +20,11 @@ async def handle_pipeline(text: str) -> tuple[str, str]:
         task_id = task["id"]
 
     # Fire-and-forget: TechLead pipeline runs async in its own server
-    import asyncio
-    asyncio.create_task(_trigger_pipeline(task_id, text))
+    import asyncio, threading
+    threading.Thread(
+        target=lambda: asyncio.run(_trigger_pipeline(task_id, text)),
+        daemon=True,
+    ).start()
 
     short_id = task_id[:8]
     reply = (

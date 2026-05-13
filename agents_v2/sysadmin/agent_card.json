@@ -1,0 +1,16 @@
+{
+  "name": "电脑管理员零",
+  "url": "http://localhost:9009",
+  "version": "1.0.0",
+  "description": "监控本机 CPU、内存、磁盘、进程，提供系统健康分析",
+  "capabilities": { "streaming": false },
+  "skills": [
+    {
+      "id": "sysmon",
+      "name": "系统监控",
+      "description": "查询实时 CPU/内存/磁盘/进程状态",
+      "inputModes": ["text"],
+      "outputModes": ["text"]
+    }
+  ]
+}

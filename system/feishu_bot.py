@@ -50,7 +50,7 @@ load_dotenv(Path(__file__).parent.parent / "infra" / ".env")
 
 APP_ID = os.getenv("FEISHU_APP_ID", "")
 APP_SECRET = os.getenv("FEISHU_APP_SECRET", "")
-WORKER_URL = os.getenv("WORKER_URL", "http://localhost:8080")
+WORKER_URL = os.getenv("WORKER_URL", "http://localhost:8180")
 PROJECT_ROOT = os.getenv("PROJECT_ROOT", "/Users/liyijiang/work/projects/robot-dog")
 BOT_SEND_PORT = int(os.getenv("BOT_SEND_PORT", "8089"))
 

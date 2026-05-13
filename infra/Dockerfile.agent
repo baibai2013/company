@@ -1,0 +1,13 @@
+FROM python:3.12-slim
+
+WORKDIR /workspace
+
+# system deps for git
+RUN apt-get update && apt-get install -y git curl && rm -rf /var/lib/apt/lists/*
+
+# python deps
+COPY agents/requirements.txt /tmp/requirements.txt
+RUN pip install --no-cache-dir -r /tmp/requirements.txt
+
+# default command: run the webhook worker
+CMD ["python", "agents/worker.py"]

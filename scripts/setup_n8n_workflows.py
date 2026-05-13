@@ -19,7 +19,7 @@ API_KEY = os.environ["N8N_API_KEY"]
 FEISHU_CHAT_ID = os.getenv("FEISHU_CHAT_ID", "")
 PROJECT_ROOT = os.getenv("PROJECT_ROOT", "/Users/liyijiang/work/projects/robot-dog")
 BOT_SEND = "http://host.docker.internal:8089/send"
-WORKER = "http://host.docker.internal:8080/run"
+WORKER = "http://host.docker.internal:8180/run"
 
 HEADERS = {"X-N8N-API-KEY": API_KEY, "Content-Type": "application/json"}
 
