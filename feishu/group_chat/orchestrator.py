@@ -1,0 +1,571 @@
+"""
+Group Orchestrator — LangGraph StateGraph that manages group chat sessions.
+
+Section V of doc/design/group-chat-redesign.md.
+
+Graph: START → receive → decide → dispatch → conclude → END
+
+The dispatch_node handles both sequential and parallel modes internally.
+Each session runs as a separate asyncio Task, with the graph checkpointed
+via AsyncPostgresSaver for cross-process durability.
+"""
+import asyncio
+import json
+import logging
+import os
+import time
+import uuid
+from functools import partial
+from typing import Any, Literal, TypedDict
+
+from dotenv import load_dotenv
+from langchain_core.messages import HumanMessage, SystemMessage
+from langgraph.graph import END, START, StateGraph
+
+load_dotenv()
+
+from agents_v2.shared.claude_client import make_langchain_llm
+from agents_v2.shared.db import async_checkpointer_ctx
+
+from .event_bus import GroupEventBus, GroupEventBusPool
+from .models import (
+    ConversationMessage, EMPLOYEE_CONFIG,
+    GroupSession, MessageEvent, OrchestratorDecision,
+    ROLE_DESCRIPTIONS, SessionRole, SpeakRequest, SpeakResponse,
+)
+from .prompts import (
+    DECIDE_PROMPT, GROUP_SPEAK_PREFIX, ROLE_DECIDE_PROMPT,
+    SUMMARY_PROMPT,
+    build_role_context, build_simple_role_context,
+    extract_explicit_roles, format_history,
+)
+from .session import SessionStore
+
+log = logging.getLogger("feishu.group_chat.orchestrator")
+
+_SPEAK_TIMEOUT = 90.0  # seconds to wait for a single speak response
+
+
+# ── State ─────────────────────────────────────────────────────────────────────
+
+class OrchestratorState(TypedDict):
+    session_json: str       # serialized GroupSession
+    event_json: str         # serialized MessageEvent
+    decision_json: str      # serialized OrchestratorDecision
+    completed: list[str]    # employees who have spoken this round
+    summary: str
+    error: str
+
+
+# ── Helpers ───────────────────────────────────────────────────────────────────
+
+def _state_get_session(state: OrchestratorState) -> GroupSession:
+    from .session import SessionStore
+    ss = SessionStore.__new__(SessionStore)
+    return ss._deserialize(json.loads(state["session_json"]))
+
+
+def _state_get_event(state: OrchestratorState) -> MessageEvent:
+    data = json.loads(state["event_json"])
+    return MessageEvent(
+        message_id=data["message_id"],
+        chat_id=data["chat_id"],
+        sender=data["sender"],
+        text=data["text"],
+        image_base64=data.get("image_base64", ""),
+        mentions=data.get("mentions", []),
+    )
+
+
+def _state_get_decision(state: OrchestratorState) -> OrchestratorDecision | None:
+    raw = state.get("decision_json", "")
+    if not raw:
+        return None
+    data = json.loads(raw)
+    return OrchestratorDecision(
+        mode=data["mode"],
+        participants=data.get("participants", []),
+        reason=data.get("reason", ""),
+    )
+
+
+def _state_set_session(state: OrchestratorState, session: GroupSession) -> dict:
+    from .session import SessionStore
+    ss = SessionStore.__new__(SessionStore)
+    return {"session_json": json.dumps(ss._serialize(session), ensure_ascii=False)}
+
+
+# ── Helper: wait for speak responses in dispatch ──────────────────────────────
+
+async def _wait_for_responses(
+    bus_pool: GroupEventBusPool,
+    session_id: str,
+    employees: list[str],
+    timeout: float = _SPEAK_TIMEOUT,
+) -> dict[str, SpeakResponse]:
+    """Wait for speak responses from multiple employees concurrently."""
+    results: dict[str, SpeakResponse] = {}
+
+    async def _wait_one(emp: str) -> SpeakResponse | None:
+        # Create a fresh subscriber for waiting on this session
+        sub = GroupEventBus()
+        await sub.connect()
+        try:
+            channel = f"speak_resp:{session_id}"
+            await sub._sub.subscribe(channel)
+            async for msg in sub._sub.listen():
+                if msg["type"] != "message":
+                    continue
+                data = json.loads(msg["data"])
+                if data.get("employee") == emp:
+                    return SpeakResponse(
+                        session_id=data["session_id"],
+                        chat_id=data["chat_id"],
+                        employee=data["employee"],
+                        content=data["content"],
+                        success=data.get("success", True),
+                    )
+        except asyncio.TimeoutError:
+            return SpeakResponse(
+                session_id=session_id, chat_id="", employee=emp,
+                content="", success=False,
+            )
+        finally:
+            await sub.disconnect()
+        return None
+
+    tasks = {emp: asyncio.create_task(_wait_one(emp)) for emp in employees}
+    done, pending = await asyncio.wait(tasks.values(), timeout=timeout)
+
+    for emp, task in tasks.items():
+        if task in done and not task.cancelled():
+            resp = task.result()
+            if resp:
+                results[emp] = resp
+        else:
+            task.cancel()
+            emoji, name = EMPLOYEE_CONFIG.get(emp, ("👤", emp))
+            results[emp] = SpeakResponse(
+                session_id=session_id, chat_id="", employee=emp,
+                content=f"{emoji} {name} 未能及时回应", success=False,
+            )
+
+    return results
+
+
+# ── Graph Nodes ───────────────────────────────────────────────────────────────
+
+async def _receive_node(
+    state: OrchestratorState,
+    session_store: SessionStore,
+    bus_pool: GroupEventBusPool,
+) -> dict:
+    """Load or create session, append the triggering message to history."""
+    event = _state_get_event(state)
+    session = _state_get_session(state)
+
+    if not session.id:
+        # New session: try to find active session in this group
+        active = await session_store.find_active(event.chat_id)
+        if active and active.status != "done":
+            session = active
+        else:
+            session = GroupSession(
+                id=event.message_id or str(uuid.uuid4()),
+                chat_id=event.chat_id,
+                trigger_message_id=event.message_id,
+                created_at=time.time(),
+            )
+
+    # Append user message to history
+    msg = ConversationMessage(
+        id=str(uuid.uuid4()),
+        session_id=session.id,
+        sender="user",
+        sender_name="用户",
+        content=event.text or "[图片]",
+        feishu_message_id=event.message_id,
+        created_at=time.time(),
+        role="user",
+    )
+    session.history.append(msg)
+    session.trigger_message_id = event.message_id
+
+    log.info("receive_node: session=%s chat=%s history_len=%d",
+             session.id, session.chat_id, len(session.history))
+
+    return _state_set_session(state, session)
+
+
+async def _decide_node(
+    state: OrchestratorState,
+    session_store: SessionStore,
+    bus_pool: GroupEventBusPool,
+) -> dict:
+    """LLM call to decide: mode, participants, and optionally session roles."""
+    session = _state_get_session(state)
+    event = _state_get_event(state)
+
+    llm_haiku = make_langchain_llm("claude-haiku-4-5-20251001")
+
+    # Step 1: Check for explicit role assignment
+    explicit_roles = await extract_explicit_roles(
+        event.text, event.mentions, llm_haiku,
+    )
+    if explicit_roles:
+        session.role_assignments = explicit_roles
+        session.role_history.append((time.time(), dict(explicit_roles)))
+        log.info("decide_node: explicit roles from user: %s", list(explicit_roles.keys()))
+
+    # Step 2: Decide mode and participants
+    resp = await llm_haiku.ainvoke([
+        SystemMessage(DECIDE_PROMPT),
+        HumanMessage(event.text),
+    ])
+
+    import re as _re
+    try:
+        m = _re.search(r"\{.*\}", resp.content, _re.DOTALL)
+        data = json.loads(m.group()) if m else {}
+    except Exception:
+        data = {}
+
+    decision = OrchestratorDecision(
+        mode=data.get("mode", "single"),
+        participants=data.get("participants", []),
+        reason=data.get("reason", ""),
+    )
+
+    # Default: if no participants, route to project_manager
+    if not decision.participants and decision.mode != "ignore":
+        decision.participants = ["project_manager"]
+
+    session.mode = decision.mode
+    session.participants = decision.participants
+    session.pending = list(decision.participants)
+
+    # Step 3: Auto-assign roles if no explicit roles and not "free"
+    if not session.role_assignments and decision.mode != "ignore":
+        # Use ROLE_DECIDE_PROMPT for complex modes
+        if decision.mode in ("sequential", "parallel") and len(decision.participants) > 1:
+            try:
+                participant_list = "\n".join(
+                    f"- {e}: {EMPLOYEE_CONFIG[e][0]} {EMPLOYEE_CONFIG[e][1]} ({ROLE_DESCRIPTIONS.get(e, '')})"
+                    for e in decision.participants
+                )
+                role_resp = await llm_haiku.ainvoke([
+                    SystemMessage(ROLE_DECIDE_PROMPT),
+                    HumanMessage(f"参与者列表：\n{participant_list}\n\n话题：{event.text}"),
+                ])
+                m2 = _re.search(r"\{.*\}", role_resp.content, _re.DOTALL)
+                if m2:
+                    role_data = json.loads(m2.group())
+                    template = role_data.pop("template", "free")
+                    roles_dict = role_data.get("roles", role_data)
+                    session.template = template
+                    for emp_key, rdata in roles_dict.items():
+                        if emp_key in EMPLOYEE_CONFIG and isinstance(rdata, dict):
+                            session.role_assignments[emp_key] = SessionRole(
+                                employee=emp_key,
+                                role_name=rdata.get("role_name", ""),
+                                role_desc=rdata.get("role_desc", ""),
+                                visible_to=rdata.get("visible_to", []),
+                                faction=rdata.get("faction", ""),
+                            )
+            except Exception as exc:
+                log.warning("decide_node: role assignment failed: %s", exc)
+
+    await session_store.save(session)
+
+    log.info("decide_node: mode=%s participants=%s reason=%s",
+             decision.mode, decision.participants, decision.reason)
+
+    return {
+        **_state_set_session(state, session),
+        "decision_json": json.dumps({
+            "mode": decision.mode,
+            "participants": decision.participants,
+            "reason": decision.reason,
+        }, ensure_ascii=False),
+    }
+
+
+async def _dispatch_node(
+    state: OrchestratorState,
+    session_store: SessionStore,
+    bus_pool: GroupEventBusPool,
+) -> dict:
+    """Publish SpeakRequests and wait for responses. Handles single/sequential/parallel."""
+    session = _state_get_session(state)
+    decision = _state_get_decision(state)
+    completed = list(state.get("completed", []))
+
+    if decision is None:
+        return {}
+
+    mode = decision.mode
+
+    if mode == "ignore":
+        return {}
+
+    # Determine which employees still need to speak this round
+    remaining = [e for e in decision.participants if e not in completed]
+
+    if not remaining:
+        return {"completed": completed}
+
+    # Build history text once
+    history_text = format_history(session.history)
+
+    if mode == "single":
+        # Only one participant
+        emp = remaining[0]
+        req = SpeakRequest(
+            session_id=session.id,
+            chat_id=session.chat_id,
+            employee=emp,
+            history_text=history_text,
+            trigger_message_id=session.trigger_message_id,
+            role_context=build_role_context(emp, session),
+        )
+        await bus_pool.pub_bus.publish_speak_req(req)
+
+        responses = await _wait_for_responses(bus_pool, session.id, [emp])
+        resp = responses.get(emp)
+        if resp and resp.success:
+            _append_speaker_to_history(session, emp, resp.content)
+        completed.append(emp)
+
+    elif mode == "sequential":
+        # Speak one at a time, each sees prior responses
+        for emp in remaining:
+            req = SpeakRequest(
+                session_id=session.id,
+                chat_id=session.chat_id,
+                employee=emp,
+                history_text=format_history(session.history),
+                trigger_message_id=session.trigger_message_id,
+                order=len(completed),
+                role_context=build_role_context(emp, session),
+            )
+            await bus_pool.pub_bus.publish_speak_req(req)
+
+            responses = await _wait_for_responses(bus_pool, session.id, [emp])
+            resp = responses.get(emp)
+            if resp and resp.success:
+                _append_speaker_to_history(session, emp, resp.content)
+            completed.append(emp)
+
+    elif mode == "parallel":
+        # All speak concurrently
+        for i, emp in enumerate(remaining):
+            req = SpeakRequest(
+                session_id=session.id,
+                chat_id=session.chat_id,
+                employee=emp,
+                history_text=history_text,
+                trigger_message_id=session.trigger_message_id,
+                order=i,
+                role_context=build_role_context(emp, session),
+            )
+            await bus_pool.pub_bus.publish_speak_req(req)
+
+        responses = await _wait_for_responses(bus_pool, session.id, remaining)
+        for emp in remaining:
+            resp = responses.get(emp)
+            if resp and resp.success:
+                _append_speaker_to_history(session, emp, resp.content)
+        completed.extend(remaining)
+
+    await session_store.save(session)
+
+    return {
+        **_state_set_session(state, session),
+        "completed": completed,
+    }
+
+
+async def _conclude_node(
+    state: OrchestratorState,
+    session_store: SessionStore,
+    bus_pool: GroupEventBusPool,
+) -> dict:
+    """Generate summary and publish to group via project_manager."""
+    session = _state_get_session(state)
+    decision = _state_get_decision(state)
+
+    if decision is None or decision.mode == "ignore":
+        return {}
+
+    # Only summarize if more than 1 participant spoke
+    if len(state.get("completed", [])) <= 1 and decision.mode == "single":
+        session.status = "done"
+        await session_store.delete(session.id)
+        return _state_set_session(state, session)
+
+    history_text = format_history(session.history)
+
+    # Let project_manager summarize
+    req = SpeakRequest(
+        session_id=session.id,
+        chat_id=session.chat_id,
+        employee="project_manager",
+        history_text=history_text,
+        trigger_message_id=session.trigger_message_id,
+        summary_mode=True,
+        role_context=SUMMARY_PROMPT,
+    )
+    await bus_pool.pub_bus.publish_speak_req(req)
+
+    responses = await _wait_for_responses(bus_pool, session.id, ["project_manager"], timeout=60.0)
+    resp = responses.get("project_manager")
+    if resp and resp.success:
+        session.summary = resp.content
+        _append_speaker_to_history(session, "project_manager", resp.content)
+
+    session.status = "done"
+    await session_store.delete(session.id)
+
+    log.info("conclude_node: session=%s done, summary_len=%d", session.id, len(session.summary))
+
+    return _state_set_session(state, session)
+
+
+def _append_speaker_to_history(session: GroupSession, employee: str, content: str) -> None:
+    emoji, name = EMPLOYEE_CONFIG.get(employee, ("👤", employee))
+    msg = ConversationMessage(
+        id=str(uuid.uuid4()),
+        session_id=session.id,
+        sender=employee,
+        sender_name=f"{emoji} {name}",
+        content=content,
+        feishu_message_id="",
+        created_at=time.time(),
+        role="assistant",
+    )
+    session.history.append(msg)
+
+
+# ── Conditional edge ──────────────────────────────────────────────────────────
+
+def _after_decide(state: OrchestratorState) -> Literal["dispatch", "conclude"]:
+    decision = _state_get_decision(state)
+    if decision is None or decision.mode == "ignore":
+        return "conclude"
+    return "dispatch"
+
+
+# ── Build graph ───────────────────────────────────────────────────────────────
+
+def _build_graph(session_store: SessionStore, bus_pool: GroupEventBusPool, cp):
+    """Compile the orchestrator LangGraph graph with an already-open checkpointer."""
+    g = StateGraph(OrchestratorState)
+
+    g.add_node("receive", partial(
+        _receive_node, session_store=session_store, bus_pool=bus_pool,
+    ))
+    g.add_node("decide", partial(
+        _decide_node, session_store=session_store, bus_pool=bus_pool,
+    ))
+    g.add_node("dispatch", partial(
+        _dispatch_node, session_store=session_store, bus_pool=bus_pool,
+    ))
+    g.add_node("conclude", partial(
+        _conclude_node, session_store=session_store, bus_pool=bus_pool,
+    ))
+
+    g.add_edge(START, "receive")
+    g.add_edge("receive", "decide")
+    g.add_conditional_edges("decide", _after_decide, {
+        "dispatch": "dispatch",
+        "conclude": "conclude",
+    })
+    g.add_edge("dispatch", "conclude")
+    g.add_edge("conclude", END)
+
+    return g.compile(checkpointer=cp)
+
+
+# ── Main orchestrator process ─────────────────────────────────────────────────
+
+async def run_orchestrator():
+    """Main entry point for the orchestrator process."""
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s  %(levelname)s  %(name)s  %(message)s",
+    )
+
+    log.info("Starting GroupOrchestrator...")
+
+    session_store = SessionStore()
+    await session_store.connect()
+
+    bus_pool = GroupEventBusPool()
+    await bus_pool.connect()
+
+    async with async_checkpointer_ctx() as cp:
+        graph = _build_graph(session_store, bus_pool, cp)
+        log.info("Orchestrator graph compiled with checkpointer")
+
+        # Track active tasks per session
+        active_tasks: dict[str, asyncio.Task] = {}
+
+        async def handle_event(event: MessageEvent):
+            """Process a group message event."""
+            log.info("received group_msg chat=%s text=%.60s", event.chat_id, event.text)
+
+            # Skip empty messages
+            if not event.text and not event.image_base64:
+                return
+
+            # Create initial state
+            from .session import SessionStore as SS
+            ss = SS.__new__(SS)
+            empty_session = GroupSession(chat_id=event.chat_id)
+            initial_state: OrchestratorState = {
+                "session_json": json.dumps(ss._serialize(empty_session), ensure_ascii=False),
+                "event_json": json.dumps({
+                    "message_id": event.message_id,
+                    "chat_id": event.chat_id,
+                    "sender": event.sender,
+                    "text": event.text,
+                    "image_base64": event.image_base64,
+                    "mentions": event.mentions,
+                }, ensure_ascii=False),
+                "decision_json": "",
+                "completed": [],
+                "summary": "",
+                "error": "",
+            }
+
+            config = {"configurable": {"thread_id": event.message_id}}
+
+            try:
+                async for chunk in graph.astream(initial_state, config=config, stream_mode="updates"):
+                    for node_name, node_out in chunk.items():
+                        log.debug("graph node=%s completed", node_name)
+            except Exception as exc:
+                log.error("graph execution failed for chat=%s: %s", event.chat_id, exc)
+
+        try:
+            # Subscribe to all group messages
+            async for event in bus_pool.sub_bus.subscribe_group_pattern():
+                # Don't block on the same session sequentially — each event is a new task
+                task = asyncio.create_task(handle_event(event))
+                # Clean up completed tasks periodically
+                done = [sid for sid, t in active_tasks.items() if t.done()]
+                for sid in done:
+                    del active_tasks[sid]
+                    try:
+                        active_tasks.pop(sid)
+                    except KeyError:
+                        pass
+        except asyncio.CancelledError:
+            log.info("Orchestrator shutting down...")
+        finally:
+            await bus_pool.disconnect()
+            await session_store.disconnect()
+
+
+if __name__ == "__main__":
+    asyncio.run(run_orchestrator())

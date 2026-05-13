@@ -298,6 +298,46 @@ def reply_message(client: lark.Client, message_id: str, text: str) -> None:
         log.error("reply_message failed: %s %s", resp.code, resp.msg)
 
 
+def fetch_recent_text(client: lark.Client, chat_id: str, limit: int = 20, within_secs: int = 3600) -> str:
+    """返回群聊近 within_secs 秒内最多 limit 条文字消息，格式化为历史字符串供 AI 参考。"""
+    import time
+    try:
+        req = (
+            ListMessageRequest.builder()
+            .container_id_type("chat")
+            .container_id(chat_id)
+            .sort_type("ByCreateTimeDesc")
+            .page_size(limit)
+            .build()
+        )
+        resp = client.im.v1.message.list(req)
+        if not resp.success() or not resp.data or not resp.data.items:
+            return ""
+        cutoff = (time.time() - within_secs) * 1000
+        lines = []
+        for msg in reversed(resp.data.items):
+            if int(getattr(msg, "create_time", 0) or 0) < cutoff:
+                continue
+            msg_type = getattr(msg, "msg_type", None) or getattr(msg, "message_type", None)
+            if msg_type != "text":
+                continue
+            try:
+                text = json.loads(msg.body.content).get("text", "").strip()
+                text = re.sub(r'<at[^>]*>[^<]*</at>', '', text)
+                text = re.sub(r'@\S+', '', text).strip()
+            except Exception:
+                continue
+            if not text:
+                continue
+            sender_type = getattr(getattr(msg, "sender", None), "sender_type", "")
+            label = "用户" if sender_type == "user" else "员工"
+            lines.append(f"{label}: {text}")
+        return "\n".join(lines)
+    except Exception as e:
+        log.warning("fetch_recent_text failed: %s", e)
+        return ""
+
+
 def fetch_recent_image(client: lark.Client, chat_id: str, within_seconds: int = 120) -> tuple[str, str]:
     """群里最近 within_seconds 秒内有没有图片，有则返回 (base64, media_type)，没有返回 ('', '')。"""
     import time
@@ -306,6 +346,7 @@ def fetch_recent_image(client: lark.Client, chat_id: str, within_seconds: int = 
             ListMessageRequest.builder()
             .container_id_type("chat")
             .container_id(chat_id)
+            .sort_type("ByCreateTimeDesc")
             .page_size(20)
             .build()
         )

@@ -2,9 +2,28 @@
 Shared runner: astream_events + Redis progress publishing.
 All employees call run_with_events() instead of ainvoke().
 """
+import base64
+import io
 import json
 
 import redis.asyncio as aioredis
+
+
+def _resize_image_b64(b64: str, max_side: int = 1568) -> str:
+    """将 base64 图片压缩到 max_side×max_side 以内，返回 JPEG base64。"""
+    try:
+        from PIL import Image
+        data = base64.b64decode(b64)
+        img = Image.open(io.BytesIO(data)).convert("RGB")
+        w, h = img.size
+        if max(w, h) > max_side:
+            ratio = max_side / max(w, h)
+            img = img.resize((int(w * ratio), int(h * ratio)), Image.LANCZOS)
+        buf = io.BytesIO()
+        img.save(buf, format="JPEG", quality=85)
+        return base64.b64encode(buf.getvalue()).decode()
+    except Exception:
+        return b64
 
 REDIS_URL = "redis://localhost:6379/0"
 
@@ -34,11 +53,15 @@ async def run_with_events(
     image_base64 = ctx.get("image_base64", "")
     image_media_type = ctx.get("image_media_type", "image/jpeg")
 
+    # 压缩图片到 Claude 推荐的最大尺寸（避免超 token 限制）
+    if image_base64:
+        image_base64 = _resize_image_b64(image_base64, max_side=1568)
+
     # 构建 task_input：有图片时用多模态列表，否则纯字符串
     if image_base64:
         task_input = [
             {"type": "text", "text": text or "请分析这张图片，给出你的专业意见。"},
-            {"type": "image_url", "image_url": {"url": f"data:{image_media_type};base64,{image_base64}"}},
+            {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{image_base64}"}},
         ]
     else:
         task_input = text
