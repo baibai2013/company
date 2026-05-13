@@ -2,15 +2,32 @@ import axios from 'axios'
 
 export const http = axios.create({ baseURL: '/api' })
 
+export interface TaskStep {
+  id: string
+  step_name: string
+  status: string
+  output: string | null
+  started_at: string | null
+  finished_at: string | null
+}
+
 export interface Task {
   id: string
+  parent_id: string | null
   title: string
-  description: string
+  description: string | null
   priority: string
   status: string
-  celery_id: string | null
+  requester: string | null
+  executor: string | null
+  verifier: string | null
   created_at: string
   updated_at: string
+  steps: TaskStep[]
+}
+
+export interface TaskDetail extends Task {
+  children: Task[]
 }
 
 export interface Employee {
@@ -32,8 +49,10 @@ export interface ChatMessage {
 export const tasksApi = {
   list: (status?: string) =>
     http.get<Task[]>('/tasks', { params: status ? { status } : {} }).then(r => r.data),
-  create: (data: { title: string; description: string; priority: string }) =>
+  create: (data: { title: string; description: string; priority: string; requester?: string; verifier?: string | null; parent_id?: string | null }) =>
     http.post<Task>('/tasks', data).then(r => r.data),
+  detail: (id: string) =>
+    http.get<TaskDetail>(`/tasks/${id}`).then(r => r.data),
   updateStatus: (id: string, status: string) =>
     http.patch(`/tasks/${id}/status`, null, { params: { status } }).then(r => r.data),
   approve: (id: string) =>

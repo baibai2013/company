@@ -41,8 +41,8 @@ function avatarEmoji(key: string) {
   gap: 12px;
 }
 .employee-card {
-  background: #f5f7fa;
-  border: 2px solid transparent;
+  background: #141720;
+  border: 2px solid #252a3a;
   border-radius: 10px;
   padding: 12px 8px;
   text-align: center;
@@ -50,13 +50,13 @@ function avatarEmoji(key: string) {
   transition: all 0.2s;
   user-select: none;
 }
-.employee-card:hover { border-color: #409eff; background: #ecf5ff; }
-.employee-card.online { border-color: #67c23a; }
+.employee-card:hover { border-color: #409eff; background: #1a2240; }
+.employee-card.online { border-color: #3ba55c; }
 .emp-avatar { font-size: 28px; margin-bottom: 6px; }
-.emp-name { font-size: 12px; font-weight: 600; margin-bottom: 4px; }
+.emp-name { font-size: 12px; font-weight: 600; margin-bottom: 4px; color: #c8d0e0; }
 .emp-status { display: flex; align-items: center; justify-content: center; gap: 4px; }
-.status-dot { width: 6px; height: 6px; border-radius: 50%; background: #bbb; }
-.status-dot.online { background: #67c23a; }
-.status-dot.offline { background: #bbb; }
-.status-label { font-size: 11px; color: #999; }
+.status-dot { width: 6px; height: 6px; border-radius: 50%; background: #3a4260; }
+.status-dot.online { background: #3ba55c; }
+.status-dot.offline { background: #3a4260; }
+.status-label { font-size: 11px; color: #5a6480; }
 </style>

@@ -61,7 +61,7 @@ start_py() {
     warn "端口 $port ($name) 已占用，跳过"
     return
   fi
-  nohup python "$@" > "$LOG_DIR/$name.log" 2>&1 &
+  nohup .venv/bin/python "$@" > "$LOG_DIR/$name.log" 2>&1 &
   local pid=$!
   echo "$name $pid" >> "$PID_FILE"
   echo -n "   等待 $name ($port) 就绪..."
@@ -116,6 +116,20 @@ fi
 source "$VENV"
 cd "$COMPANY_DIR"
 
+# ── 清理残留 Python 进程（上次未 stop 的）────────────────────────────────────
+echo ""
+info "检查并清理残留进程..."
+STALE_PORTS="8000 8089 9000 9001 9002 9003 9004 9005 9006 9007 9008 9009"
+for port in $STALE_PORTS; do
+  pids=$(lsof -ti:"$port" 2>/dev/null || true)
+  if [[ -n "$pids" ]]; then
+    # shellcheck disable=SC2086
+    kill $pids 2>/dev/null && warn "已清理端口 $port 残留进程 (PID=$pids)"
+    sleep 0.3
+  fi
+done
+> "$PID_FILE"  # 清空旧 PID 文件
+
 # ── 2. Backend FastAPI (:8000) ────────────────────────────────────────────────
 echo ""
 info "启动 Backend API (port 8000)..."
@@ -139,6 +153,7 @@ EMPLOYEES=(
   "testing:9006"
   "cost:9007"
   "project_manager:9008"
+  "sysadmin:9009"
 )
 
 for entry in "${EMPLOYEES[@]}"; do
@@ -187,23 +202,30 @@ if [[ $NO_FEISHU -eq 0 ]]; then
   if [[ -z "$FEISHU_APP_ID" ]]; then
     warn "未找到 FEISHU_APP_ID，跳过飞书机器人"
   else
-    if lsof -ti:8089 &>/dev/null; then
-      warn "端口 8089 (feishu /send) 已占用，跳过"
-    else
-      nohup python -m feishu.bot > "$LOG_DIR/feishu_bot.log" 2>&1 &
-      BOT_PID=$!
-      echo "feishu_bot $BOT_PID" >> "$PID_FILE"
-      sleep 2
-      if kill -0 "$BOT_PID" 2>/dev/null; then
-        ok "飞书机器人 PID=$BOT_PID  (logs/feishu_bot.log)"
-      else
-        err "飞书机器人启动失败，查看 logs/feishu_bot.log"
-        tail -5 "$LOG_DIR/feishu_bot.log" || true
-      fi
-    fi
+    start_py "feishu_bot" 8089 -m feishu.bot
   fi
 else
   warn "跳过飞书机器人（--no-feishu）"
+fi
+
+# ── 7. 员工独立 Bot（有 APP_ID 才启动）────────────────────────────────────────
+if [[ $NO_FEISHU -eq 0 ]]; then
+  echo ""
+  info "检查员工独立 Bot..."
+  EMPLOYEE_BOTS=(product_manager project_manager tech_lead mechanical hardware firmware algorithm testing cost sysadmin)
+  BOT_PORT=8100  # 员工 bot 不监听 HTTP，用递增 port 占位跳过重复检查
+  started_bots=0
+  for emp in "${EMPLOYEE_BOTS[@]}"; do
+    env_key="${emp^^}_APP_ID"
+    val=$(grep -E "^${env_key}=" "$INFRA_DIR/.env" 2>/dev/null | cut -d= -f2 | tr -d '"' | tr -d "'" || true)
+    if [[ -n "$val" ]]; then
+      nohup .venv/bin/python -m feishu.employee_bot "$emp" > "$LOG_DIR/bot_${emp}.log" 2>&1 &
+      echo "bot_${emp} $!" >> "$PID_FILE"
+      ok "员工 Bot: $emp (logs/bot_${emp}.log)"
+      started_bots=$((started_bots + 1))
+    fi
+  done
+  [[ $started_bots -eq 0 ]] && warn "未配置员工 Bot APP_ID，跳过（见 infra/.env 注释）"
 fi
 
 # ── 完成 ──────────────────────────────────────────────────────────────────────

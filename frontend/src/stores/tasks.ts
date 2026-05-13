@@ -15,14 +15,20 @@ export const useTaskStore = defineStore('tasks', () => {
     const source = new EventSource('/api/events')
     source.onmessage = (e) => {
       try {
-        const event = JSON.parse(e.data) as { task_id: string; status: string }
-        const task = tasks.value.find(t => t.id === event.task_id)
-        if (task) task.status = event.status
+        const event = JSON.parse(e.data)
+        if (event.type === 'employee_status') {
+          // Lazy-import to avoid circular deps
+          import('@/stores/employees').then(({ useEmployeeStore }) => {
+            useEmployeeStore().applyStatusEvent(event)
+          })
+        } else {
+          // task status update
+          const task = tasks.value.find(t => t.id === event.task_id)
+          if (task) task.status = event.status
+        }
       } catch { /* ignore parse errors */ }
     }
-    source.onerror = () => {
-      // Reconnect handled by browser automatically
-    }
+    source.onerror = () => { /* browser auto-reconnects */ }
     sse.value = source
   }
 

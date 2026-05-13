@@ -1,35 +1,35 @@
-@import './base.css';
-
-#app {
-  max-width: 1280px;
-  margin: 0 auto;
-  padding: 2rem;
-  font-weight: normal;
+/* Reset Vite scaffold defaults — this is a full-screen dashboard, not a content page */
+html, body, #app {
+  width: 100%;
+  height: 100%;
+  margin: 0;
+  padding: 0;
+  overflow: hidden;
 }
 
-a,
-.green {
-  text-decoration: none;
-  color: hsla(160, 100%, 37%, 1);
-  transition: 0.4s;
-  padding: 3px;
-}
-
-@media (hover: hover) {
-  a:hover {
-    background-color: hsla(160, 100%, 37%, 0.2);
-  }
-}
-
-@media (min-width: 1024px) {
-  body {
-    display: flex;
-    place-items: center;
-  }
-
-  #app {
-    display: grid;
-    grid-template-columns: 1fr 1fr;
-    padding: 0 2rem;
-  }
+/* Global Element Plus dark theme — overrides all dialogs, selects, dropdowns, tables */
+:root {
+  --el-bg-color: #1a1d27;
+  --el-bg-color-overlay: #1a1d27;
+  --el-bg-color-page: #0f1117;
+  --el-text-color-primary: #dce8ff;
+  --el-text-color-regular: #c8d0e0;
+  --el-text-color-secondary: #7a8aa0;
+  --el-text-color-placeholder: #4a5270;
+  --el-border-color: #2d3141;
+  --el-border-color-light: #252a3a;
+  --el-border-color-lighter: #1e2235;
+  --el-fill-color-blank: #141720;
+  --el-fill-color: #1a1d27;
+  --el-fill-color-light: #1e2235;
+  --el-color-white: #1a1d27;
+  --el-mask-color: rgba(0, 0, 0, 0.7);
+  --el-box-shadow-light: 0 2px 12px rgba(0, 0, 0, 0.5);
+  --el-input-bg-color: #141720;
+  --el-input-text-color: #dce8ff;
+  --el-input-border-color: #2d3141;
+  --el-input-placeholder-color: #4a5270;
+  --el-select-dropdown-bg-color: #1a1d27;
+  --el-select-option-hover-bg-color: #252a3a;
+  --el-tag-bg-color: #252a3a;
 }

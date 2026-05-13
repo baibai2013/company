@@ -11,7 +11,7 @@
         <div class="msg-content">{{ msg.content }}</div>
         <div class="msg-time">{{ formatTime(msg.created_at) }}</div>
       </div>
-      <div v-if="messages.length === 0" class="empty-chat">暂无消息</div>
+      <div v-if="messages.length === 0" class="empty-chat">暂无消息，发送第一条吧</div>
     </div>
     <div class="chat-input">
       <el-input
@@ -63,38 +63,46 @@ watch(() => props.messages.length, async () => {
 .chat-panel {
   display: flex;
   flex-direction: column;
-  height: 100%;
-  background: white;
-  border-radius: 8px;
+  flex: 1;
+  overflow: hidden;
 }
 .chat-messages {
   flex: 1;
   overflow-y: auto;
-  padding: 12px;
+  padding: 16px;
   display: flex;
   flex-direction: column;
-  gap: 8px;
+  gap: 10px;
 }
-.chat-msg { max-width: 85%; }
+.chat-msg { max-width: 78%; }
 .chat-msg.user { align-self: flex-end; }
 .chat-msg.assistant { align-self: flex-start; }
-.msg-sender { font-size: 11px; color: #999; margin-bottom: 2px; }
+.msg-sender { font-size: 11px; color: #5a6480; margin-bottom: 3px; }
 .msg-content {
-  background: #f0f2f5;
-  padding: 8px 12px;
-  border-radius: 8px;
+  background: #252a3a;
+  padding: 9px 13px;
+  border-radius: 10px;
   font-size: 13px;
-  line-height: 1.5;
+  line-height: 1.55;
   white-space: pre-wrap;
   word-break: break-word;
+  color: #c8d0e0;
 }
-.chat-msg.user .msg-content { background: #409eff; color: white; }
-.msg-time { font-size: 11px; color: #bbb; margin-top: 2px; text-align: right; }
+.chat-msg.user .msg-content { background: #1a3d7a; color: #dce8ff; border-radius: 10px 10px 2px 10px; }
+.chat-msg.assistant .msg-content { border-radius: 10px 10px 10px 2px; }
+.msg-time { font-size: 11px; color: #3a4260; margin-top: 3px; }
+.chat-msg.user .msg-time { text-align: right; }
 .chat-input {
   display: flex;
   gap: 8px;
-  padding: 12px;
-  border-top: 1px solid #eee;
+  padding: 12px 16px;
+  border-top: 1px solid #252a3a;
 }
-.empty-chat { text-align: center; color: #bbb; font-size: 13px; padding: 40px 0; }
+:deep(.el-input__wrapper) {
+  background: #141720 !important;
+  box-shadow: 0 0 0 1px #2d3141 !important;
+}
+:deep(.el-input__inner) { color: #c8d0e0 !important; }
+:deep(.el-input__inner::placeholder) { color: #3a4260 !important; }
+.empty-chat { text-align: center; color: #3a4260; font-size: 13px; padding: 60px 0; }
 </style>

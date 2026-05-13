@@ -1,13 +1,85 @@
+import asyncio
+import importlib
+import re
+from asyncio import CancelledError
+
 from fastapi import APIRouter, Depends
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from backend.api.deps import get_db
+from backend.api.routes.employees import EMPLOYEES
+from backend.core.db import AsyncSessionLocal
 from backend.models.message import ChatMessage
 from backend.schemas.message import MessageCreate, MessageRead
 
 router = APIRouter(prefix="/api/chat", tags=["chat"])
 
+# Keywords that signal a work task (not casual chat)
+_WORK_RE = re.compile(
+    r"设计|开发|实现|建模|分析|验证|输出|生成|创建|编写|规划|调试|测试|"
+    r"优化|计算|评审|报告|方案|需求|任务|BOM|CAD|PCB|固件|算法|仿真|URDF|STEP",
+    re.IGNORECASE,
+)
+
+EMPLOYEE_NAMES = {
+    "mechanical": "机械工程师", "hardware": "硬件工程师",
+    "firmware": "固件工程师", "algorithm": "算法工程师",
+    "product_manager": "产品经理", "testing": "测试工程师",
+    "cost": "成本工程师", "project_manager": "项目经理",
+    "tech_lead": "技术总监",
+}
+
+
+async def _save_msg(channel: str, role: str, sender: str, content: str) -> None:
+    async with AsyncSessionLocal() as db:
+        db.add(ChatMessage(channel=channel, role=role, sender=sender, content=content))
+        await db.commit()
+
+
+# ── fire-and-forget agent call ────────────────────────────────────────────────
+
+async def _call_agent_and_save(
+    employee_key: str, user_text: str, *, channel: str | None = None
+) -> None:
+    """Call employee A2A agent and persist the reply.
+
+    For work tasks: saves an immediate ack so user sees activity fast,
+    then saves the full result when the agent finishes.
+    """
+    info = EMPLOYEES.get(employee_key)
+    if not info:
+        return
+
+    try:
+        a2a = importlib.import_module("agents_v2.shared.a2a_server")
+        call_agent = a2a.call_agent
+    except ModuleNotFoundError:
+        return  # agents_v2 not available (e.g. unit-test env)
+
+    save_channel = channel if channel is not None else employee_key
+    url = f"http://localhost:{info['port']}/"
+    name = EMPLOYEE_NAMES.get(employee_key, employee_key)
+
+    # Save immediate ack for work tasks so the user isn't staring at silence
+    is_work = bool(_WORK_RE.search(user_text))
+    if is_work:
+        await _save_msg(save_channel, "assistant", employee_key,
+                        f"收到，我来处理这个任务，稍等…")
+
+    try:
+        reply = await call_agent(url, user_text, timeout=180)
+        # For work tasks, prefix result with a progress marker
+        if is_work:
+            reply = f"✅ 完成！以下是结果：\n\n{reply}"
+        await _save_msg(save_channel, "assistant", employee_key, reply)
+    except CancelledError:
+        pass  # Event loop teardown — exit silently without re-raising
+    except Exception:
+        pass  # Agent unreachable or DB write failed — frontend polls for reply
+
+
+# ── group chat ────────────────────────────────────────────────────────────────
 
 @router.post("/group", response_model=MessageRead)
 async def post_group(body: MessageCreate, db: AsyncSession = Depends(get_db)):
@@ -15,6 +87,10 @@ async def post_group(body: MessageCreate, db: AsyncSession = Depends(get_db)):
     db.add(msg)
     await db.commit()
     await db.refresh(msg)
+    # project_manager monitors the group channel and replies on behalf of the team
+    asyncio.create_task(
+        _call_agent_and_save("project_manager", body.content, channel="group")
+    )
     return msg
 
 
@@ -26,12 +102,22 @@ async def group_history(db: AsyncSession = Depends(get_db)):
     return result.scalars().all()
 
 
+# ── direct chat ───────────────────────────────────────────────────────────────
+
 @router.post("/direct/{employee}", response_model=MessageRead)
-async def post_direct(employee: str, body: MessageCreate, db: AsyncSession = Depends(get_db)):
+async def post_direct(
+    employee: str,
+    body: MessageCreate,
+    db: AsyncSession = Depends(get_db),
+):
+    # Persist user message and return immediately
     msg = ChatMessage(channel=employee, role="user", sender=body.sender, content=body.content)
     db.add(msg)
     await db.commit()
     await db.refresh(msg)
+
+    # Schedule agent call without blocking the response
+    asyncio.create_task(_call_agent_and_save(employee, body.content))
     return msg
 
 

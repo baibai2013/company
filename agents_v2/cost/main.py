@@ -22,14 +22,15 @@ async def lifespan(inner_app: FastAPI):
         yield
 
 
+EMPLOYEE_NAME = "cost"
+
 async def handle_task(text: str, context: dict) -> str:
-    agent = _app_ref.state.agent
-    config = {"configurable": {"thread_id": context.get("task_id", "default")}}
-    result = await agent.ainvoke(
-        {"task_input": text, "plan": "", "execution_result": "", "messages": []},
-        config=config,
-    )
-    return result["execution_result"]
+    import json
+    from agents_v2.shared.runner import run_with_events
+    task_id = context.get("task_id", "default")
+    config = {"configurable": {"thread_id": task_id}}
+    data = await run_with_events(_app_ref.state.agent, text, config, EMPLOYEE_NAME, task_id, context=context)
+    return json.dumps(data, ensure_ascii=False)
 
 
 _base = create_a2a_app(CARD_PATH, handle_task)

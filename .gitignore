@@ -4,3 +4,5 @@ infra/.env
 __pycache__/
 *.pyc
 *.pyo
+logs/
+.pytest_cache/
