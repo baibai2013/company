@@ -88,10 +88,17 @@ def _execute_node(state: SmartState, system_prompt: str) -> dict:
     return {"execution_result": resp.content}
 
 
-_VALID_EMPLOYEES = {
-    "mechanical", "hardware", "firmware", "algorithm",
-    "testing", "cost", "project_manager", "tech_lead",
-}
+def _valid_employees() -> set[str]:
+    """Active employee keys from registry. Used by the PM CC node to filter LLM-suggested specialists."""
+    from backend.services import registry
+    if not registry._loaded:  # type: ignore[attr-defined]
+        try:
+            registry.warmup_sync()
+        except RuntimeError:
+            return set()
+    # Exclude product_manager (it's the one doing the CC) and sysadmin (ops, not specialist).
+    return {k for k in registry.list_keys_sync_cached(active_only=True)
+            if k not in {"product_manager", "sysadmin"}}
 
 
 def _cc_node(state: SmartState, cc_prompt: str) -> dict:
@@ -107,7 +114,8 @@ def _cc_node(state: SmartState, cc_prompt: str) -> dict:
     try:
         m = _re.search(r"\[.*?\]", resp.content, _re.DOTALL)
         cc = _json.loads(m.group()) if m else []
-        cc = [e for e in cc if e in _VALID_EMPLOYEES]
+        valid = _valid_employees()
+        cc = [e for e in cc if e in valid]
     except Exception:
         cc = []
     return {"cc": cc}

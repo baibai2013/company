@@ -140,27 +140,27 @@ echo ""
 info "启动 TechLead Supervisor (port 9000)..."
 start_py "tech_lead" 9000 -m agents_v2.tech_lead.main
 
-# ── 4. 员工 Agents (:9001-9008) ───────────────────────────────────────────────
+# ── 4. 员工 Agents — 从 DB registry 读列表 ────────────────────────────────────
 echo ""
-info "启动员工 Agents (ports 9001-9008)..."
+info "启动员工 Agents（来自 employee 表）..."
 
-EMPLOYEES=(
-  "mechanical:9001"
-  "hardware:9002"
-  "firmware:9003"
-  "algorithm:9004"
-  "product_manager:9005"
-  "testing:9006"
-  "cost:9007"
-  "project_manager:9008"
-  "sysadmin:9009"
-)
+# Fetch active employees + ports from registry; tech_lead already started above.
+EMPLOYEE_LIST=$(cd "$COMPANY_DIR" && .venv/bin/python -c "
+from backend.services import registry
+registry.warmup_sync()
+for k in registry.list_keys_sync_cached(active_only=True):
+    if k == 'tech_lead': continue
+    cfg = registry.get_effective_sync(k)
+    if cfg and cfg.agent_port:
+        print(f'{k}:{cfg.agent_port}')
+")
 
-for entry in "${EMPLOYEES[@]}"; do
+while IFS= read -r entry; do
+  [[ -z "$entry" ]] && continue
   name="${entry%%:*}"
   port="${entry##*:}"
   start_py "$name" "$port" -m "agents_v2.$name.main"
-done
+done <<< "$EMPLOYEE_LIST"
 
 # ── 5. Frontend (port 5173) ───────────────────────────────────────────────────
 if [[ $NO_FRONTEND -eq 0 ]]; then
@@ -208,25 +208,35 @@ else
   warn "跳过飞书机器人（--no-feishu）"
 fi
 
-# ── 7. 员工独立 Bot（有 APP_ID 才启动）────────────────────────────────────────
+# ── 7. 员工独立 Bot — 从 DB registry 读列表 ──────────────────────────────────
 if [[ $NO_FEISHU -eq 0 ]]; then
   echo ""
-  info "检查员工独立 Bot..."
-  EMPLOYEE_BOTS=(product_manager project_manager tech_lead mechanical hardware firmware algorithm testing cost sysadmin)
-  BOT_PORT=8100  # 员工 bot 不监听 HTTP，用递增 port 占位跳过重复检查
+  info "检查员工独立 Bot（来自 employee 表）..."
+  BOT_LIST=$(cd "$COMPANY_DIR" && .venv/bin/python -c "
+from backend.services import registry
+registry.warmup_sync()
+for k in registry.list_keys_sync_cached(active_only=True):
+    cfg = registry.get_effective_sync(k)
+    if cfg and cfg.feishu_app_id:
+        print(k)
+")
   started_bots=0
-  for emp in "${EMPLOYEE_BOTS[@]}"; do
-    env_key="${emp^^}_APP_ID"
-    val=$(grep -E "^${env_key}=" "$INFRA_DIR/.env" 2>/dev/null | cut -d= -f2 | tr -d '"' | tr -d "'" || true)
-    if [[ -n "$val" ]]; then
-      nohup .venv/bin/python -m feishu.employee_bot "$emp" > "$LOG_DIR/bot_${emp}.log" 2>&1 &
-      echo "bot_${emp} $!" >> "$PID_FILE"
-      ok "员工 Bot: $emp (logs/bot_${emp}.log)"
-      started_bots=$((started_bots + 1))
-    fi
-  done
-  [[ $started_bots -eq 0 ]] && warn "未配置员工 Bot APP_ID，跳过（见 infra/.env 注释）"
+  while IFS= read -r emp; do
+    [[ -z "$emp" ]] && continue
+    nohup .venv/bin/python -m feishu.employee_bot "$emp" > "$LOG_DIR/bot_${emp}.log" 2>&1 &
+    echo "bot_${emp} $!" >> "$PID_FILE"
+    ok "员工 Bot: $emp (logs/bot_${emp}.log)"
+    started_bots=$((started_bots + 1))
+  done <<< "$BOT_LIST"
+  [[ $started_bots -eq 0 ]] && warn "无员工配置飞书 App ID，跳过"
 fi
+
+# ── 8. GroupOrchestrator ──────────────────────────────────────────────────────
+echo ""
+info "启动 GroupOrchestrator（群聊调度器）..."
+nohup .venv/bin/python -m feishu.group_chat.orchestrator > "$LOG_DIR/orchestrator.log" 2>&1 &
+echo "orchestrator $!" >> "$PID_FILE"
+ok "GroupOrchestrator (logs/orchestrator.log)"
 
 # ── 完成 ──────────────────────────────────────────────────────────────────────
 echo ""

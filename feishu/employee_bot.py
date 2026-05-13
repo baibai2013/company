@@ -22,6 +22,7 @@ import threading
 from pathlib import Path
 
 import httpx
+import redis
 from dotenv import load_dotenv
 
 load_dotenv(Path(__file__).parent.parent / "infra" / ".env")
@@ -30,38 +31,61 @@ import lark_oapi as lark
 from lark_oapi.api.im.v1.model.p2_im_message_receive_v1 import P2ImMessageReceiveV1
 
 from feishu.commands.dispatch import handle_dispatch
-from feishu.sender import add_reaction, download_image, fetch_recent_image, reply_message, reply_rich_card, send_card, send_rich_card, send_text
+from feishu.group_chat.prompts import (
+    GROUP_SPEAK_PREFIX,
+    build_role_context,
+    build_simple_role_context,
+    format_history,
+)
+from feishu.personas import get_persona_prompt
+from feishu.sender import add_reaction, download_image, fetch_recent_image, fetch_recent_text, reply_message, reply_rich_card, send_card, send_rich_card, send_text
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s  %(levelname)s  %(message)s")
 log = logging.getLogger("feishu.employee_bot")
 
-EMPLOYEE_CONFIG: dict[str, tuple[str, str]] = {
-    "product_manager": ("🎯", "小米"),
-    "project_manager": ("📋", "芳芳"),
-    "tech_lead":       ("🔧", "胖虎"),
-    "mechanical":      ("⚙️",  "Dave"),
-    "hardware":        ("🔌", "大法师"),
-    "firmware":        ("💾", "小布丁"),
-    "algorithm":       ("🧠", "喵喵球"),
-    "testing":         ("🧪", "狐妖小红娘"),
-    "cost":            ("💰", "兔子精"),
-    "sysadmin":        ("🖥️",  "零"),
-}
+# Employee config sourced from DB registry (see feishu/group_chat/models.py).
+from feishu.group_chat.models import EMPLOYEE_CONFIG, ROLE_DESCRIPTIONS as _ROLE_DESCRIPTIONS  # noqa: F401
 
-_ROLE_DESCRIPTIONS = {
-    "product_manager": "负责产品需求和用户体验",
-    "project_manager": "负责项目进度和团队协调",
-    "tech_lead":       "负责技术架构和技术决策",
-    "mechanical":      "负责机械结构设计",
-    "hardware":        "负责硬件电路设计",
-    "firmware":        "负责嵌入式固件开发",
-    "algorithm":       "负责算法和运动控制",
-    "testing":         "负责测试和质量保证",
-    "cost":            "负责成本分析和供应链",
-    "sysadmin":        "负责系统运维和开发",
-}
 
 _processed: set[str] = set()
+
+# ── Redis client for group message forwarding (sync, used from WS thread) ─────
+_redis_client: redis.Redis | None = None
+
+
+def _get_redis() -> redis.Redis:
+    global _redis_client
+    if _redis_client is None:
+        _redis_client = redis.Redis.from_url("redis://localhost:6379/0", decode_responses=True)
+    return _redis_client
+
+
+def _publish_group_message(chat_id: str, message_id: str, text: str,
+                           image_base64: str = "", mentions: list[str] | None = None) -> None:
+    """Forward a group message to the EventBus for orchestrator processing.
+
+    Uses SETNX dedup so only the first employee bot to receive the message
+    publishes it — prevents 10× duplicate processing.
+    """
+    import json as _json
+    dedup_key = f"group_msg_sent:{message_id}"
+    r = _get_redis()
+    # NX=only set if not exists, EX=expire after 60s
+    if not r.set(dedup_key, "1", nx=True, ex=60):
+        return  # another bot already published this message
+    payload = _json.dumps({
+        "message_id": message_id,
+        "chat_id": chat_id,
+        "sender": "user",
+        "text": text,
+        "image_base64": image_base64,
+        "mentions": mentions or [],
+    }, ensure_ascii=False)
+    try:
+        r.publish(f"group_msg:{chat_id}", payload)
+        log.info("forwarded group_msg:%s mid=%s", chat_id, message_id)
+    except Exception as exc:
+        log.warning("publish group_msg failed: %s", exc)
 
 
 def _make_client(app_id: str, app_secret: str) -> lark.Client:
@@ -115,7 +139,7 @@ _REPLY_EMOJI = {
 
 async def _handle(employee: str, task: str, chat_id: str, client: lark.Client,
                   image_base64: str = "", image_media_type: str = "image/jpeg",
-                  message_id: str = "") -> None:
+                  message_id: str = "", chat_type: str = "p2p") -> None:
     emoji, name = EMPLOYEE_CONFIG.get(employee, ("👤", employee))
 
     # 在原消息上贴表情表示收到
@@ -139,12 +163,28 @@ async def _handle(employee: str, task: str, chat_id: str, client: lark.Client,
         quick_hint = "收到，处理中…"
     _send_card("⏳ 处理中", quick_hint, "grey")
 
-    data = await handle_dispatch(employee, task, chat_id=chat_id,
+    # 大群：拉近期聊天记录注入上下文，让 agent 了解来龙去脉
+    if chat_type == "group":
+        history = fetch_recent_text(client, chat_id, limit=20, within_secs=3600)
+        task_with_ctx = (
+            f"【近期群聊记录（供参考，理解上下文）】\n{history}\n\n【当前消息】{task}"
+            if history else task
+        )
+    else:
+        task_with_ctx = task
+
+    # 每条消息独立 thread，避免历史累积超长
+    thread_id = message_id or f"{chat_id}_{id(task)}"
+    data = await handle_dispatch(employee, task_with_ctx, task_id=thread_id, chat_id=chat_id,
                                  image_base64=image_base64, image_media_type=image_media_type)
     route  = data.get("route", "WORK")
     plan   = data.get("plan", "")
     result = data.get("result", "(无输出)")
-    cc     = data.get("cc", []) if employee == "product_manager" else []
+    # PM 单聊走 CC；项目经理群聊/单聊均可发起头脑风暴 CC
+    cc = data.get("cc", []) if (
+        (employee == "product_manager" and chat_type == "p2p")
+        or employee == "project_manager"
+    ) else []
 
     if route == "CHAT":
         _send_card(f"{emoji} 回复", result[:2000], "blue")
@@ -156,22 +196,36 @@ async def _handle(employee: str, task: str, chat_id: str, client: lark.Client,
                        "yellow")
         _send_card("✅ 完成", result[:2000], "blue")
 
-    # CC：依次让专家补充专业意见（仅 PM 触发）
+    # CC：依次让专家补充专业意见（PM 单聊 / 项目经理头脑风暴）
     if cc:
-        context = f"背景（产品经理已回复）：{result[:400]}\n\n原始消息：{task}"
+        emp_emoji, emp_name = EMPLOYEE_CONFIG.get(employee, ("👤", employee))
+        context_base = (
+            f"原始问题：{task}\n\n"
+            f"{emp_name}主持词：{result[:300]}"
+        )
+        prior_voices: list[str] = []
         for cc_emp in cc:
             cc_emoji, cc_name = EMPLOYEE_CONFIG.get(cc_emp, ("👤", cc_emp))
-            send_text(client, chat_id, f"{cc_emoji} {cc_name} 补充意见中…")
+            prior_section = (
+                "\n\n**前面同事的发言（不要重复，可以补充或不同意）：**\n"
+                + "\n".join(prior_voices)
+            ) if prior_voices else ""
+            context = (
+                f"{context_base}{prior_section}\n\n"
+                "【重要】只需发表你自己的专业意见，不要@任何人，不要建议找其他人，不要安排下一步任务。"
+            )
+            _send_card("⏳ 处理中", f"{cc_emoji} {cc_name} 发表意见中…", "grey")
             try:
                 cc_data = await handle_dispatch(cc_emp, context)
                 cc_result = cc_data.get("result", "(无输出)")
-                send_text(client, chat_id, f"{cc_emoji} **{cc_name}**：{cc_result[:600]}")
+                prior_voices.append(f"{cc_name}：{cc_result[:200]}")
+                _send_card(f"{cc_emoji} {cc_name}", cc_result[:2000], "blue")
             except Exception as exc:
                 log.warning("cc dispatch failed for %s: %s", cc_emp, exc)
 
 
 def make_on_message(employee: str, client: lark.Client, bot_open_id: str):
-    is_default = (employee == "product_manager")
+    is_default = (employee == "project_manager")
 
     def on_message(data: P2ImMessageReceiveV1) -> None:
         msg = data.event.message if data.event else None
@@ -202,7 +256,7 @@ def make_on_message(employee: str, client: lark.Client, bot_open_id: str):
         # 大群消息路由：
         #   @all       → 所有 bot 都响应
         #   精确 @本人  → 响应
-        #   无 @       → 仅产品经理（默认接话人）响应
+        #   无 @       → 仅项目经理芳芳（默认接话人）响应
         #   @其他人    → 静默
         if msg.chat_type == "group":
             mentions = msg.mentions or []
@@ -250,7 +304,34 @@ def make_on_message(employee: str, client: lark.Client, bot_open_id: str):
                 text = json.loads(raw_content).get("text", "")
             except Exception:
                 text = raw_content
+            log.info("raw_text=%.80r", text)
+            has_at_all = bool(re.search(r"@(?:_all|all|所有人|ALL)", text, re.IGNORECASE))
             text = re.sub(r"@\S+", "", text).strip()
+            if has_at_all:
+                text = f"[全员] {text}" if text else "[全员]"
+            else:
+                # 从 msg.mentions 取显示名，映射到员工 key，注入 [@key] 前缀
+                # 飞书 text 字段里的 @_user_1 是内部占位 ID，不可靠，要用 mentions 数组
+                _NAME_TO_EMP = {
+                    "项目经理芳芳": "project_manager", "芳芳": "project_manager",
+                    "Dave": "mechanical",
+                    "大法师": "hardware",
+                    "小布丁": "firmware",
+                    "喵喵球": "algorithm",
+                    "狐妖": "testing",
+                    "兔子精": "cost",
+                    "小米": "product_manager",
+                    "胖虎": "tech_lead",
+                }
+                mention_keys = []
+                for m in (msg.mentions or []):
+                    display = getattr(m, "name", None) or getattr(getattr(m, "id", None), "name", None) or ""
+                    emp_key = _NAME_TO_EMP.get(display)
+                    if emp_key:
+                        mention_keys.append(emp_key)
+                if mention_keys:
+                    tags = " ".join(f"[@{k}]" for k in mention_keys)
+                    text = f"{tags} {text}".strip()
             # 群里文字消息：查最近 2 分钟是否有图片
             if msg.chat_type == "group" and not image_base64:
                 image_base64, image_media_type = fetch_recent_image(client, msg.chat_id)
@@ -261,15 +342,205 @@ def make_on_message(employee: str, client: lark.Client, bot_open_id: str):
         chat_id = msg.chat_id
         log.info("employee=%s chat_type=%s text=%.60s image=%s",
                  employee, msg.chat_type, text, bool(image_base64))
+
+        # 大群消息：转发到 EventBus，由 GroupOrchestrator 统一调度，不再本地处理
+        if msg.chat_type == "group":
+            _publish_group_message(
+                chat_id, mid, text,
+                image_base64=image_base64,
+                mentions=[getattr(getattr(m, "id", None), "open_id", "")
+                          for m in (msg.mentions or [])],
+            )
+            return
+
+        # 单聊消息：保持原有逻辑不变
         threading.Thread(
             target=_run_async,
             args=(_handle(employee, text, chat_id, client,
                           image_base64=image_base64, image_media_type=image_media_type,
-                          message_id=mid),),
+                          message_id=mid, chat_type=msg.chat_type),),
             daemon=True,
         ).start()
 
     return on_message
+
+
+# ── Group listener: subscribe to speak_req and respond with fast Haiku ────────
+
+async def _get_joined_group_chat_ids(app_id: str, app_secret: str) -> list[str]:
+    """获取 bot 所在的所有群聊 chat_id 列表。"""
+    import httpx as _httpx
+    try:
+        token_resp = _httpx.post(
+            "https://open.feishu.cn/open-apis/auth/v3/app_access_token/internal",
+            json={"app_id": app_id, "app_secret": app_secret},
+            timeout=10,
+        )
+        token = token_resp.json().get("app_access_token", "")
+        if not token:
+            log.warning("get_joined_groups: failed to get tenant token")
+            return []
+
+        chat_ids: list[str] = []
+        page_token = ""
+        while True:
+            url = "https://open.feishu.cn/open-apis/im/v1/chats"
+            params = {"page_size": 100, "user_id_type": "open_id"}
+            if page_token:
+                params["page_token"] = page_token
+            resp = _httpx.get(
+                url,
+                headers={"Authorization": f"Bearer {token}"},
+                params=params,
+                timeout=10,
+            )
+            data = resp.json()
+            if data.get("code") != 0:
+                log.warning("get_joined_groups failed: %s", data.get("msg", ""))
+                break
+            for item in data.get("data", {}).get("items", []):
+                cid = item.get("chat_id", "")
+                if cid:
+                    chat_ids.append(cid)
+            if not data.get("data", {}).get("has_more"):
+                break
+            page_token = data.get("data", {}).get("page_token", "")
+            if not page_token:
+                break
+        log.info("get_joined_groups: found %d groups", len(chat_ids))
+        return chat_ids
+    except Exception as exc:
+        log.warning("get_joined_groups failed: %s", exc)
+        return []
+
+
+def _start_group_listener(employee: str, client: lark.Client, app_id: str = "", app_secret: str = ""):
+    """在 daemon 线程中运行群聊 SpeakRequest 监听器。
+
+    订阅 speak_req:{employee}:* 频道，收到请求后用快速 Haiku 通道回复。
+    """
+    import asyncio as _asyncio
+    import redis.asyncio as _aioredis
+    import json as _json
+    import uuid as _uuid
+
+    from langchain_core.messages import HumanMessage, SystemMessage
+    from agents_v2.shared.claude_client import make_langchain_llm
+
+    emoji, name = EMPLOYEE_CONFIG.get(employee, ("👤", employee))
+
+    async def _listener():
+        redis_conn = _aioredis.from_url("redis://localhost:6379/0")
+
+        # Get initial group list
+        chat_ids = await _get_joined_group_chat_ids(app_id, app_secret)
+        if not chat_ids:
+            log.warning("group_listener(%s): no groups found, will retry", employee)
+
+        # Subscribe to speak_req channels for all known groups
+        async def _resubscribe(pubsub: _aioredis.client.PubSub, cids: list[str]):
+            channels = [f"speak_req:{employee}:{cid}" for cid in cids]
+            if channels:
+                await pubsub.subscribe(*channels)
+                log.info("group_listener(%s): subscribed to %d channels", employee, len(channels))
+
+        pubsub = redis_conn.pubsub()
+        if chat_ids:
+            await _resubscribe(pubsub, chat_ids)
+
+        # Periodic group list refresh (every 5 min)
+        last_refresh = 0
+
+        async for msg in pubsub.listen():
+            if msg["type"] != "message":
+                continue
+
+            # Periodic refresh of group list
+            now = __import__("time").time()
+            if now - last_refresh > 300:
+                try:
+                    new_ids = await _get_joined_group_chat_ids(app_id, app_secret)
+                    if set(new_ids) != set(chat_ids):
+                        chat_ids = new_ids
+                        await _resubscribe(pubsub, chat_ids)
+                    last_refresh = now
+                except Exception:
+                    pass
+
+            try:
+                data = _json.loads(msg["data"])
+            except Exception:
+                continue
+
+            session_id = data.get("session_id", "")
+            chat_id = data.get("chat_id", "")
+            history_text = data.get("history_text", "")
+            trigger_message_id = data.get("trigger_message_id", "")
+            role_context = data.get("role_context", "")
+            summary_mode = data.get("summary_mode", False)
+
+            log.info("group_listener(%s): received speak_req session=%s summary=%s",
+                     employee, session_id, summary_mode)
+
+            # Fast Haiku channel for group speak
+            try:
+                llm = make_langchain_llm("claude-haiku-4-5-20251001")
+
+                if summary_mode:
+                    system = f"你是{emoji} {name}，项目经理。请根据讨论内容做简短总结。"
+                else:
+                    persona = get_persona_prompt(employee)
+                    system = (
+                        f"{persona}\n\n"
+                        f"{GROUP_SPEAK_PREFIX}\n\n"
+                        f"{role_context}"
+                    )
+
+                human = history_text
+                resp = await llm.ainvoke([
+                    SystemMessage(system),
+                    HumanMessage(human),
+                ])
+                content = resp.content[:2000]
+
+                # Reply to the trigger message thread
+                log.info("group_listener(%s): trigger_mid=%r content_len=%d",
+                         employee, trigger_message_id, len(content))
+                if trigger_message_id and content:
+                    reply_rich_card(
+                        client, trigger_message_id,
+                        f"{'📋 总结' if summary_mode else f'{emoji} {name}'}",
+                        content, "blue",
+                    )
+                    log.info("group_listener(%s): reply_rich_card sent", employee)
+                else:
+                    log.warning("group_listener(%s): skipped reply — trigger_mid=%r content_len=%d",
+                                employee, trigger_message_id, len(content))
+
+                # Publish response
+                resp_payload = _json.dumps({
+                    "session_id": session_id,
+                    "chat_id": chat_id,
+                    "employee": employee,
+                    "content": content,
+                    "success": True,
+                }, ensure_ascii=False)
+                await redis_conn.publish(f"speak_resp:{session_id}", resp_payload)
+                log.info("group_listener(%s): speak_resp published session=%s", employee, session_id)
+
+            except Exception as exc:
+                log.error("group_listener(%s): speak handling failed: %s", employee, exc)
+                # Publish failure response so orchestrator doesn't hang
+                resp_payload = _json.dumps({
+                    "session_id": session_id,
+                    "chat_id": chat_id,
+                    "employee": employee,
+                    "content": "",
+                    "success": False,
+                }, ensure_ascii=False)
+                await redis_conn.publish(f"speak_resp:{session_id}", resp_payload)
+
+    _asyncio.run(_listener())
 
 
 def run_bot(employee: str) -> None:
@@ -315,6 +586,16 @@ def run_bot(employee: str) -> None:
         app_secret=app_secret,
         event_handler=handler,
     )
+
+    # 启动群聊 SpeakRequest 监听器（daemon 线程，独立 asyncio loop）
+    threading.Thread(
+        target=_start_group_listener,
+        args=(employee, client, app_id, app_secret),
+        daemon=True,
+        name=f"group-listener-{employee}",
+    ).start()
+    print(f"  群聊监听器: 已启动")
+
     ws_client.start()
 
 

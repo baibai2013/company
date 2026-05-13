@@ -14,16 +14,43 @@ from agents_v2.shared.a2a_server import call_agent
 from agents_v2.shared.claude_client import make_langchain_llm
 from agents_v2.tech_lead.prompts import SYSTEM_PROMPT
 
-EMPLOYEES = {
-    "mechanical":      "http://localhost:9001",
-    "hardware":        "http://localhost:9002",
-    "firmware":        "http://localhost:9003",
-    "algorithm":       "http://localhost:9004",
-    "product_manager": "http://localhost:9005",
-    "testing":         "http://localhost:9006",
-    "cost":            "http://localhost:9007",
-    "project_manager": "http://localhost:9008",
-}
+
+def _employee_endpoints() -> dict[str, str]:
+    """Build the {key: http://host:port} routing table from registry.
+
+    Excludes tech_lead itself (this graph runs inside it) and any inactive employees.
+    """
+    from backend.services import registry
+    if not registry._loaded:  # type: ignore[attr-defined]
+        try:
+            registry.warmup_sync()
+        except RuntimeError:
+            pass
+    out = {}
+    for emp in registry.list_keys_sync_cached(active_only=True):
+        if emp == "tech_lead":
+            continue
+        cfg = registry.get_effective_sync(emp)
+        if cfg and cfg.agent_port:
+            out[emp] = f"http://localhost:{cfg.agent_port}"
+    return out
+
+
+# Backwards-compatible: many callers do `EMPLOYEES.get(k)` or `k in EMPLOYEES`.
+class _DynamicEndpoints:
+    def _data(self):
+        return _employee_endpoints()
+    def __getitem__(self, k):     return self._data()[k]
+    def get(self, k, default=None): return self._data().get(k, default)
+    def __contains__(self, k):     return k in self._data()
+    def __iter__(self):            return iter(self._data())
+    def __len__(self):             return len(self._data())
+    def items(self):               return self._data().items()
+    def keys(self):                return self._data().keys()
+    def values(self):              return self._data().values()
+
+
+EMPLOYEES: dict[str, str] = _DynamicEndpoints()  # type: ignore[assignment]
 
 
 class SupervisorState(TypedDict):

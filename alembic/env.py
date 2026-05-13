@@ -8,6 +8,9 @@ from backend.core.config import settings
 from backend.core.db import Base
 import backend.models.task  # noqa: F401 — register Task, TaskStep
 import backend.models.message  # noqa: F401 — register ChatMessage
+import backend.models.employee  # noqa: F401 — register Employee, SystemConfig
+import backend.models.audit  # noqa: F401 — register AuditLog
+import backend.models.llm_call  # noqa: F401 — register LlmCall
 
 config = context.config
 config.set_main_option("sqlalchemy.url", settings.database_url_sync)
