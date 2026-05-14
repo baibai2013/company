@@ -18,7 +18,7 @@ if TYPE_CHECKING:
     from ..models import GroupSession
 
 from ..participant import Participant
-from ..pipelines import announce, speak_sequential
+from ..pipelines import announce, speak_sequential, VisibleScope
 from .base import Scenario, register
 
 log = logging.getLogger(__name__)
@@ -178,18 +178,18 @@ class WerewolfScenario(Scenario):
             wolf_participants = [self._p(w) for w in wolves]
 
             # 狼人讨论+投票（统一接口）
-            await speak_sequential(
-                wolf_participants, session, bus_pool,
-                context_fn=lambda p: (
-                    f"你是狼人。现在是夜晚，只有狼人同伴能看到这段对话。\n"
-                    f"存活的非狼人玩家：{candidates}\n"
-                    f"讨论要杀谁。在回复最后写【杀:目标key】。30字以内。"
-                ),
-                visible_to=wolves + [host],
-                timeout=60,
-                marks=["wolf_night"],
-                **_win,
-            )
+            async with VisibleScope(wolves + [host]):
+                await speak_sequential(
+                    wolf_participants, session, bus_pool,
+                    context_fn=lambda p: (
+                        f"你是狼人。现在是夜晚，只有狼人同伴能看到这段对话。\n"
+                        f"存活的非狼人玩家：{candidates}\n"
+                        f"讨论要杀谁。在回复最后写【杀:目标key】。30字以内。"
+                    ),
+                    timeout=60,
+                    marks=["wolf_night"],
+                    **_win,
+                )
 
             # 提取杀人目标
             kill_target = self._extract_target(wolves, "杀")
@@ -204,28 +204,27 @@ class WerewolfScenario(Scenario):
             alive_others = [p for p in state["alive"] if p != seer]
             candidates = ", ".join(self._p(c).display_name for c in alive_others)
 
-            resp = await seer_p.speak(
-                session, bus_pool,
-                context=(
-                    f"你是预言家。选择一人查验身份。存活玩家：{candidates}\n"
-                    f"在回复最后写【查验:目标key】。10字以内。"
-                ),
-                visible_to=[seer, host],
-                timeout=60,
-                marks=["seer_night"],
-                **_win,
-            )
-            check_target = self._extract_action(resp or "", "查验")
-            if check_target and check_target in state["roles"]:
-                is_wolf = state["roles"][check_target] == "wolf"
-                result = "狼人" if is_wolf else "好人"
-                await announce(
-                    session, host, bus_pool,
-                    context=f"告诉预言家查验结果：「{check_target} 是{result}。」10字以内。",
-                    visible_to=[seer, host],
-                    marks=["system_event"],
+            async with VisibleScope([seer, host]):
+                resp = await seer_p.speak(
+                    session, bus_pool,
+                    context=(
+                        f"你是预言家。选择一人查验身份。存活玩家：{candidates}\n"
+                        f"在回复最后写【查验:目标key】。10字以内。"
+                    ),
+                    timeout=60,
+                    marks=["seer_night"],
                     **_win,
                 )
+                check_target = self._extract_action(resp or "", "查验")
+                if check_target and check_target in state["roles"]:
+                    is_wolf = state["roles"][check_target] == "wolf"
+                    result = "狼人" if is_wolf else "好人"
+                    await announce(
+                        session, host, bus_pool,
+                        context=f"告诉预言家查验结果：「{check_target} 是{result}。」10字以内。",
+                        marks=["system_event"],
+                        **_win,
+                    )
 
         # 3. 女巫行动
         witch = state["witch"]
@@ -239,18 +238,18 @@ class WerewolfScenario(Scenario):
                 poison_info = "你有毒药可以毒一人。"
 
             if heal_info or poison_info:
-                resp = await witch_p.speak(
-                    session, bus_pool,
-                    context=(
-                        f"你是女巫。{heal_info} {poison_info}\n"
-                        f"选择行动：【救:{dead_tonight[0] if dead_tonight else '无'}】或"
-                        f"【毒:目标key】或【跳过】。20字以内。"
-                    ),
-                    visible_to=[witch, host],
-                    timeout=60,
-                    marks=["witch_night"],
-                    **_win,
-                )
+                async with VisibleScope([witch, host]):
+                    resp = await witch_p.speak(
+                        session, bus_pool,
+                        context=(
+                            f"你是女巫。{heal_info} {poison_info}\n"
+                            f"选择行动：【救:{dead_tonight[0] if dead_tonight else '无'}】或"
+                            f"【毒:目标key】或【跳过】。20字以内。"
+                        ),
+                        timeout=60,
+                        marks=["witch_night"],
+                        **_win,
+                    )
                 if resp:
                     if "救" in resp and dead_tonight and state["witch_heal"]:
                         save_target = self._extract_action(resp, "救")

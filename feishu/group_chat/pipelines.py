@@ -8,6 +8,7 @@ fanout（并行发言）、announce（单人公告）、vote（投票）等通�
 """
 from __future__ import annotations
 
+import contextvars
 import logging
 import time
 import uuid
@@ -23,6 +24,30 @@ from .prompts import build_role_context, format_history
 log = logging.getLogger(__name__)
 
 _SPEAK_TIMEOUT = 120.0
+
+_visible_scope: contextvars.ContextVar[list[str]] = contextvars.ContextVar(
+    "visible_scope", default=[],
+)
+
+
+class VisibleScope:
+    """可见性上下文管理器：在 async with 块内，announce/speak_sequential 自动继承此可见范围。
+
+    用法：
+        async with VisibleScope(wolves + [host]):
+            await speak_sequential(...)   # 无需重复传 visible_to=
+    """
+
+    def __init__(self, visible_to: list[str]):
+        self._visible_to = visible_to
+        self._token = None
+
+    async def __aenter__(self) -> "VisibleScope":
+        self._token = _visible_scope.set(self._visible_to)
+        return self
+
+    async def __aexit__(self, *_) -> None:
+        _visible_scope.reset(self._token)
 
 
 # ── Internal helpers ──────────────────────────────────────────────────────────
@@ -266,6 +291,7 @@ async def announce(
     Returns:
         发言内容字符串，失败返回 None。
     """
+    effective_visible_to = visible_to if visible_to is not None else (_visible_scope.get() or None)
     t0 = time.perf_counter()
     req = SpeakRequest(
         session_id=session.id,
@@ -285,7 +311,7 @@ async def announce(
     elapsed = time.perf_counter() - t0
     resp = responses.get(speaker)
     if resp and resp.success:
-        _append_to_history(session, speaker, resp.content, visible_to=visible_to, marks=marks)
+        _append_to_history(session, speaker, resp.content, visible_to=effective_visible_to, marks=marks)
         log.info("TRACE announce session=%s speaker=%s elapsed=%.2fs ctx≈%dtok",
                  session.id[:8], speaker, elapsed, len(context) // 4)
         return resp.content
@@ -441,13 +467,14 @@ async def speak_sequential(
     Returns:
         成功发言的 participant key 列表。
     """
+    effective_visible_to = visible_to if visible_to is not None else (_visible_scope.get() or None)
     completed = []
     for p in participants:
         ctx = context_fn(p) if context_fn else ""
         t0 = time.perf_counter()
         content = await p.speak(
             session, bus_pool, context=ctx,
-            visible_to=visible_to, timeout=timeout, marks=marks,
+            visible_to=effective_visible_to, timeout=timeout, marks=marks,
             max_messages=max_messages, keep_marks=keep_marks,
         )
         elapsed = time.perf_counter() - t0
