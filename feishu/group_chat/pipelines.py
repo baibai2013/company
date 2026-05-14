@@ -186,6 +186,7 @@ async def fanout(
     bus_pool: "GroupEventBusPool",
     role_context_fn=None,
     timeout: float = _SPEAK_TIMEOUT,
+    enable_gather: bool = True,
 ) -> dict[str, SpeakResponse]:
     """并行发言管道：所有参与者同时发言，看到相同的历史记录（互相不可见新回复）。
 
@@ -195,6 +196,7 @@ async def fanout(
         bus_pool: Redis 事件总线。
         role_context_fn: 自定义上下文函数 (employee, session, index) -> str。
         timeout: 总超时时间（秒）。
+        enable_gather: True=asyncio.gather 真并行；False=视图一致但顺序发言（投票场景用）。
 
     Returns:
         员工 key → SpeakResponse 的字典。
@@ -218,7 +220,15 @@ async def fanout(
         )
         await bus_pool.pub_bus.publish_speak_req(req)
 
-    responses = await _wait_for_responses(bus_pool, session.id, participants, timeout=timeout)
+    if enable_gather:
+        responses = await _wait_for_responses(bus_pool, session.id, participants, timeout=timeout)
+    else:
+        # 顺序等待，但所有人用相同的 history 快照（已在上面统一发请求）
+        responses = {}
+        for emp in participants:
+            r = await _wait_for_responses(bus_pool, session.id, [emp], timeout=timeout)
+            responses.update(r)
+
     for emp in participants:
         resp = responses.get(emp)
         if resp and resp.success:
@@ -449,3 +459,45 @@ async def speak_sequential(
             log.info("TRACE speak session=%s participant=%s elapsed=%.2fs TIMEOUT/SKIP",
                      session.id[:8], p.key, elapsed)
     return completed
+
+
+# ── 流程控制原语 ──────────────────────────────────────────────────────────────
+
+async def loop_until(
+    condition_fn,
+    body_fn,
+    max_rounds: int = 10,
+) -> int:
+    """条件循环原语：condition_fn() 返回 True 时反复执行 body_fn()。
+
+    Args:
+        condition_fn: () -> bool，返回 True 表示继续循环。
+        body_fn: async () -> None，每轮执行的逻辑。
+        max_rounds: 最大轮数，防止死循环。
+
+    Returns:
+        实际执行的轮数。
+    """
+    rounds = 0
+    while condition_fn() and rounds < max_rounds:
+        await body_fn()
+        rounds += 1
+    return rounds
+
+
+async def conditional(
+    condition: bool,
+    if_fn,
+    else_fn=None,
+) -> None:
+    """条件分支原语：condition 为 True 执行 if_fn，否则执行 else_fn。
+
+    Args:
+        condition: 判断条件。
+        if_fn: async () -> None，条件为真时执行。
+        else_fn: async () -> None | None，条件为假时执行（可选）。
+    """
+    if condition:
+        await if_fn()
+    elif else_fn is not None:
+        await else_fn()
