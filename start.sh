@@ -64,6 +64,15 @@ start_py() {
   nohup .venv/bin/python "$@" > "$LOG_DIR/$name.log" 2>&1 &
   local pid=$!
   echo "$name $pid" >> "$PID_FILE"
+  # Also drop a per-employee PID file so backend.services.process_manager
+  # can stop / inspect / restart agents started here.
+  case "$name" in
+    backend|frontend|feishu_bot|orchestrator) ;;
+    *)
+      mkdir -p "$LOG_DIR/.pids"
+      echo "$pid" > "$LOG_DIR/.pids/agent_${name}.pid"
+      ;;
+  esac
   echo -n "   等待 $name ($port) 就绪..."
   for i in $(seq 1 20); do
     if curl -sf "http://localhost:$port/health" &>/dev/null; then
@@ -224,7 +233,10 @@ for k in registry.list_keys_sync_cached(active_only=True):
   while IFS= read -r emp; do
     [[ -z "$emp" ]] && continue
     nohup .venv/bin/python -m feishu.employee_bot "$emp" > "$LOG_DIR/bot_${emp}.log" 2>&1 &
-    echo "bot_${emp} $!" >> "$PID_FILE"
+    bot_pid=$!
+    echo "bot_${emp} $bot_pid" >> "$PID_FILE"
+    mkdir -p "$LOG_DIR/.pids"
+    echo "$bot_pid" > "$LOG_DIR/.pids/bot_${emp}.pid"
     ok "员工 Bot: $emp (logs/bot_${emp}.log)"
     started_bots=$((started_bots + 1))
   done <<< "$BOT_LIST"
@@ -237,6 +249,26 @@ info "启动 GroupOrchestrator（群聊调度器）..."
 nohup .venv/bin/python -m feishu.group_chat.orchestrator > "$LOG_DIR/orchestrator.log" 2>&1 &
 echo "orchestrator $!" >> "$PID_FILE"
 ok "GroupOrchestrator (logs/orchestrator.log)"
+
+# ── 9. 等待飞书 WebSocket 连接就绪 ────────────────────────────────────────────
+echo ""
+info "等待飞书 Bot WebSocket 连接..."
+WS_READY=0
+for i in $(seq 1 120); do
+  # 检查 project_manager bot 的 WebSocket 是否已连接（它通常最后连上）
+  if grep -q "connected to wss://" "$LOG_DIR/bot_project_manager.log" 2>/dev/null; then
+    WS_READY=1
+    break
+  fi
+  sleep 1
+  echo -n "."
+done
+echo ""
+if [[ $WS_READY -eq 1 ]]; then
+  ok "飞书 Bot WebSocket 已连接，系统可正常接收消息"
+else
+  warn "飞书 Bot WebSocket 120s 内未连接，请检查网络或 logs/bot_project_manager.log"
+fi
 
 # ── 完成 ──────────────────────────────────────────────────────────────────────
 echo ""

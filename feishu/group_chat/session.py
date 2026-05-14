@@ -51,6 +51,7 @@ class SessionStore:
                     "feishu_message_id": m.feishu_message_id,
                     "created_at": m.created_at,
                     "role": m.role,
+                    "visible_to": m.visible_to,
                 }
                 for m in session.history
             ],
@@ -58,6 +59,9 @@ class SessionStore:
             "created_at": session.created_at,
             "ttl": session.ttl,
             "template": session.template,
+            "activity_rules": session.activity_rules,
+            "host": session.host,
+            "game_state": session.game_state,
             "role_assignments": {
                 emp: {
                     "employee": r.employee,
@@ -102,6 +106,7 @@ class SessionStore:
                     feishu_message_id=m["feishu_message_id"],
                     created_at=m["created_at"],
                     role=m.get("role", "user"),
+                    visible_to=m.get("visible_to", []),
                 )
                 for m in data.get("history", [])
             ],
@@ -109,6 +114,9 @@ class SessionStore:
             created_at=data.get("created_at", 0.0),
             ttl=data.get("ttl", DEFAULT_TTL),
             template=data.get("template", "free"),
+            activity_rules=data.get("activity_rules", ""),
+            host=data.get("host", ""),
+            game_state=data.get("game_state", {}),
             role_assignments=role_assignments,
             role_history=data.get("role_history", []),
             summary=data.get("summary", ""),

@@ -15,6 +15,7 @@ class ConversationMessage:
     feishu_message_id: str     # feishu message_id for thread replies
     created_at: float          # unix timestamp
     role: str = "user"         # "user" | "assistant"
+    visible_to: list[str] = field(default_factory=list)  # empty = visible to all
 
 
 @dataclass
@@ -39,6 +40,9 @@ class GroupSession:
     created_at: float = 0.0
     ttl: int = 1800            # 30 min
     template: str = "free"     # "brainstorm" | "debate" | "werewolf" | "review" | "free"
+    activity_rules: str = ""   # host-defined rules of this session, broadcast to all participants
+    host: str = ""             # employee key of the host/organizer (often project_manager)
+    game_state: dict = field(default_factory=dict)  # e.g. {"secret_number": 42}
     role_assignments: dict[str, SessionRole] = field(default_factory=dict)
     role_history: list[tuple[float, dict]] = field(default_factory=list)
     summary: str = ""

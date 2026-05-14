@@ -27,9 +27,10 @@ _DECIDE_PROMPT_TEMPLATE = """你是群聊调度员，根据最新消息决定如
 2. 消息含 [@具体人] → mode=single, participants=[该人]（该人负责组织/回答）
 3. "头脑风暴/大家说说/集思广益/brainstorm" → mode=sequential, 选≤6个最相关专家
 4. "同时/并行/大家一起" → mode=parallel, 选相关专家
-5. 技术问题但无明确@人 → mode=single, participants=[最相关专家]
-6. 项目进度/协调类 → mode=single, participants=[project_manager]
-7. 纯闲聊/表情/打卡 → mode=ignore
+5. 游戏/互动/娱乐/趣味活动/猜谜/投票/竞猜/比赛 → mode=sequential, participants=全部员工（全员参与最有趣）
+6. 技术问题但无明确@人 → mode=single, participants=[最相关专家]
+7. 项目进度/任务分配/里程碑/协调类（明确与工作相关） → mode=single, participants=[project_manager]
+8. 纯闲聊/表情/打卡 → mode=ignore
 
 输出格式（只输出 JSON）：
 {{"mode": "single|sequential|parallel|ignore", "participants": [...], "reason": "一句话理由"}}"""
@@ -77,27 +78,52 @@ def __getattr__(name: str):
 
 # ── Role decide prompt (section 13.3) ─────────────────────────────────────────
 
-ROLE_DECIDE_PROMPT = """根据话题和参与者，为每个人分配一个最能推动讨论的角色。
+ROLE_DECIDE_PROMPT = """你为本次群聊互动现场设计「活动规则」和「角色分配」。
 
-角色可以是：
-- 预设角色：主持人、正方、反方、挑战者、支持者、裁判
-- 自由角色：任何你认为合适的角色描述，如"用户视角代言人"、"成本杀手"、"技术乐观派"
-- 游戏角色：狼人、村民、预言家、巫师、骑士 等
+【你的输出由两部分组成】：
 
-输出 JSON：
+1. **activity_rules**：本次活动的可执行玩法说明，所有参与者都会看到这段文字
+   - 游戏类（猜数字、狼人杀、真心话、谁是卧底、成语接龙等）：写清完整玩法、范围、判定标准、轮次结构
+   - 辩论/角色扮演：说明立场分配、发言顺序、目标
+   - 工作头脑风暴/严肃讨论：可设为空字符串 ""
+   - 不要超过 150 字，要让每位成员一眼看懂自己该做什么
+
+2. **roles**：每位参与者在本场活动中的具体角色
+   - 角色描述必须可执行（"你应该做什么"，而不是"你是怎样的人"）
+   - 如果活动需要主持/裁判/出题人，把该员工 key 填到顶层 host 字段；优先选 project_manager
+   - 主持人的 role_desc 要包含独有职责（出题、判定、公布答案、推进流程等）
+   - 普通参与者的 role_desc 鼓励他们结合自己的专业身份创意发挥
+
+【角色类型可以是】：
+- 预设角色：主持人、正方、反方、挑战者、支持者、裁判、出题人、答题者、玩家
+- 自由角色："用户视角代言人"、"成本杀手"、"技术乐观派"等
+- 游戏角色：狼人、村民、预言家、巫师、骑士、卧底等
+- 隐藏信息游戏（狼人杀等）通过 visible_to 限制角色可见性
+
+【输出 JSON 示例】：
+
+示例 A — 0-100 猜数字游戏：
 {
-  "template": "debate | brainstorm | werewolf | free",
+  "template": "guess_number",
+  "host": "project_manager",
+  "activity_rules": "0-100 猜数字游戏。芳芳已选定一个秘密数字（不会透露），范围 0-100。其他成员每人猜一个整数，结合自己的专业背景说出选这个数的理由（脑洞越大越好）。最后由芳芳公布答案、宣布最接近者并表扬。",
   "roles": {
-    "mechanical": {
-      "role_name": "技术悲观派",
-      "role_desc": "从工程可行性角度质疑方案，找出难以实现的部分",
-      "faction": "negative",
-      "visible_to": []
-    }
+    "project_manager": {"role_name": "游戏主持人", "role_desc": "你已经在心里选定了一个 0-100 的秘密数字（自行选定，不要透露具体值）。本轮发言宣布游戏规则、数字范围 0-100，邀请大家猜测，但绝不透露答案。"},
+    "algorithm": {"role_name": "玩家", "role_desc": "猜一个 0-100 的整数，从算法/概率角度脑洞解释为什么猜这个数。"}
   }
 }
 
-注意：如果是狼人等需要信息隐藏的游戏，设置 visible_to 限制谁能看到谁的角色。"""
+示例 B — 头脑风暴（无规则）：
+{
+  "template": "brainstorm",
+  "host": "",
+  "activity_rules": "",
+  "roles": {
+    "mechanical": {"role_name": "可行性派", "role_desc": "从工程可行性角度评估方案。", "faction": "negative"}
+  }
+}
+
+⚠️ 严格只输出 JSON，不要任何其他说明文字。"""
 
 EXPLICIT_ROLE_EXTRACT_PROMPT = """判断用户是否在消息中显式指定了某人的角色。
 
@@ -135,23 +161,60 @@ GROUP_SPEAK_PREFIX = """
 
 # ── Summary prompt ────────────────────────────────────────────────────────────
 
-SUMMARY_PROMPT = """你是项目经理芳芳，请根据以上群聊讨论内容，做一段简短的总结。
+_SUMMARY_PROMPT_TEMPLATE = """你是项目经理芳芳，请根据上面的群聊内容做收尾发言。
 
-要求：
-- 200 字以内
-- 列出主要观点和共识
-- 指出分歧点（如有）
-- 给出下一步建议
-- 口语化风格，像一个真实的 PM 在群里做总结"""
+{activity_block}
+
+【收尾要求】：
+- 直接给结论，不要复述每个人的原话
+- 200 字以内（如果是游戏/活动收尾，60~100 字即可）
+- 口语化、活泼自然，像真实的 PM 在群里收尾
+
+⚠️ 严格遵守活动规则中分配给你的主持人/出题人/裁判职责（如：公布答案、宣布最接近者、给予表扬、判定胜负等）。"""
+
+
+def build_summary_prompt(session) -> str:
+    """Render the summary prompt, injecting the session's activity_rules so 芳芳
+    knows whether this is a game (announce result) or a discussion (give recap).
+    """
+    if session.activity_rules:
+        activity_block = (
+            "【本场活动规则（你之前已宣布的玩法）】\n"
+            f"{session.activity_rules}\n"
+        )
+    else:
+        activity_block = (
+            "【场景类型】\n"
+            "工作讨论/头脑风暴。请列出主要观点、共识、分歧点和下一步建议。\n"
+        )
+    return _SUMMARY_PROMPT_TEMPLATE.format(activity_block=activity_block)
+
+
+# Backwards-compatible static fallback (used only when session is unavailable)
+SUMMARY_PROMPT = _SUMMARY_PROMPT_TEMPLATE.format(
+    activity_block="【场景类型】\n根据上下文判断（游戏则公布答案宣布获胜者，讨论则做要点小结）。\n"
+)
 
 
 # ── History formatting (section 13.1) ─────────────────────────────────────────
 
-def format_history(history: list[ConversationMessage], current_employee: str = "") -> str:
-    """Format conversation history for LLM context."""
+def format_history(
+    history: list[ConversationMessage],
+    current_employee: str = "",
+    viewer: str = "",
+) -> str:
+    """Format conversation history for LLM context.
+
+    Args:
+        viewer: If set, filter out messages whose visible_to doesn't include this viewer.
+                Messages with empty visible_to are always included (public).
+    """
     now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M")
     lines = [f"【群聊记录 · {now}】"]
     for msg in history:
+        # Visibility filter: skip private messages not meant for this viewer
+        if viewer and msg.visible_to and viewer not in msg.visible_to:
+            continue
         emoji, name = EMPLOYEE_CONFIG.get(msg.sender, ("👤", msg.sender))
         label = "用户" if msg.sender == "user" else f"{emoji} {name}（{ROLE_DESCRIPTIONS.get(msg.sender, '')}）"
         lines.append("─────────────────────────────")
@@ -179,6 +242,18 @@ def build_role_context(current_employee: str, session: GroupSession) -> str:
     # Check if there are session roles
     my_role = session.role_assignments.get(current_employee)
 
+    # Activity rules — broadcast to ALL participants so everyone plays the same game
+    activity_block = []
+    if session.activity_rules:
+        activity_block = [
+            "【本场活动规则（所有人共同遵守）】",
+            session.activity_rules,
+        ]
+        if session.host:
+            host_emoji, host_name = EMPLOYEE_CONFIG.get(session.host, ("👤", session.host))
+            activity_block.append(f"主持人：{host_emoji} {host_name}")
+        activity_block.append("")
+
     others_info = []
     for emp in session.participants:
         if emp == current_employee:
@@ -198,7 +273,7 @@ def build_role_context(current_employee: str, session: GroupSession) -> str:
             o_role_desc = ROLE_DESCRIPTIONS.get(emp, "")
             others_info.append(f"  {o_emoji} {o_name}（{o_role_desc}）")
 
-    lines = [
+    lines = list(activity_block) + [
         "【你的双重身份】",
         f"职业身份：{emoji} {name}（{role_desc}）",
     ]
@@ -249,6 +324,8 @@ def build_simple_role_context(current_employee: str, participants: list[str]) ->
 你的发言应该聚焦在你的专业领域，避免重复其他人已覆盖的内容。
 如果你的专业与其他人有交叉，从你独特的角度补充即可。
 """
+
+
 
 
 # ── Explicit role extraction ──────────────────────────────────────────────────

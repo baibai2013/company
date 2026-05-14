@@ -27,23 +27,30 @@ load_dotenv()
 from agents_v2.shared.claude_client import make_langchain_llm
 from agents_v2.shared.db import async_checkpointer_ctx
 
-from .event_bus import GroupEventBus, GroupEventBusPool
+from .event_bus import GroupEventBusPool
 from .models import (
     ConversationMessage, EMPLOYEE_CONFIG,
     GroupSession, MessageEvent, OrchestratorDecision,
-    ROLE_DESCRIPTIONS, SessionRole, SpeakRequest, SpeakResponse,
+    ROLE_DESCRIPTIONS, SessionRole, SpeakRequest,
+)
+from .pipelines import (
+    sequential as pipe_sequential,
+    fanout as pipe_fanout,
+    _append_to_history,
+    _wait_for_responses,
 )
 from .prompts import (
     DECIDE_PROMPT, GROUP_SPEAK_PREFIX, ROLE_DECIDE_PROMPT,
     SUMMARY_PROMPT,
+    build_summary_prompt,
     build_role_context, build_simple_role_context,
     extract_explicit_roles, format_history,
 )
+from .scenarios import SCENARIO_REGISTRY
 from .session import SessionStore
 
 log = logging.getLogger("feishu.group_chat.orchestrator")
 
-_SPEAK_TIMEOUT = 90.0  # seconds to wait for a single speak response
 
 
 # ── State ─────────────────────────────────────────────────────────────────────
@@ -95,62 +102,6 @@ def _state_set_session(state: OrchestratorState, session: GroupSession) -> dict:
     return {"session_json": json.dumps(ss._serialize(session), ensure_ascii=False)}
 
 
-# ── Helper: wait for speak responses in dispatch ──────────────────────────────
-
-async def _wait_for_responses(
-    bus_pool: GroupEventBusPool,
-    session_id: str,
-    employees: list[str],
-    timeout: float = _SPEAK_TIMEOUT,
-) -> dict[str, SpeakResponse]:
-    """Wait for speak responses from multiple employees concurrently."""
-    results: dict[str, SpeakResponse] = {}
-
-    async def _wait_one(emp: str) -> SpeakResponse | None:
-        # Create a fresh subscriber for waiting on this session
-        sub = GroupEventBus()
-        await sub.connect()
-        try:
-            channel = f"speak_resp:{session_id}"
-            await sub._sub.subscribe(channel)
-            async for msg in sub._sub.listen():
-                if msg["type"] != "message":
-                    continue
-                data = json.loads(msg["data"])
-                if data.get("employee") == emp:
-                    return SpeakResponse(
-                        session_id=data["session_id"],
-                        chat_id=data["chat_id"],
-                        employee=data["employee"],
-                        content=data["content"],
-                        success=data.get("success", True),
-                    )
-        except asyncio.TimeoutError:
-            return SpeakResponse(
-                session_id=session_id, chat_id="", employee=emp,
-                content="", success=False,
-            )
-        finally:
-            await sub.disconnect()
-        return None
-
-    tasks = {emp: asyncio.create_task(_wait_one(emp)) for emp in employees}
-    done, pending = await asyncio.wait(tasks.values(), timeout=timeout)
-
-    for emp, task in tasks.items():
-        if task in done and not task.cancelled():
-            resp = task.result()
-            if resp:
-                results[emp] = resp
-        else:
-            task.cancel()
-            emoji, name = EMPLOYEE_CONFIG.get(emp, ("👤", emp))
-            results[emp] = SpeakResponse(
-                session_id=session_id, chat_id="", employee=emp,
-                content=f"{emoji} {name} 未能及时回应", success=False,
-            )
-
-    return results
 
 
 # ── Graph Nodes ───────────────────────────────────────────────────────────────
@@ -260,9 +211,10 @@ async def _decide_node(
                 m2 = _re.search(r"\{.*\}", role_resp.content, _re.DOTALL)
                 if m2:
                     role_data = json.loads(m2.group())
-                    template = role_data.pop("template", "free")
-                    roles_dict = role_data.get("roles", role_data)
-                    session.template = template
+                    session.template = role_data.get("template", "free")
+                    session.activity_rules = role_data.get("activity_rules", "") or ""
+                    session.host = role_data.get("host", "") or ""
+                    roles_dict = role_data.get("roles", {})
                     for emp_key, rdata in roles_dict.items():
                         if emp_key in EMPLOYEE_CONFIG and isinstance(rdata, dict):
                             session.role_assignments[emp_key] = SessionRole(
@@ -272,6 +224,17 @@ async def _decide_node(
                                 visible_to=rdata.get("visible_to", []),
                                 faction=rdata.get("faction", ""),
                             )
+                    if session.activity_rules:
+                        log.info("decide_node: activity_rules=%s host=%s",
+                                 session.activity_rules[:80], session.host)
+
+                    # Initialize game state via scenario registry
+                    scenario_cls = SCENARIO_REGISTRY.get(session.template)
+                    if scenario_cls and session.host and not session.game_state:
+                        scenario = scenario_cls(session)
+                        session.game_state = scenario.initialize(session.activity_rules)
+                        log.info("decide_node: scenario=%s state=%s",
+                                 session.template, session.game_state)
             except Exception as exc:
                 log.warning("decide_node: role assignment failed: %s", exc)
 
@@ -295,87 +258,37 @@ async def _dispatch_node(
     session_store: SessionStore,
     bus_pool: GroupEventBusPool,
 ) -> dict:
-    """Publish SpeakRequests and wait for responses. Handles single/sequential/parallel."""
+    """Dispatch to registered Scenario or generic pipelines."""
     session = _state_get_session(state)
     decision = _state_get_decision(state)
     completed = list(state.get("completed", []))
 
-    if decision is None:
+    if decision is None or decision.mode == "ignore":
         return {}
 
-    mode = decision.mode
+    # Check if this session has a registered scenario
+    scenario_cls = SCENARIO_REGISTRY.get(session.template)
+    if scenario_cls and session.game_state:
+        # Delegate entirely to the scenario's run() method
+        scenario = scenario_cls(session)
+        await scenario.run(bus_pool)
+        completed = list(decision.participants)
+    else:
+        # Generic pipeline dispatch (no game logic)
+        remaining = [e for e in decision.participants if e not in completed]
+        if not remaining:
+            return {"completed": completed}
 
-    if mode == "ignore":
-        return {}
-
-    # Determine which employees still need to speak this round
-    remaining = [e for e in decision.participants if e not in completed]
-
-    if not remaining:
-        return {"completed": completed}
-
-    # Build history text once
-    history_text = format_history(session.history)
-
-    if mode == "single":
-        # Only one participant
-        emp = remaining[0]
-        req = SpeakRequest(
-            session_id=session.id,
-            chat_id=session.chat_id,
-            employee=emp,
-            history_text=history_text,
-            trigger_message_id=session.trigger_message_id,
-            role_context=build_role_context(emp, session),
-        )
-        await bus_pool.pub_bus.publish_speak_req(req)
-
-        responses = await _wait_for_responses(bus_pool, session.id, [emp])
-        resp = responses.get(emp)
-        if resp and resp.success:
-            _append_speaker_to_history(session, emp, resp.content)
-        completed.append(emp)
-
-    elif mode == "sequential":
-        # Speak one at a time, each sees prior responses
-        for emp in remaining:
-            req = SpeakRequest(
-                session_id=session.id,
-                chat_id=session.chat_id,
-                employee=emp,
-                history_text=format_history(session.history),
-                trigger_message_id=session.trigger_message_id,
-                order=len(completed),
-                role_context=build_role_context(emp, session),
-            )
-            await bus_pool.pub_bus.publish_speak_req(req)
-
-            responses = await _wait_for_responses(bus_pool, session.id, [emp])
-            resp = responses.get(emp)
-            if resp and resp.success:
-                _append_speaker_to_history(session, emp, resp.content)
-            completed.append(emp)
-
-    elif mode == "parallel":
-        # All speak concurrently
-        for i, emp in enumerate(remaining):
-            req = SpeakRequest(
-                session_id=session.id,
-                chat_id=session.chat_id,
-                employee=emp,
-                history_text=history_text,
-                trigger_message_id=session.trigger_message_id,
-                order=i,
-                role_context=build_role_context(emp, session),
-            )
-            await bus_pool.pub_bus.publish_speak_req(req)
-
-        responses = await _wait_for_responses(bus_pool, session.id, remaining)
-        for emp in remaining:
-            resp = responses.get(emp)
-            if resp and resp.success:
-                _append_speaker_to_history(session, emp, resp.content)
-        completed.extend(remaining)
+        mode = decision.mode
+        if mode == "single":
+            await pipe_sequential(session, [remaining[0]], bus_pool)
+            completed.append(remaining[0])
+        elif mode == "sequential":
+            spoken = await pipe_sequential(session, remaining, bus_pool)
+            completed.extend(spoken)
+        elif mode == "parallel":
+            await pipe_fanout(session, remaining, bus_pool)
+            completed.extend(remaining)
 
     await session_store.save(session)
 
@@ -405,23 +318,25 @@ async def _conclude_node(
 
     history_text = format_history(session.history)
 
-    # Let project_manager summarize
+    # Pick the host (or fall back to project_manager) to do the summary
+    summarizer = session.host if session.host in EMPLOYEE_CONFIG else "project_manager"
+
     req = SpeakRequest(
         session_id=session.id,
         chat_id=session.chat_id,
-        employee="project_manager",
+        employee=summarizer,
         history_text=history_text,
         trigger_message_id=session.trigger_message_id,
         summary_mode=True,
-        role_context=SUMMARY_PROMPT,
+        role_context=build_summary_prompt(session),
     )
     await bus_pool.pub_bus.publish_speak_req(req)
 
-    responses = await _wait_for_responses(bus_pool, session.id, ["project_manager"], timeout=60.0)
-    resp = responses.get("project_manager")
+    responses = await _wait_for_responses(bus_pool, session.id, [summarizer], timeout=60.0)
+    resp = responses.get(summarizer)
     if resp and resp.success:
         session.summary = resp.content
-        _append_speaker_to_history(session, "project_manager", resp.content)
+        _append_to_history(session, summarizer, resp.content)
 
     session.status = "done"
     await session_store.delete(session.id)
@@ -431,19 +346,6 @@ async def _conclude_node(
     return _state_set_session(state, session)
 
 
-def _append_speaker_to_history(session: GroupSession, employee: str, content: str) -> None:
-    emoji, name = EMPLOYEE_CONFIG.get(employee, ("👤", employee))
-    msg = ConversationMessage(
-        id=str(uuid.uuid4()),
-        session_id=session.id,
-        sender=employee,
-        sender_name=f"{emoji} {name}",
-        content=content,
-        feishu_message_id="",
-        created_at=time.time(),
-        role="assistant",
-    )
-    session.history.append(msg)
 
 
 # ── Conditional edge ──────────────────────────────────────────────────────────
@@ -507,8 +409,8 @@ async def run_orchestrator():
         graph = _build_graph(session_store, bus_pool, cp)
         log.info("Orchestrator graph compiled with checkpointer")
 
-        # Track active tasks per session
-        active_tasks: dict[str, asyncio.Task] = {}
+        # Track active tasks per chat to prevent duplicate games
+        active_chat_tasks: dict[str, asyncio.Task] = {}
 
         async def handle_event(event: MessageEvent):
             """Process a group message event."""
@@ -516,6 +418,12 @@ async def run_orchestrator():
 
             # Skip empty messages
             if not event.text and not event.image_base64:
+                return
+
+            # If this chat already has an active game/session running, skip
+            existing = active_chat_tasks.get(event.chat_id)
+            if existing and not existing.done():
+                log.info("skipping: chat=%s already has active session running", event.chat_id)
                 return
 
             # Create initial state
@@ -550,16 +458,12 @@ async def run_orchestrator():
         try:
             # Subscribe to all group messages
             async for event in bus_pool.sub_bus.subscribe_group_pattern():
-                # Don't block on the same session sequentially — each event is a new task
                 task = asyncio.create_task(handle_event(event))
+                active_chat_tasks[event.chat_id] = task
                 # Clean up completed tasks periodically
-                done = [sid for sid, t in active_tasks.items() if t.done()]
-                for sid in done:
-                    del active_tasks[sid]
-                    try:
-                        active_tasks.pop(sid)
-                    except KeyError:
-                        pass
+                done = [cid for cid, t in active_chat_tasks.items() if t.done()]
+                for cid in done:
+                    del active_chat_tasks[cid]
         except asyncio.CancelledError:
             log.info("Orchestrator shutting down...")
         finally:
