@@ -23,3 +23,7 @@ psycopg[binary]>=3.1  # langgraph-checkpoint-postgres 依赖
 celery[redis]>=5.3
 redis>=5.0
 watchdog>=4.0  # scenarios/ 目录热重载
+
+# pgvector — 向量存储与语义检索
+pgvector>=0.3          # SQLAlchemy Vector 类型
+openai>=1.0            # text-embedding-3-small（需配置 OPENAI_API_KEY）

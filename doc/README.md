@@ -25,6 +25,12 @@
 |------|------|
 | [usage.md](usage.md) | 安装、启动、飞书交互方式 |
 
+### 优化与演进
+
+| 文件 | 内容 |
+|------|------|
+| [optimization-agentscope.md](optimization-agentscope.md) | 借鉴 AgentScope 的 4 个优化方向（Tracing/Memory Marks/可测试性/MsgHub） |
+
 ### 注意事项
 
 | 文件 | 内容 |

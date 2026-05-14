@@ -97,16 +97,22 @@ def _llm_for(employee_key: str, call_type: str, default_model: str = "claude-son
     return make_langchain_llm(default_model)
 
 
-def _system_prompt_for(employee_key: str, suffix: str = "") -> str:
+def _system_prompt_for(employee_key: str, suffix: str = "", query: str = "") -> str:
+    """构建 system prompt，并注入长期记忆。
+
+    query 非空时做语义检索（pgvector），为空时回退最近 N 条。
+    """
     cfg = _load_config(employee_key)
     base = cfg.system_prompt if cfg else ""
 
-    # 注入长期记忆（近期参与的讨论摘要）
     try:
         from backend.repos import memory_repo
-        memories = memory_repo.get_sync(employee_key)
+        if query:
+            memories = memory_repo.search_semantic_sync(employee_key, query, limit=5)
+        else:
+            memories = memory_repo.get_sync(employee_key)[:5]
         if memories:
-            mem_block = "\n".join(f"- {m[:200]}" for m in memories[:5])
+            mem_block = "\n".join(f"- {m[:200]}" for m in memories)
             base = (base or "") + f"\n\n【近期参与的讨论（供参考）】\n{mem_block}"
     except Exception:
         pass
@@ -139,27 +145,30 @@ def _route_node(state: SmartState, employee_key: str) -> dict:
 
 def _chat_node(state: SmartState, employee_key: str) -> dict:
     suffix = _global_prompt(employee_key, "chat_suffix", _DEFAULT_CHAT_SUFFIX)
+    query = _text_only(state["task_input"])
     llm = _llm_for(employee_key, "chat", default_model="claude-sonnet-4-6")
     resp = llm.invoke([
-        SystemMessage(_system_prompt_for(employee_key, suffix)),
+        SystemMessage(_system_prompt_for(employee_key, suffix, query=query)),
         _human_msg(state["task_input"]),
     ])
     return {"execution_result": resp.content}
 
 
 def _plan_node(state: SmartState, employee_key: str) -> dict:
+    query = _text_only(state["task_input"])
     llm = _llm_for(employee_key, "plan", default_model="claude-opus-4-7")
     resp = llm.invoke([
-        SystemMessage(_system_prompt_for(employee_key, _DEFAULT_PLAN_SUFFIX)),
+        SystemMessage(_system_prompt_for(employee_key, _DEFAULT_PLAN_SUFFIX, query=query)),
         _human_msg(state["task_input"]),
     ])
     return {"plan": resp.content}
 
 
 def _execute_node(state: SmartState, employee_key: str) -> dict:
+    query = _text_only(state["task_input"])
     llm = _llm_for(employee_key, "execute", default_model="claude-opus-4-7")
     resp = llm.invoke([
-        SystemMessage(_system_prompt_for(employee_key)),
+        SystemMessage(_system_prompt_for(employee_key, query=query)),
         _human_msg(state["task_input"], prefix=f"执行方案：{state['plan']}\n\n原始需求（如有图请一并分析）：\n"),
     ])
     return {"execution_result": resp.content}

@@ -1,8 +1,11 @@
 """员工长期记忆仓库。
 
-提供异步写入（供 orchestrator 在会话结束后调用）和同步读取（供 smart_graph 注入 system prompt）。
+写入：异步，自动生成 embedding（需 OPENAI_API_KEY）。
+读取：同步缓存（热路径）+ 异步语义检索（按 query 向量相似度排序）。
 
-读取走内存缓存（启动时预热，写入后刷新），热路径零 DB 开销。
+降级策略：
+  - 无 OPENAI_API_KEY → 跳过 embedding，回退时间倒序
+  - pgvector 不可用 → 同上
 """
 from __future__ import annotations
 
@@ -10,7 +13,7 @@ import asyncio
 import logging
 from typing import TYPE_CHECKING
 
-from sqlalchemy import select
+from sqlalchemy import select, text
 
 from backend.core.db import AsyncSessionLocal
 from backend.models.memory import EmployeeMemory
@@ -20,15 +23,16 @@ if TYPE_CHECKING:
 
 log = logging.getLogger(__name__)
 
+_EMBED_DIM = 1536
+_CACHE_SIZE = 10
+
 # ── In-memory cache ───────────────────────────────────────────────────────────
-# key → list[str] (最近 N 条 content，按时间倒序)
 _cache: dict[str, list[str]] = {}
-_CACHE_SIZE = 10   # 每人最多缓存条数
 _cache_warmed = False
 
 
 async def warmup() -> None:
-    """进程启动时预热全员记忆缓存（由 registry.warmup_sync 的 asyncio.run 触发）。"""
+    """进程启动时预热全员记忆缓存。"""
     global _cache_warmed
     async with AsyncSessionLocal() as s:
         rows = (await s.execute(
@@ -50,21 +54,50 @@ async def warmup() -> None:
 
 
 def warmup_sync() -> None:
-    """同步预热入口，供无事件循环的进程启动阶段调用（如 smart_graph 初始化）。"""
+    """同步预热入口，供无事件循环的进程启动阶段调用。"""
     global _cache_warmed
     if _cache_warmed:
         return
+    coro = warmup()
     try:
-        asyncio.run(warmup())
+        asyncio.run(coro)
     except RuntimeError:
-        pass  # 在事件循环内调用：等异步写入触发刷新
+        coro.close()  # 已在事件循环中，关闭协程避免 "never awaited" 警告
 
 
 def get_sync(employee_key: str) -> list[str]:
-    """从缓存读取记忆（同步，适合 smart_graph 节点）。"""
+    """从缓存读取最近记忆（同步，适合 smart_graph 节点）。"""
     if not _cache_warmed:
         warmup_sync()
     return _cache.get(employee_key, [])
+
+
+# ── Embedding ─────────────────────────────────────────────────────────────────
+
+async def _embed(text_: str) -> list[float] | None:
+    """生成文本 embedding，失败或无 API Key 时返回 None。"""
+    try:
+        from backend.core.config import settings
+        if not settings.OPENAI_API_KEY:
+            return None
+        from openai import AsyncOpenAI
+        client = AsyncOpenAI(api_key=settings.OPENAI_API_KEY)
+        resp = await client.embeddings.create(
+            model="text-embedding-3-small",
+            input=text_,
+        )
+        return resp.data[0].embedding
+    except Exception as e:
+        log.debug("memory_repo: embedding failed: %s", e)
+        return None
+
+
+def _embed_sync(text_: str) -> list[float] | None:
+    """同步版 embedding，供 smart_graph 节点调用（运行在 thread executor 中）。"""
+    try:
+        return asyncio.run(_embed(text_))
+    except RuntimeError:
+        return None
 
 
 # ── Write ─────────────────────────────────────────────────────────────────────
@@ -76,18 +109,20 @@ async def save(
     chat_id: str = "",
     template: str = "free",
 ) -> None:
-    """写入一条记忆，并刷新该员工的缓存。"""
+    """写入一条记忆（自动生成 embedding），并刷新缓存。"""
+    embedding = await _embed(content)
+
     async with AsyncSessionLocal() as s:
         s.add(EmployeeMemory(
             employee_key=employee_key,
             content=content,
+            embedding=embedding,
             session_id=session_id or None,
             chat_id=chat_id or None,
             template=template or None,
         ))
         await s.commit()
 
-    # 刷新缓存
     bucket = _cache.setdefault(employee_key, [])
     bucket.insert(0, content)
     if len(bucket) > _CACHE_SIZE:
@@ -95,29 +130,82 @@ async def save(
 
 
 async def save_session_summary(session: "GroupSession") -> None:
-    """会话结束后，将摘要写入所有参与者的记忆。
-
-    仅当 session.summary 非空时执行。每个员工各存一行（内容相同），
-    便于按 employee_key 独立检索。
-    """
+    """会话结束后，将摘要写入所有员工的长期记忆。"""
     summary = getattr(session, "summary", "") or ""
     if not summary:
         return
 
-    # 取真实员工（排除 "user" / "user:xxx"）
     employees = [p for p in session.participants if not p.startswith("user")]
     if not employees:
         return
 
     template = getattr(session, "template", "free") or "free"
-    log.info("memory_repo: saving session summary for %d employees session=%s",
-             len(employees), session.id[:8])
+    # embedding 只生成一次，所有员工共用同一向量
+    embedding = await _embed(summary)
 
+    log.info("memory_repo: saving summary for %d employees session=%s embed=%s",
+             len(employees), session.id[:8], "yes" if embedding else "no")
+
+    async with AsyncSessionLocal() as s:
+        for emp in employees:
+            s.add(EmployeeMemory(
+                employee_key=emp,
+                content=summary,
+                embedding=embedding,
+                session_id=session.id,
+                chat_id=getattr(session, "chat_id", None),
+                template=template,
+            ))
+        await s.commit()
+
+    # 刷新缓存
     for emp in employees:
-        await save(emp, summary,
-                   session_id=session.id,
-                   chat_id=session.chat_id,
-                   template=template)
+        bucket = _cache.setdefault(emp, [])
+        bucket.insert(0, summary)
+        if len(bucket) > _CACHE_SIZE:
+            bucket.pop()
+
+
+# ── Semantic search ───────────────────────────────────────────────────────────
+
+async def search_semantic(
+    employee_key: str,
+    query: str,
+    limit: int = 5,
+) -> list[str]:
+    """按语义相似度检索相关记忆。无 embedding 时回退时间倒序。"""
+    q_vec = await _embed(query)
+    if q_vec is None:
+        return get_sync(employee_key)[:limit]
+
+    async with AsyncSessionLocal() as s:
+        # 使用 pgvector <=> 余弦距离运算符
+        rows = (await s.execute(
+            select(EmployeeMemory.content)
+            .where(
+                EmployeeMemory.employee_key == employee_key,
+                EmployeeMemory.embedding.isnot(None),
+            )
+            .order_by(EmployeeMemory.embedding.op("<=>")(q_vec))
+            .limit(limit)
+        )).scalars().all()
+
+    if not rows:
+        return get_sync(employee_key)[:limit]
+    return list(rows)
+
+
+def search_semantic_sync(
+    employee_key: str,
+    query: str,
+    limit: int = 5,
+) -> list[str]:
+    """同步版语义检索，供 smart_graph 节点调用（运行在 thread executor 中）。"""
+    try:
+        return asyncio.run(search_semantic(employee_key, query, limit))
+    except RuntimeError:
+        # 已在事件循环中（不应发生于 sync LangGraph 节点）
+        return get_sync(employee_key)[:limit]
 
 
 # ── Read (async, for admin/debug) ─────────────────────────────────────────────

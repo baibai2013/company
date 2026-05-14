@@ -1,6 +1,7 @@
-"""员工长期记忆模型 — 跨会话保存参与过的讨论/游戏摘要。"""
+"""员工长期记忆模型 — 跨会话保存参与过的讨论/游戏摘要，支持 pgvector 语义检索。"""
 from datetime import datetime, timezone
 
+from pgvector.sqlalchemy import Vector
 from sqlalchemy import BigInteger, DateTime, Index, Text
 from sqlalchemy.orm import Mapped, mapped_column
 
@@ -20,6 +21,7 @@ class EmployeeMemory(Base):
     chat_id:      Mapped[str | None] = mapped_column(Text)
     template:     Mapped[str | None] = mapped_column(Text)   # "werewolf" / "brainstorm" / "free"
     content:      Mapped[str]      = mapped_column(Text, nullable=False)
+    embedding:    Mapped[list | None] = mapped_column(Vector(1536), nullable=True)
     created_at:   Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_utcnow)
 
     __table_args__ = (
