@@ -8,10 +8,10 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from backend.api.deps import get_db
-from backend.api.routes.employees import EMPLOYEES
 from backend.core.db import AsyncSessionLocal
 from backend.models.message import ChatMessage
 from backend.schemas.message import MessageCreate, MessageRead
+from backend.services import registry
 
 router = APIRouter(prefix="/api/chat", tags=["chat"])
 
@@ -22,13 +22,14 @@ _WORK_RE = re.compile(
     re.IGNORECASE,
 )
 
-EMPLOYEE_NAMES = {
-    "mechanical": "机械工程师", "hardware": "硬件工程师",
-    "firmware": "固件工程师", "algorithm": "算法工程师",
-    "product_manager": "产品经理", "testing": "测试工程师",
-    "cost": "成本工程师", "project_manager": "项目经理",
-    "tech_lead": "技术总监",
-}
+def _employee_port(key: str) -> int | None:
+    cfg = registry.get_effective_sync(key)
+    return cfg.agent_port if cfg else None
+
+
+def _employee_name(key: str) -> str:
+    cfg = registry.get_effective_sync(key)
+    return cfg.name if cfg else key
 
 
 async def _save_msg(channel: str, role: str, sender: str, content: str) -> None:
@@ -47,8 +48,8 @@ async def _call_agent_and_save(
     For work tasks: saves an immediate ack so user sees activity fast,
     then saves the full result when the agent finishes.
     """
-    info = EMPLOYEES.get(employee_key)
-    if not info:
+    port = _employee_port(employee_key)
+    if not port:
         return
 
     try:
@@ -58,8 +59,8 @@ async def _call_agent_and_save(
         return  # agents_v2 not available (e.g. unit-test env)
 
     save_channel = channel if channel is not None else employee_key
-    url = f"http://localhost:{info['port']}/"
-    name = EMPLOYEE_NAMES.get(employee_key, employee_key)
+    url = f"http://localhost:{port}/"
+    name = _employee_name(employee_key)
 
     # Save immediate ack for work tasks so the user isn't staring at silence
     is_work = bool(_WORK_RE.search(user_text))

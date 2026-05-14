@@ -3,6 +3,7 @@
     <header class="dash-header">
       <h1>🏗️ 机器狗公司 · 控制台</h1>
       <div class="header-actions">
+        <el-button @click="$router.push('/employees')" size="small">👥 员工管理</el-button>
         <el-button type="primary" @click="showCreateDialog = true" size="small">+ 新建任务</el-button>
         <el-button @click="refresh" size="small" :loading="loading">刷新</el-button>
       </div>
