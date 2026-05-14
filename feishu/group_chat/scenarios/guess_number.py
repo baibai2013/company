@@ -1,6 +1,6 @@
 """
-Guess Number scenario: host picks a secret number, players guess,
-host gives 偏大/偏小 feedback after each guess, game ends on correct guess.
+猜数字场景：主持人心中选定一个秘密数字，玩家轮流猜测，
+主持人每轮给出偏大/偏小提示，猜中则游戏结束。
 """
 from __future__ import annotations
 
@@ -22,9 +22,14 @@ log = logging.getLogger(__name__)
 
 @register("guess_number", "guess", "guessing")
 class GuessNumberScenario(Scenario):
-    """0-N 猜数字：主持人心中有秘密数字，逐人猜，主持人给偏大/偏小提示。"""
+    """猜数字游戏场景。
+
+    流程：主持人宣布规则 → 玩家逐一猜测 → 主持人每次给出偏大/偏小反馈 → 猜对结束。
+    数字比较在 Python 中确定性完成，不依赖 LLM 做算术。
+    """
 
     def initialize(self, activity_rules: str) -> dict:
+        """从活动规则中解析数字范围，生成随机秘密数字。"""
         lo, hi = 0, 100
         m = re.search(r"(\d+)\s*[-–~]\s*(\d+)", activity_rules)
         if m:
@@ -34,6 +39,7 @@ class GuessNumberScenario(Scenario):
         return {"secret_number": secret, "lo": lo, "hi": hi}
 
     async def run(self, bus_pool: "GroupEventBusPool") -> None:
+        """执行猜数字游戏：主持人开场 → 逐人猜测+反馈 → 猜对结束或全部猜完揭晓。"""
         session = self.session
         secret = session.game_state["secret_number"]
         lo = session.game_state["lo"]
@@ -108,7 +114,7 @@ class GuessNumberScenario(Scenario):
         log.info("GuessNumber: nobody guessed correctly, revealed %d", secret)
 
     def _extract_guess(self, lo: int, hi: int) -> int | None:
-        """Extract the guessed number from the latest history message."""
+        """从最新一条历史消息中提取猜测的数字。优先选取范围内的数字。"""
         if not self.session.history:
             return None
         latest = self.session.history[-1].content

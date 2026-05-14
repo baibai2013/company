@@ -1,9 +1,8 @@
 """
-Werewolf (狼人杀) scenario: standard 8-player game with
-2 wolves, 1 seer, 1 witch, 1 hunter, 3 villagers + 1 host.
+狼人杀场景：标准 8 人局。
 
-Multi-round night/day cycle with information isolation,
-private actions, and voting elimination.
+角色配置：2 狼人 + 1 预言家 + 1 女巫 + 1 猎人 + 3 村民 + 1 主持人（上帝）。
+多轮夜晚/白天循环，支持信息隔离、私密行动和投票放逐机制。
 """
 from __future__ import annotations
 
@@ -36,10 +35,16 @@ ROLE_NAMES = {
 
 @register("werewolf", "狼人杀", "werewolves")
 class WerewolfScenario(Scenario):
-    """Standard werewolf game with night/day phases."""
+    """狼人杀游戏场景。
+
+    流程：角色分配 → 循环（夜晚阶段 → 白天阶段）→ 胜负判定。
+    夜晚：狼人杀人 → 预言家查验 → 女巫救/毒。
+    白天：宣布死讯 → 全员讨论 → 投票放逐。
+    信息隔离：狼人讨论仅狼人可见，特殊角色行动仅自己可见。
+    """
 
     def initialize(self, activity_rules: str) -> dict:
-        """Randomly assign roles to players (host excluded)."""
+        """随机分配角色给玩家（主持人除外）。"""
         session = self.session
         host = session.host
         players = [p for p in session.participants if p != host]
@@ -83,11 +88,12 @@ class WerewolfScenario(Scenario):
         }
 
     async def run(self, bus_pool: "GroupEventBusPool") -> None:
+        """执行完整的狼人杀游戏流程。"""
         session = self.session
         state = session.game_state
         host = session.host
 
-        # Opening: host announces game start, privately notify each player their role
+        # 开场：主持人宣布游戏开始，私密通知每人身份
         await announce(session, host, bus_pool, context=(
             "你是狼人杀游戏的上帝（主持人）。游戏即将开始！\n"
             "宣布：「各位玩家，狼人杀游戏开始！请大家确认自己的身份牌，"
@@ -157,7 +163,7 @@ class WerewolfScenario(Scenario):
     # ── Night Phase ───────────────────────────────────────────────────────────
 
     async def _night_phase(self, bus_pool: "GroupEventBusPool") -> list[str]:
-        """Execute night phase. Returns list of players killed tonight."""
+        """执行夜晚阶段：狼人杀人 → 预言家查验 → 女巫行动。返回今晚死亡的玩家列表。"""
         session = self.session
         state = session.game_state
         host = session.host
@@ -269,7 +275,7 @@ class WerewolfScenario(Scenario):
     # ── Day Phase ─────────────────────────────────────────────────────────────
 
     async def _day_phase(self, bus_pool: "GroupEventBusPool", killed_tonight: list[str]) -> None:
-        """Execute day phase: announce deaths, discuss, vote."""
+        """执行白天阶段：宣布死讯 → 全员讨论 → 投票放逐。"""
         session = self.session
         state = session.game_state
         host = session.host
@@ -327,7 +333,7 @@ class WerewolfScenario(Scenario):
     # ── Helpers ───────────────────────────────────────────────────────────────
 
     async def _hunter_shot(self, bus_pool: "GroupEventBusPool", hunter: str) -> str | None:
-        """Hunter's last shot: choose someone to take down."""
+        """猎人的最后一枪：选择一名存活玩家带走。"""
         session = self.session
         state = session.game_state
         host = session.host
@@ -358,7 +364,7 @@ class WerewolfScenario(Scenario):
         return None
 
     def _check_win(self) -> str:
-        """Check win condition. Returns 'wolves', 'villagers', or ''."""
+        """检查胜负条件。返回 'wolves'（狼人胜）、'villagers'（好人胜）或 ''（未结束）。"""
         state = self.session.game_state
         wolves_alive = [w for w in state["wolves"] if w in state["alive"]]
         good_alive = [p for p in state["alive"] if p not in state["wolves"]]
@@ -370,13 +376,13 @@ class WerewolfScenario(Scenario):
         return ""
 
     def _extract_target(self, speakers: list[str], action: str) -> str | None:
-        """Extract action target from the last speaker in speakers list."""
+        """从指定发言者的最新消息中提取动作目标（如【杀:xxx】）。"""
         for msg in reversed(self.session.history):
             if msg.sender in speakers:
                 return self._extract_action(msg.content, action)
         return None
 
     def _extract_action(self, text: str, action: str) -> str | None:
-        """Extract 【action:target】from text."""
+        """从文本中提取【动作:目标】格式的内容，如【杀:algorithm】→ 'algorithm'。"""
         m = re.search(rf"【{action}[:：](\w+)】", text)
         return m.group(1) if m else None

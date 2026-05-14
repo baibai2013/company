@@ -1,10 +1,10 @@
 """
-Pipeline primitives for multi-agent orchestration.
+多 Agent 编排原语（Pipeline Primitives）。
 
-These are the building blocks that Scenarios compose to define
-complex interaction flows (games, debates, brainstorms, etc.).
+这是 Scenario 场景构建的基础积木，提供 sequential（顺序发言）、
+fanout（并行发言）、announce（单人公告）、vote（投票）等通用编排函数。
 
-Layer 2 in the architecture: Transport (Redis) → **Pipelines** → Scenarios
+架构层级：Transport（Redis 通信）→ **Pipelines（编排原语）** → Scenarios（场景逻辑）
 """
 from __future__ import annotations
 
@@ -33,7 +33,11 @@ async def _wait_for_responses(
     employees: list[str],
     timeout: float = _SPEAK_TIMEOUT,
 ) -> dict[str, SpeakResponse]:
-    """Wait for speak responses from multiple employees concurrently."""
+    """等待多个员工的发言响应（并发监听 Redis 频道）。
+
+    为每个员工创建独立的 Redis 订阅者，监听 speak_resp:{session_id} 频道，
+    超时未响应的员工返回 success=False 的占位响应。
+    """
     import asyncio
     import json as _json
     from .event_bus import GroupEventBus
@@ -95,11 +99,13 @@ def _append_to_history(
     content: str,
     visible_to: list[str] | None = None,
 ) -> None:
-    """Append an employee's message to session history.
+    """将员工发言追加到会话历史。
 
     Args:
-        visible_to: If set, only these employees can see this message.
-                    None/empty = visible to all (public).
+        session: 当前群聊会话。
+        employee: 发言员工 key。
+        content: 发言内容。
+        visible_to: 可见范围。设置后仅指定员工可看到此消息；为空则全员可见。
     """
     emoji, name = EMPLOYEE_CONFIG.get(employee, ("👤", employee))
     msg = ConversationMessage(
@@ -126,18 +132,18 @@ async def sequential(
     visible_to: list[str] | None = None,
     timeout: float = _SPEAK_TIMEOUT,
 ) -> list[str]:
-    """Sequential pipeline: each participant speaks in order, seeing prior replies.
+    """顺序发言管道：参与者按顺序依次发言，每人可看到前面所有人的回复。
 
     Args:
-        session: Current group session (history will be mutated).
-        participants: Employee keys in speaking order.
-        bus_pool: Event bus for pub/sub.
-        role_context_fn: Optional (employee, session, index) -> str for custom context.
-        visible_to: If set, all messages in this pipeline are only visible to these people.
-        timeout: Per-participant timeout.
+        session: 当前群聊会话（history 会被修改）。
+        participants: 发言顺序的员工 key 列表。
+        bus_pool: Redis 事件总线。
+        role_context_fn: 自定义上下文函数 (employee, session, index) -> str。
+        visible_to: 消息可见范围，为空则全员可见。
+        timeout: 单人超时时间（秒）。
 
     Returns:
-        List of employees who successfully spoke.
+        成功发言的员工 key 列表。
     """
     completed = []
     for i, emp in enumerate(participants):
@@ -173,17 +179,17 @@ async def fanout(
     role_context_fn=None,
     timeout: float = _SPEAK_TIMEOUT,
 ) -> dict[str, SpeakResponse]:
-    """Fanout pipeline: all participants speak concurrently, seeing the same history.
+    """并行发言管道：所有参与者同时发言，看到相同的历史记录（互相不可见新回复）。
 
     Args:
-        session: Current group session.
-        participants: Employee keys (all speak at once).
-        bus_pool: Event bus.
-        role_context_fn: Optional (employee, session, index) -> str.
-        timeout: Total timeout for all responses.
+        session: 当前群聊会话。
+        participants: 参与发言的员工 key 列表（同时发言）。
+        bus_pool: Redis 事件总线。
+        role_context_fn: 自定义上下文函数 (employee, session, index) -> str。
+        timeout: 总超时时间（秒）。
 
     Returns:
-        Dict of employee -> SpeakResponse.
+        员工 key → SpeakResponse 的字典。
     """
     history_text = format_history(session.history)
 
@@ -222,19 +228,19 @@ async def announce(
     viewer: str = "",
     timeout: float = 60.0,
 ) -> str | None:
-    """Single speaker announcement (e.g., host declares rules or results).
+    """单人公告：指定一名员工发言（如主持人宣布规则、结果等）。
 
     Args:
-        session: Current group session.
-        speaker: Employee key of the announcer.
-        bus_pool: Event bus.
-        context: Role context / instruction for the speaker.
-        visible_to: If set, the response is only visible to these employees.
-        viewer: If set, filter history shown to speaker (for private phases).
-        timeout: Timeout for this single response.
+        session: 当前群聊会话。
+        speaker: 发言者员工 key。
+        bus_pool: Redis 事件总线。
+        context: 给发言者的角色指令/上下文。
+        visible_to: 该发言的可见范围，为空则全员可见。
+        viewer: 发言者能看到的历史范围（用于私密阶段过滤 history）。
+        timeout: 超时时间（秒）。
 
     Returns:
-        The speaker's response content, or None if failed.
+        发言内容字符串，失败返回 None。
     """
     req = SpeakRequest(
         session_id=session.id,
@@ -264,22 +270,22 @@ async def vote(
     visible_to: list[str] | None = None,
     timeout: float = _SPEAK_TIMEOUT,
 ) -> tuple[str | None, dict[str, str]]:
-    """Voting primitive: collect votes from all voters in parallel.
+    """投票原语：所有投票人并行发言，从回复中提取【投票:目标】并计票。
 
-    Each voter's response is parsed for 【投票:target】pattern.
+    通过正则从每人的回复中解析投票目标，取得票最多者为结果。
+    平票时返回 None。
 
     Args:
-        session: Current group session.
-        voters: Employee keys who vote.
-        candidates: Valid vote targets (employee keys).
-        bus_pool: Event bus.
-        context_template: Role context for voters (should instruct them to vote).
-        visible_to: Visibility of vote messages in history.
-        timeout: Timeout.
+        session: 当前群聊会话。
+        voters: 参与投票的员工 key 列表。
+        candidates: 合法投票目标的员工 key 列表。
+        bus_pool: Redis 事件总线。
+        context_template: 投票提示模板，可用 {candidates} 和 {voter} 占位符。
+        visible_to: 投票消息的可见范围。
+        timeout: 超时时间（秒）。
 
     Returns:
-        Tuple of (winner_or_None, votes_dict).
-        winner is None if tie.
+        (得票最多者或None, {投票人: 投票目标} 字典)。
     """
     import re as _re
     from collections import Counter

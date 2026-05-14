@@ -1,9 +1,9 @@
 """
-Scenario base class and registry.
+场景基类与注册表。
 
-A Scenario encapsulates a complete multi-agent interaction flow:
-- initialize(): set up game_state before the flow starts
-- run(): execute the full flow by composing pipeline primitives
+Scenario 封装完整的多 Agent 交互流程（游戏、辩论、头脑风暴等）：
+- initialize(): 在流程开始前初始化 game_state
+- run(): 通过组合 pipeline 原语执行完整流程
 """
 from __future__ import annotations
 
@@ -23,7 +23,7 @@ SCENARIO_REGISTRY: dict[str, type["Scenario"]] = {}
 
 
 def register(*template_names: str):
-    """Decorator: register a Scenario subclass under one or more template names."""
+    """装饰器：将 Scenario 子类注册到一个或多个模板名下。"""
     def decorator(cls: type["Scenario"]):
         for name in template_names:
             SCENARIO_REGISTRY[name] = cls
@@ -34,29 +34,32 @@ def register(*template_names: str):
 # ── Base class ────────────────────────────────────────────────────────────────
 
 class Scenario:
-    """Base class for orchestrated multi-agent scenarios.
+    """多 Agent 编排场景的基类。
 
-    Subclasses override initialize() and run() to define their flow.
-    The orchestrator's dispatch_node delegates to scenario.run() when
-    the session template matches a registered scenario.
+    子类通过 override initialize() 和 run() 定义自己的交互流程。
+    orchestrator 的 dispatch_node 在 session.template 匹配已注册场景时，
+    会将控制权委托给 scenario.run()。
     """
 
     def __init__(self, session: "GroupSession"):
         self.session = session
 
     def initialize(self, activity_rules: str) -> dict:
-        """Called in decide_node to create initial game_state.
+        """初始化游戏状态（在 decide_node 中调用）。
+
+        Args:
+            activity_rules: LLM 生成的活动规则文本。
 
         Returns:
-            dict to be stored as session.game_state.
+            将存储到 session.game_state 的字典。
         """
         return {}
 
     async def run(self, bus_pool: "GroupEventBusPool") -> None:
-        """Execute the complete scenario flow.
+        """执行完整的场景流程。
 
-        Compose pipeline primitives (sequential, fanout, announce, etc.)
-        to implement the interaction. Session history is mutated in-place.
+        子类在此方法中组合 pipeline 原语（sequential、fanout、announce、vote 等）
+        实现游戏/互动的完整逻辑。session.history 会被就地修改。
         """
         raise NotImplementedError(
             f"{self.__class__.__name__} must implement run()"
