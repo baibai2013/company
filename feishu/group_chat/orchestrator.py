@@ -348,6 +348,13 @@ async def _conclude_node(
         session.summary = resp.content
         _append_to_history(session, summarizer, resp.content)
 
+    # 将本次会话摘要写入所有参与员工的长期记忆
+    try:
+        from backend.repos import memory_repo
+        await memory_repo.save_session_summary(session)
+    except Exception as _mem_err:
+        log.warning("conclude_node: memory save failed session=%s err=%s", session.id[:8], _mem_err)
+
     session.status = "done"
     await session_store.delete(session.id)
 

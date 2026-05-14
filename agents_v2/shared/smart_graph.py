@@ -100,6 +100,17 @@ def _llm_for(employee_key: str, call_type: str, default_model: str = "claude-son
 def _system_prompt_for(employee_key: str, suffix: str = "") -> str:
     cfg = _load_config(employee_key)
     base = cfg.system_prompt if cfg else ""
+
+    # 注入长期记忆（近期参与的讨论摘要）
+    try:
+        from backend.repos import memory_repo
+        memories = memory_repo.get_sync(employee_key)
+        if memories:
+            mem_block = "\n".join(f"- {m[:200]}" for m in memories[:5])
+            base = (base or "") + f"\n\n【近期参与的讨论（供参考）】\n{mem_block}"
+    except Exception:
+        pass
+
     return (base or "") + suffix
 
 

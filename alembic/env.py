@@ -11,6 +11,7 @@ import backend.models.message  # noqa: F401 — register ChatMessage
 import backend.models.employee  # noqa: F401 — register Employee, SystemConfig
 import backend.models.audit  # noqa: F401 — register AuditLog
 import backend.models.llm_call  # noqa: F401 — register LlmCall
+import backend.models.memory    # noqa: F401 — register EmployeeMemory
 
 config = context.config
 config.set_main_option("sqlalchemy.url", settings.database_url_sync)
