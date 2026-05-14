@@ -169,46 +169,35 @@ onMounted(refresh)
 </script>
 
 <style scoped>
+/* Page-specific layout only — Element Plus dark theme is global (assets/main.css). */
+
 .cfg-view {
   height: 100vh; overflow-y: auto;
-  background: #0f1117; color: #dce8ff;
+  background: var(--el-bg-color-page);
+  color: var(--el-text-color-primary);
   padding: 24px 32px;
 }
-.page-header { display: flex; align-items: center; gap: 16px; margin-bottom: 8px; }
-.page-header h1 { margin: 0; font-size: 22px; font-weight: 700; }
-.actions { margin-left: auto; display: flex; gap: 8px; }
+.page-header   { display: flex; align-items: center; gap: 16px; margin-bottom: 8px; }
+.page-header h1 { margin: 0; font-size: 22px; font-weight: 700; color: var(--el-text-color-primary); }
+.actions       { margin-left: auto; display: flex; gap: 8px; }
 
-.hint { color: #6a7a9a; font-size: 13px; margin: 0 0 20px 0; }
+.hint { color: var(--el-text-color-secondary); font-size: 13px; margin: 0 0 20px 0; }
 
 .sections { display: flex; flex-direction: column; gap: 16px; }
-.section :deep(.el-card__header) {
-  background: #14161f; border-bottom: 1px solid #252a3a;
-}
-:deep(.el-card) { background: #14161f !important; border: 1px solid #252a3a !important; }
-.sec-title { font-size: 14px; font-weight: 600; color: #dce8ff; }
-.sec-hint { font-size: 11px; color: #5a6480; margin-left: 12px; }
+.sec-title { font-size: 14px; font-weight: 600; color: var(--el-text-color-primary); }
+.sec-hint  { font-size: 11px; color: var(--el-text-color-placeholder); margin-left: 12px; }
 
 .prompts-grid { display: flex; flex-direction: column; gap: 16px; }
-.prompt-label { font-size: 12px; color: #8a96b0; font-weight: 600; margin-bottom: 6px; }
+.prompt-label { font-size: 12px; color: var(--el-text-color-secondary); font-weight: 600; margin-bottom: 6px; }
 .prompt-block {
   margin: 0; padding: 12px;
-  background: #0d0f18; border: 1px solid #1f232f; border-radius: 6px;
+  background: var(--el-fill-color-blank);
+  border: 1px solid var(--el-border-color-lighter);
+  border-radius: 6px;
   font-family: ui-monospace, monospace;
-  font-size: 12px; line-height: 1.6; color: #c8d0e0;
+  font-size: 12px; line-height: 1.6;
+  color: var(--el-text-color-regular);
   white-space: pre-wrap;
   max-height: 300px; overflow-y: auto;
 }
-
-:deep(.el-table) { background: transparent !important; color: #c8d0e0 !important; }
-:deep(.el-table tr), :deep(.el-table th.el-table__cell) {
-  background: #14161f !important; color: #8a96b0 !important;
-}
-:deep(.el-table .cell) { color: #c8d0e0 !important; }
-:deep(.el-input__wrapper),
-:deep(.el-textarea__inner),
-:deep(.el-select .el-input__wrapper) {
-  background: #0d0f18 !important; box-shadow: 0 0 0 1px #2d3141 !important; color: #c8d0e0 !important;
-}
-:deep(.el-descriptions__cell.el-descriptions__label) { background: #14161f !important; color: #8a96b0 !important; }
-:deep(.el-descriptions__cell) { color: #c8d0e0 !important; }
 </style>

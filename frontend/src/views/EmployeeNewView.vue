@@ -243,48 +243,41 @@ async function onCreate() {
 </script>
 
 <style scoped>
+/* Page-specific layout only — Element Plus dark theme is global (assets/main.css). */
+
 .new-view {
   height: 100vh; overflow-y: auto;
-  background: #0f1117; color: #dce8ff;
+  background: var(--el-bg-color-page);
+  color: var(--el-text-color-primary);
   padding: 24px 32px;
 }
-.page-header { display: flex; align-items: center; gap: 16px; margin-bottom: 20px; }
-.page-header h1 { margin: 0; font-size: 22px; font-weight: 700; }
+.page-header   { display: flex; align-items: center; gap: 16px; margin-bottom: 20px; }
+.page-header h1 { margin: 0; font-size: 22px; font-weight: 700; color: var(--el-text-color-primary); }
 .step-tag {
   margin-left: auto; padding: 4px 10px; border-radius: 12px;
   background: #1c2030; color: #7aa3d6; font-size: 12px; font-weight: 600;
 }
 
-.wizard-card { max-width: 800px; margin: 0 auto; background: #14161f !important; border: 1px solid #252a3a !important; }
+.wizard-card { max-width: 800px; margin: 0 auto; }
 :deep(.wizard-card .el-card__body) { padding: 24px; }
 
-.step-block h2 { margin: 0 0 8px 0; font-size: 18px; color: #dce8ff; }
-.hint { color: #6a7a9a; font-size: 13px; margin: 0 0 16px 0; }
-.hint-inline { color: #6a7a9a; font-size: 12px; margin-left: 8px; }
-.hint a { color: #7aa3d6; }
+.step-block h2 { margin: 0 0 8px 0; font-size: 18px; color: var(--el-text-color-primary); }
+.hint          { color: var(--el-text-color-secondary); font-size: 13px; margin: 0 0 16px 0; }
+.hint-inline   { color: var(--el-text-color-secondary); font-size: 12px; margin-left: 8px; }
+.hint a        { color: #7aa3d6; }
 
 .preset-group { display: flex; flex-direction: column; gap: 8px; align-items: stretch; }
 :deep(.preset-group .el-radio-button) { display: block; }
 :deep(.preset-group .el-radio-button__inner) {
   display: block; width: 100%; text-align: left; padding: 12px 16px;
-  border-radius: 6px !important; border: 1px solid #252a3a !important;
-  background: #0d0f18 !important; color: #c8d0e0 !important;
+  border-radius: 6px !important;
 }
-:deep(.preset-group .el-radio-button.is-active .el-radio-button__inner) {
-  background: #1c2540 !important; border-color: #4068d0 !important;
-}
-.preset-item strong { color: #dce8ff; font-size: 14px; }
-.preset-item .preset-desc { color: #6a7a9a; font-size: 12px; margin-top: 4px; }
+.preset-item strong       { color: var(--el-text-color-primary); font-size: 14px; }
+.preset-item .preset-desc { color: var(--el-text-color-secondary); font-size: 12px; margin-top: 4px; }
 
 .wizard-footer {
-  margin-top: 24px; padding-top: 16px; border-top: 1px solid #1f232f;
+  margin-top: 24px; padding-top: 16px;
+  border-top: 1px solid var(--el-border-color-lighter);
   display: flex; justify-content: flex-end; gap: 8px;
 }
-
-:deep(.el-form-item__label) { color: #8a96b0 !important; }
-:deep(.el-input__wrapper),
-:deep(.el-textarea__inner) {
-  background: #0d0f18 !important; box-shadow: 0 0 0 1px #2d3141 !important; color: #c8d0e0 !important;
-}
-:deep(.el-divider__text) { background: #14161f !important; color: #6a7a9a !important; }
 </style>

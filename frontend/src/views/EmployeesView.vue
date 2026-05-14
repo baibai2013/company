@@ -110,9 +110,12 @@ onMounted(refresh)
 </script>
 
 <style scoped>
+/* Page-specific layout only — Element Plus dark theme is global (assets/main.css). */
+
 .emp-view {
   height: 100vh; overflow-y: auto;
-  background: #0f1117; color: #dce8ff;
+  background: var(--el-bg-color-page);
+  color: var(--el-text-color-primary);
   padding: 24px 32px;
 }
 
@@ -120,9 +123,9 @@ onMounted(refresh)
   display: flex; justify-content: space-between; align-items: flex-end;
   margin-bottom: 24px; flex-wrap: wrap; gap: 16px;
 }
-.title-block h1 { margin: 0 0 4px 0; font-size: 22px; font-weight: 700; }
-.subtitle { margin: 0; font-size: 13px; color: #6a7a9a; }
-.actions { display: flex; gap: 8px; }
+.title-block h1 { margin: 0 0 4px 0; font-size: 22px; font-weight: 700; color: var(--el-text-color-primary); }
+.subtitle { margin: 0; font-size: 13px; color: var(--el-text-color-secondary); }
+.actions  { display: flex; gap: 8px; }
 
 .emp-grid {
   display: grid;
@@ -132,37 +135,39 @@ onMounted(refresh)
 
 .emp-card {
   cursor: pointer;
-  background: #14161f !important;
-  border: 1px solid #252a3a !important;
-  transition: border-color .2s, transform .15s;
+  transition: border-color .2s, transform .15s, box-shadow .2s;
 }
-.emp-card:hover { border-color: #334070 !important; transform: translateY(-1px); }
+.emp-card:hover {
+  border-color: #4068d0 !important;
+  transform: translateY(-1px);
+  box-shadow: 0 4px 16px rgba(64, 104, 208, 0.15);
+}
 .emp-card.is-inactive { opacity: 0.55; }
 :deep(.emp-card .el-card__body) { padding: 16px; }
 
-.card-head { display: flex; justify-content: space-between; align-items: flex-start; margin-bottom: 8px; }
+.card-head  { display: flex; justify-content: space-between; align-items: flex-start; margin-bottom: 8px; }
 .card-title { display: flex; align-items: flex-start; gap: 12px; }
 .card-emoji { font-size: 28px; line-height: 1; margin-top: 2px; }
-.card-name { font-size: 16px; font-weight: 700; color: #dce8ff; }
-.card-key { font-size: 11px; color: #5a6480; font-family: ui-monospace, monospace; margin-top: 2px; }
+.card-name  { font-size: 16px; font-weight: 700; color: var(--el-text-color-primary); }
+.card-key   { font-size: 11px; color: var(--el-text-color-placeholder); font-family: ui-monospace, monospace; margin-top: 2px; }
 
 .card-role {
-  font-size: 13px; color: #8a96b0;
+  font-size: 13px; color: var(--el-text-color-secondary);
   margin: 8px 0 12px 0;
   padding-bottom: 12px;
-  border-bottom: 1px solid #1f232f;
+  border-bottom: 1px solid var(--el-border-color-lighter);
   min-height: 18px;
 }
 
-.card-meta { display: flex; flex-direction: column; gap: 6px; }
-.meta-row { display: flex; align-items: center; gap: 8px; font-size: 12px; }
-.meta-label { width: 48px; color: #5a6480; }
-.meta-dot { width: 8px; height: 8px; border-radius: 50%; flex-shrink: 0; }
-.meta-dot.on { background: #4ade80; box-shadow: 0 0 6px #4ade80; }
-.meta-dot.off { background: #555a6f; }
-.meta-dot.unset { background: #2d3141; }
-.meta-text { color: #c8d0e0; }
-.meta-port { color: #6a7a9a; font-family: ui-monospace, monospace; margin-left: 4px; }
+.card-meta  { display: flex; flex-direction: column; gap: 6px; }
+.meta-row   { display: flex; align-items: center; gap: 8px; font-size: 12px; }
+.meta-label { width: 48px; color: var(--el-text-color-placeholder); }
+.meta-dot   { width: 8px; height: 8px; border-radius: 50%; flex-shrink: 0; }
+.meta-dot.on    { background: #4ade80; box-shadow: 0 0 6px #4ade80; }
+.meta-dot.off   { background: #555a6f; }
+.meta-dot.unset { background: var(--el-border-color); }
+.meta-text { color: var(--el-text-color-regular); }
+.meta-port { color: var(--el-text-color-secondary); font-family: ui-monospace, monospace; margin-left: 4px; }
 
 .card-models {
   margin-top: 12px;

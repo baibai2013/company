@@ -7,29 +7,293 @@ html, body, #app {
   overflow: hidden;
 }
 
-/* Global Element Plus dark theme — overrides all dialogs, selects, dropdowns, tables */
+/* ── Global Element Plus dark theme tokens ────────────────────────────────── */
 :root {
-  --el-bg-color: #1a1d27;
-  --el-bg-color-overlay: #1a1d27;
-  --el-bg-color-page: #0f1117;
-  --el-text-color-primary: #dce8ff;
-  --el-text-color-regular: #c8d0e0;
-  --el-text-color-secondary: #7a8aa0;
+  /* Page / surfaces */
+  --el-bg-color-page:        #0f1117;   /* page background */
+  --el-bg-color:             #14161f;   /* card / panel surface */
+  --el-bg-color-overlay:     #1a1d27;   /* dropdowns, popovers, dialogs */
+  --el-fill-color-blank:     #0d0f18;   /* input background */
+  --el-fill-color-light:     #1e2235;   /* table stripe / hover */
+  --el-fill-color:           #1a1d27;
+  --el-fill-color-darker:    #0d0f18;
+  --el-color-white:          #1a1d27;
+
+  /* Text */
+  --el-text-color-primary:     #dce8ff;
+  --el-text-color-regular:     #c8d0e0;
+  --el-text-color-secondary:   #8a96b0;
   --el-text-color-placeholder: #4a5270;
-  --el-border-color: #2d3141;
-  --el-border-color-light: #252a3a;
-  --el-border-color-lighter: #1e2235;
-  --el-fill-color-blank: #141720;
-  --el-fill-color: #1a1d27;
-  --el-fill-color-light: #1e2235;
-  --el-color-white: #1a1d27;
+  --el-text-color-disabled:    #4a5270;
+
+  /* Borders */
+  --el-border-color-darker: #334060;
+  --el-border-color:        #2d3141;
+  --el-border-color-light:  #252a3a;
+  --el-border-color-lighter:#1f232f;
+  --el-border-color-extra-light: #1a1d27;
+
+  /* Inputs */
+  --el-input-bg-color:          #0d0f18;
+  --el-input-text-color:        #dce8ff;
+  --el-input-border-color:      #2d3141;
+  --el-input-hover-border:      #334070;
+  --el-input-focus-border:      #4068d0;
+  --el-input-placeholder-color: #4a5270;
+
+  /* Tables */
+  --el-table-bg-color:           #14161f;
+  --el-table-tr-bg-color:        #14161f;
+  --el-table-row-hover-bg-color: #1c2030;
+  --el-table-header-bg-color:    #1a1d27;
+  --el-table-border-color:       #252a3a;
+  --el-table-text-color:         #c8d0e0;
+  --el-table-header-text-color:  #8a96b0;
+
+  /* Selects / dropdowns */
+  --el-select-dropdown-bg-color:        #1a1d27;
+  --el-select-input-color:              #dce8ff;
+  --el-select-option-hover-bg-color:    #252a3a;
+  --el-select-option-selected-bg-color: #1c2540;
+
+  /* Tags */
+  --el-tag-bg-color: #252a3a;
+
+  /* Mask */
   --el-mask-color: rgba(0, 0, 0, 0.7);
   --el-box-shadow-light: 0 2px 12px rgba(0, 0, 0, 0.5);
-  --el-input-bg-color: #141720;
-  --el-input-text-color: #dce8ff;
-  --el-input-border-color: #2d3141;
-  --el-input-placeholder-color: #4a5270;
-  --el-select-dropdown-bg-color: #1a1d27;
-  --el-select-option-hover-bg-color: #252a3a;
-  --el-tag-bg-color: #252a3a;
+}
+
+/* ── Body baseline ────────────────────────────────────────────────────────── */
+body {
+  font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+  background: var(--el-bg-color-page);
+  color: var(--el-text-color-primary);
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+}
+
+/* ── Element Plus components — global dark coverage ───────────────────────── */
+
+/* Card — used in detail / list / wizard views */
+.el-card {
+  background: var(--el-bg-color) !important;
+  border: 1px solid var(--el-border-color-light) !important;
+  color: var(--el-text-color-primary) !important;
+}
+.el-card__header {
+  background: var(--el-bg-color) !important;
+  border-bottom: 1px solid var(--el-border-color-light) !important;
+}
+
+/* Inputs / textarea / select */
+.el-input__wrapper,
+.el-textarea__inner,
+.el-select .el-input__wrapper {
+  background: var(--el-input-bg-color) !important;
+  box-shadow: 0 0 0 1px var(--el-input-border-color) !important;
+  color: var(--el-text-color-primary) !important;
+}
+.el-input__wrapper:hover,
+.el-textarea__inner:hover {
+  box-shadow: 0 0 0 1px var(--el-input-hover-border) !important;
+}
+.el-input.is-focus .el-input__wrapper,
+.el-textarea__inner:focus {
+  box-shadow: 0 0 0 1px var(--el-input-focus-border) !important;
+}
+.el-input__inner,
+.el-input-number__inner,
+.el-textarea__inner {
+  color: var(--el-text-color-primary) !important;
+  background: transparent !important;
+}
+.el-input::placeholder,
+.el-input__inner::placeholder,
+.el-textarea__inner::placeholder {
+  color: var(--el-text-color-placeholder) !important;
+}
+
+/* Form labels */
+.el-form-item__label {
+  color: var(--el-text-color-secondary) !important;
+}
+
+/* Tables */
+.el-table {
+  background: transparent !important;
+  color: var(--el-table-text-color) !important;
+  --el-table-border-color: var(--el-border-color-light);
+}
+.el-table tr,
+.el-table tr td.el-table__cell,
+.el-table th.el-table__cell {
+  background: var(--el-table-tr-bg-color) !important;
+  color: var(--el-text-color-regular) !important;
+  border-bottom-color: var(--el-border-color-light) !important;
+}
+.el-table th.el-table__cell {
+  background: var(--el-table-header-bg-color) !important;
+  color: var(--el-table-header-text-color) !important;
+}
+.el-table--striped .el-table__body tr.el-table__row--striped td.el-table__cell {
+  background: var(--el-fill-color-darker) !important;
+}
+.el-table .el-table__body tr:hover > td.el-table__cell {
+  background: var(--el-table-row-hover-bg-color) !important;
+}
+.el-table .cell {
+  color: var(--el-text-color-regular) !important;
+}
+
+/* Descriptions */
+.el-descriptions__cell.el-descriptions__label {
+  background: var(--el-bg-color) !important;
+  color: var(--el-text-color-secondary) !important;
+  border-color: var(--el-border-color-light) !important;
+}
+.el-descriptions__cell {
+  color: var(--el-text-color-regular) !important;
+  border-color: var(--el-border-color-light) !important;
+}
+
+/* Dropdown menu (process control etc) */
+.el-dropdown-menu {
+  background: var(--el-bg-color-overlay) !important;
+  border: 1px solid var(--el-border-color-light) !important;
+}
+.el-dropdown-menu__item {
+  color: var(--el-text-color-regular) !important;
+}
+.el-dropdown-menu__item:hover,
+.el-dropdown-menu__item:focus {
+  background: var(--el-select-option-hover-bg-color) !important;
+  color: var(--el-text-color-primary) !important;
+}
+
+/* Select dropdown */
+.el-select-dropdown {
+  background: var(--el-bg-color-overlay) !important;
+  border: 1px solid var(--el-border-color-light) !important;
+}
+.el-select-dropdown__item {
+  color: var(--el-text-color-regular) !important;
+}
+.el-select-dropdown__item.hover,
+.el-select-dropdown__item:hover {
+  background: var(--el-select-option-hover-bg-color) !important;
+}
+.el-select-dropdown__item.selected {
+  background: var(--el-select-option-selected-bg-color) !important;
+  color: #7eb3ff !important;
+}
+
+/* Dialog */
+.el-dialog,
+.el-message-box {
+  background: var(--el-bg-color-overlay) !important;
+  border: 1px solid var(--el-border-color-light) !important;
+}
+.el-dialog__title,
+.el-message-box__title {
+  color: var(--el-text-color-primary) !important;
+}
+.el-dialog__headerbtn .el-dialog__close {
+  color: var(--el-text-color-secondary) !important;
+}
+.el-message-box__content {
+  color: var(--el-text-color-regular) !important;
+}
+
+/* Message popups (ElMessage) */
+.el-message {
+  background: var(--el-bg-color-overlay) !important;
+  border: 1px solid var(--el-border-color-light) !important;
+  color: var(--el-text-color-primary) !important;
+}
+
+/* Divider */
+.el-divider__text {
+  background: var(--el-bg-color) !important;
+  color: var(--el-text-color-secondary) !important;
+}
+.el-divider {
+  border-color: var(--el-border-color-light) !important;
+}
+
+/* Tag */
+.el-tag {
+  background: #252a3a !important;
+  border-color: #2d3141 !important;
+  color: #c8d0e0 !important;
+}
+.el-tag--success { background: #1c3a2e !important; border-color: #2d5a44 !important; color: #4ade80 !important; }
+.el-tag--info    { background: #252a3a !important; border-color: #2d3141 !important; color: #8a96b0 !important; }
+.el-tag--warning { background: #3a2e1c !important; border-color: #5a4429 !important; color: #fbbf24 !important; }
+.el-tag--danger  { background: #3a1c1c !important; border-color: #5a2929 !important; color: #f87171 !important; }
+
+/* Switch */
+.el-switch__core {
+  background: var(--el-border-color) !important;
+  border-color: var(--el-border-color) !important;
+}
+.el-switch.is-checked .el-switch__core {
+  background: #4068d0 !important;
+  border-color: #4068d0 !important;
+}
+
+/* Radio button group */
+.el-radio-button__inner {
+  background: var(--el-input-bg-color) !important;
+  border: 1px solid var(--el-border-color-light) !important;
+  color: var(--el-text-color-regular) !important;
+}
+.el-radio-button.is-active .el-radio-button__inner {
+  background: #1c2540 !important;
+  border-color: #4068d0 !important;
+  color: #7eb3ff !important;
+  box-shadow: -1px 0 0 0 #4068d0 !important;
+}
+
+/* Checkbox */
+.el-checkbox__label { color: var(--el-text-color-regular) !important; }
+.el-checkbox__inner {
+  background: var(--el-input-bg-color) !important;
+  border-color: var(--el-border-color) !important;
+}
+.el-checkbox.is-checked .el-checkbox__inner {
+  background: #4068d0 !important;
+  border-color: #4068d0 !important;
+}
+
+/* Buttons — keep ElementPlus defaults except for plain/default tone */
+.el-button {
+  background: var(--el-bg-color) !important;
+  border-color: var(--el-border-color) !important;
+  color: var(--el-text-color-regular) !important;
+}
+.el-button:hover {
+  background: #1c2030 !important;
+  border-color: #334070 !important;
+  color: var(--el-text-color-primary) !important;
+}
+.el-button--primary {
+  background: #2855b8 !important;
+  border-color: #2855b8 !important;
+  color: #ffffff !important;
+}
+.el-button--primary:hover {
+  background: #4068d0 !important;
+  border-color: #4068d0 !important;
+}
+.el-button.is-disabled,
+.el-button.is-disabled:hover {
+  background: var(--el-bg-color) !important;
+  border-color: var(--el-border-color-lighter) !important;
+  color: var(--el-text-color-disabled) !important;
+}
+
+/* Loading mask */
+.el-loading-mask {
+  background-color: rgba(15, 17, 23, 0.7) !important;
 }
