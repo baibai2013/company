@@ -22,3 +22,4 @@ asyncpg>=0.29
 psycopg[binary]>=3.1  # langgraph-checkpoint-postgres 依赖
 celery[redis]>=5.3
 redis>=5.0
+watchdog>=4.0  # scenarios/ 目录热重载

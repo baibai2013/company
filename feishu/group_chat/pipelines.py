@@ -107,7 +107,12 @@ def _append_to_history(
         content: 发言内容。
         visible_to: 可见范围。设置后仅指定员工可看到此消息；为空则全员可见。
     """
-    emoji, name = EMPLOYEE_CONFIG.get(employee, ("👤", employee))
+    if employee == "user":
+        emoji, name = "👔", "老板"
+        role = "user"
+    else:
+        emoji, name = EMPLOYEE_CONFIG.get(employee, ("👤", employee))
+        role = "assistant"
     msg = ConversationMessage(
         id=str(uuid.uuid4()),
         session_id=session.id,
@@ -116,7 +121,7 @@ def _append_to_history(
         content=content,
         feishu_message_id="",
         created_at=time.time(),
-        role="assistant",
+        role=role,
         visible_to=visible_to or [],
     )
     session.history.append(msg)
@@ -327,3 +332,88 @@ async def vote(
     if len(top) == 1 or top[0][1] > top[1][1]:
         return top[0][0], votes
     return None, votes  # tie
+
+
+# ── 用户输入原语 ─────────────────────────────────────────────────────────────
+
+async def wait_for_user_msg(
+    session: "GroupSession",
+    bus_pool: "GroupEventBusPool",
+    sender: str = "",
+    timeout: float = 120.0,
+) -> str | None:
+    """等待真实用户在群里发一条消息，追加到 history 后返回内容。
+
+    游戏进行中，orchestrator 会把用户新消息转发到 user_input:{chat_id} 频道，
+    本函数订阅该频道等待用户输入。超时返回 None。
+
+    Args:
+        session: 当前群聊会话。
+        bus_pool: Redis 事件总线。
+        sender: 可选，指定接受哪个用户的消息（如 "user:ou_abc"）。为空接受任何人。
+        timeout: 超时秒数（默认 120 秒）。
+
+    Returns:
+        用户消息文本，超时返回 None。
+    """
+    import asyncio
+    from .event_bus import GroupEventBus
+
+    sub = GroupEventBus()
+    await sub.connect()
+    try:
+        async def _listen():
+            async for data in sub.subscribe_user_input(session.chat_id):
+                # 如果指定了 sender，过滤非目标用户的消息
+                if sender and data.get("sender") and data["sender"] != sender:
+                    continue
+                return data.get("text", ""), data.get("message_id", "")
+            return None
+
+        result = await asyncio.wait_for(_listen(), timeout=timeout)
+        if result:
+            text, mid = result
+            sender_key = sender or "user"
+            _append_to_history(session, sender_key, text)
+            return text
+        return None
+    except asyncio.TimeoutError:
+        log.info("wait_for_user_msg: timeout after %.0fs chat=%s", timeout, session.chat_id)
+        return None
+    finally:
+        await sub.disconnect()
+
+
+# ── Participant 便捷原语 ─────────────────────────────────────────────────────
+
+async def speak_sequential(
+    participants: list,
+    session: "GroupSession",
+    bus_pool: "GroupEventBusPool",
+    context_fn=None,
+    visible_to: list[str] | None = None,
+    timeout: float = _SPEAK_TIMEOUT,
+) -> list[str]:
+    """顺序让所有 Participant 发言（AI 和用户自动区分）。
+
+    Args:
+        participants: Participant 实例列表。
+        session: 当前群聊会话。
+        bus_pool: Redis 事件总线。
+        context_fn: 上下文生成函数 (participant) -> str。
+        visible_to: 消息可见范围。
+        timeout: 单人超时时间。
+
+    Returns:
+        成功发言的 participant key 列表。
+    """
+    completed = []
+    for p in participants:
+        ctx = context_fn(p) if context_fn else ""
+        content = await p.speak(
+            session, bus_pool, context=ctx,
+            visible_to=visible_to, timeout=timeout,
+        )
+        if content:
+            completed.append(p.key)
+    return completed

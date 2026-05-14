@@ -3,9 +3,10 @@ Redis Pub/Sub event bus for group chat orchestration.
 Section VI of doc/design/group-chat-redesign.md.
 
 Channel naming (with multi-group isolation):
-  group_msg:{chat_id}          — group message entry
+  group_msg:{chat_id}            — group message entry
   speak_req:{employee}:{chat_id} — speak request for employee in group
-  speak_resp:{session_id}     — speak response for session
+  speak_resp:{session_id}        — speak response for session
+  user_input:{chat_id}           — forwarded user message during active game
 """
 import asyncio
 import json
@@ -73,6 +74,18 @@ class GroupEventBus:
         await self._pub.publish(channel, payload)
         log.info("published speak_req:%s:%s session=%s", req.employee, req.chat_id, req.session_id)
 
+    async def publish_user_input(
+        self, chat_id: str, text: str, message_id: str = "", sender: str = "",
+    ) -> None:
+        """转发用户消息到活跃场景（游戏进行中用户发的消息走这个频道）。"""
+        channel = f"user_input:{chat_id}"
+        payload = json.dumps({
+            "chat_id": chat_id, "text": text,
+            "message_id": message_id, "sender": sender,
+        }, ensure_ascii=False)
+        await self._pub.publish(channel, payload)
+        log.info("published user_input:%s sender=%s", chat_id, sender)
+
     async def publish_speak_resp(self, resp: SpeakResponse) -> None:
         channel = f"speak_resp:{resp.session_id}"
         payload = json.dumps({
@@ -128,6 +141,19 @@ class GroupEventBus:
                 )
             except Exception as exc:
                 log.warning("parse group_msg pattern failed: %s", exc)
+
+    async def subscribe_user_input(self, chat_id: str) -> AsyncIterator[dict]:
+        """监听转发过来的用户消息（场景等待 CEO 输入时使用）。"""
+        channel = f"user_input:{chat_id}"
+        await self._sub.subscribe(channel)
+        log.info("subscribed to %s (user_input)", channel)
+        async for msg in self._sub.listen():
+            if msg["type"] != "message":
+                continue
+            try:
+                yield json.loads(msg["data"])
+            except Exception as exc:
+                log.warning("parse user_input failed: %s", exc)
 
     async def subscribe_speak_req(
         self, employee: str, chat_ids: list[str], callback: Callable[[SpeakRequest], Awaitable[None]],

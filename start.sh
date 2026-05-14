@@ -142,7 +142,7 @@ done
 # ── 2. Backend FastAPI (:8000) ────────────────────────────────────────────────
 echo ""
 info "启动 Backend API (port 8000)..."
-start_py "backend" 8000 -m uvicorn backend.main:app --host 0.0.0.0 --port 8000
+start_py "backend" 8000 -m uvicorn backend.main:app --host 0.0.0.0 --port 8000 --reload --reload-dir backend
 
 # ── 3. TechLead Supervisor (:9000) ────────────────────────────────────────────
 echo ""
@@ -250,7 +250,14 @@ nohup .venv/bin/python -m feishu.group_chat.orchestrator > "$LOG_DIR/orchestrato
 echo "orchestrator $!" >> "$PID_FILE"
 ok "GroupOrchestrator (logs/orchestrator.log)"
 
-# ── 9. 等待飞书 WebSocket 连接就绪 ────────────────────────────────────────────
+# ── 9. 热更新守护进程 ─────────────────────────────────────────────────────────
+echo ""
+info "启动热更新守护进程..."
+nohup .venv/bin/python scripts/hot_reload.py > "$LOG_DIR/hot_reload.log" 2>&1 &
+echo "hot_reload $!" >> "$PID_FILE"
+ok "热更新守护进程 (logs/hot_reload.log)"
+
+# ── 10. 等待飞书 WebSocket 连接就绪 ───────────────────────────────────────────
 echo ""
 info "等待飞书 Bot WebSocket 连接..."
 WS_READY=0

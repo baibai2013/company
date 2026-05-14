@@ -16,6 +16,7 @@ from pydantic import BaseModel
 
 from agents_v2.shared.claude_client import make_langchain_llm
 from agents_v2.shared.db import async_checkpointer_ctx
+from agents_v2.shared.hot_reload_receiver import setup as _hot_setup
 from agents_v2.tech_lead.supervisor import build_supervisor
 
 CHAT_SYSTEM_PROMPT = """你是机器狗公司的技术负责人（Tech Lead）。
@@ -125,4 +126,5 @@ def health():
 
 
 if __name__ == "__main__":
+    _hot_setup("agents_v2.tech_lead")  # SIGUSR1 → reload prompts.py
     uvicorn.run("agents_v2.tech_lead.main:app", host="0.0.0.0", port=9000, reload=False)

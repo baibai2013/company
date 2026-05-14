@@ -39,13 +39,7 @@ from .pipelines import (
     _append_to_history,
     _wait_for_responses,
 )
-from .prompts import (
-    DECIDE_PROMPT, GROUP_SPEAK_PREFIX, ROLE_DECIDE_PROMPT,
-    SUMMARY_PROMPT,
-    build_summary_prompt,
-    build_role_context, build_simple_role_context,
-    extract_explicit_roles, format_history,
-)
+from . import prompts as _p  # 模块级引用，支持 watchdog 热重载后自动使用新值
 from .scenarios import SCENARIO_REGISTRY
 from .session import SessionStore
 
@@ -160,7 +154,7 @@ async def _decide_node(
     llm_haiku = make_langchain_llm("claude-haiku-4-5-20251001")
 
     # Step 1: Check for explicit role assignment
-    explicit_roles = await extract_explicit_roles(
+    explicit_roles = await _p.extract_explicit_roles(
         event.text, event.mentions, llm_haiku,
     )
     if explicit_roles:
@@ -170,7 +164,7 @@ async def _decide_node(
 
     # Step 2: Decide mode and participants
     resp = await llm_haiku.ainvoke([
-        SystemMessage(DECIDE_PROMPT),
+        SystemMessage(_p.DECIDE_PROMPT),
         HumanMessage(event.text),
     ])
 
@@ -191,6 +185,12 @@ async def _decide_node(
     if not decision.participants and decision.mode != "ignore":
         decision.participants = ["project_manager"]
 
+    # 过滤掉 LLM 幻觉出的无效 key（仅在 EMPLOYEE_CONFIG 非空时过滤，避免 registry 未 warmup 误删）
+    if len(EMPLOYEE_CONFIG) > 0:
+        decision.participants = [e for e in decision.participants if e in EMPLOYEE_CONFIG]
+    if not decision.participants and decision.mode != "ignore":
+        decision.participants = ["project_manager"]
+
     session.mode = decision.mode
     session.participants = decision.participants
     session.pending = list(decision.participants)
@@ -200,12 +200,17 @@ async def _decide_node(
         # Use ROLE_DECIDE_PROMPT for complex modes
         if decision.mode in ("sequential", "parallel") and len(decision.participants) > 1:
             try:
+                # 过滤掉 LLM 幻觉出的无效 key，只保留 EMPLOYEE_CONFIG 里有的
+                valid_participants = [e for e in decision.participants if e in EMPLOYEE_CONFIG]
+                if not valid_participants:
+                    # registry 未 warmup，跳过角色分配
+                    raise RuntimeError("EMPLOYEE_CONFIG empty, registry not warmed up")
                 participant_list = "\n".join(
-                    f"- {e}: {EMPLOYEE_CONFIG[e][0]} {EMPLOYEE_CONFIG[e][1]} ({ROLE_DESCRIPTIONS.get(e, '')})"
-                    for e in decision.participants
+                    f"- {e}: {EMPLOYEE_CONFIG.get(e, ('👤', e))[0]} {EMPLOYEE_CONFIG.get(e, ('👤', e))[1]} ({ROLE_DESCRIPTIONS.get(e, '')})"
+                    for e in valid_participants
                 )
                 role_resp = await llm_haiku.ainvoke([
-                    SystemMessage(ROLE_DECIDE_PROMPT),
+                    SystemMessage(_p.ROLE_DECIDE_PROMPT),
                     HumanMessage(f"参与者列表：\n{participant_list}\n\n话题：{event.text}"),
                 ])
                 m2 = _re.search(r"\{.*\}", role_resp.content, _re.DOTALL)
@@ -231,9 +236,14 @@ async def _decide_node(
                     # Initialize game state via scenario registry
                     scenario_cls = SCENARIO_REGISTRY.get(session.template)
                     if scenario_cls and session.host and not session.game_state:
+                        # 游戏场景自动加入 CEO（真实用户）
+                        if "user" not in session.participants:
+                            session.participants.append("user")
+                            session.pending.append("user")
+                            decision.participants.append("user")
                         scenario = scenario_cls(session)
                         session.game_state = scenario.initialize(session.activity_rules)
-                        log.info("decide_node: scenario=%s state=%s",
+                        log.info("decide_node: scenario=%s state=%s (user joined)",
                                  session.template, session.game_state)
             except Exception as exc:
                 log.warning("decide_node: role assignment failed: %s", exc)
@@ -316,7 +326,7 @@ async def _conclude_node(
         await session_store.delete(session.id)
         return _state_set_session(state, session)
 
-    history_text = format_history(session.history)
+    history_text = _p.format_history(session.history)
 
     # Pick the host (or fall back to project_manager) to do the summary
     summarizer = session.host if session.host in EMPLOYEE_CONFIG else "project_manager"
@@ -328,7 +338,7 @@ async def _conclude_node(
         history_text=history_text,
         trigger_message_id=session.trigger_message_id,
         summary_mode=True,
-        role_context=build_summary_prompt(session),
+        role_context=_p.build_summary_prompt(session),
     )
     await bus_pool.pub_bus.publish_speak_req(req)
 
@@ -399,6 +409,40 @@ async def run_orchestrator():
 
     log.info("Starting GroupOrchestrator...")
 
+    # ── 热更新信号处理 ────────────────────────────────────────────────────────
+    # SIGUSR1：reload prompts / pipelines / scenarios（文件级热更，守护进程自动触发）
+    # SIGUSR2：eventbus 重连（scripts/reload.py eventbus 触发）
+    import signal as _signal
+    import importlib as _importlib
+    from feishu.group_chat.scenarios import reload_all as _reload_scenarios
+    from feishu.group_chat import pipelines as _pipelines_mod
+
+    _reconnect_flag = False
+
+    def _on_usr1(sig, frame):
+        """热重载 prompts / pipelines / scenarios。"""
+        try:
+            _importlib.reload(_p)
+            _importlib.reload(_pipelines_mod)
+            _reload_scenarios()
+            log.info("🔄 SIGUSR1: prompts + pipelines + scenarios reloaded")
+        except Exception as exc:
+            log.warning("SIGUSR1 reload error: %s", exc)
+
+    def _on_usr2(sig, frame):
+        """标记 eventbus 需要重连（下一个消息循环迭代时执行）。"""
+        nonlocal _reconnect_flag
+        _reconnect_flag = True
+        log.info("🔌 SIGUSR2: eventbus reconnect scheduled")
+
+    _signal.signal(_signal.SIGUSR1, _on_usr1)
+    _signal.signal(_signal.SIGUSR2, _on_usr2)
+
+    # 预热员工配置注册表（否则 EMPLOYEE_CONFIG 在 async 上下文返回空字典）
+    from backend.services import registry as _registry
+    await _registry.warmup()
+    log.info("Registry warmed up: %d employees", len(list(_registry.list_keys_sync_cached())))
+
     session_store = SessionStore()
     await session_store.connect()
 
@@ -418,12 +462,6 @@ async def run_orchestrator():
 
             # Skip empty messages
             if not event.text and not event.image_base64:
-                return
-
-            # If this chat already has an active game/session running, skip
-            existing = active_chat_tasks.get(event.chat_id)
-            if existing and not existing.done():
-                log.info("skipping: chat=%s already has active session running", event.chat_id)
                 return
 
             # Create initial state
@@ -455,15 +493,50 @@ async def run_orchestrator():
             except Exception as exc:
                 log.error("graph execution failed for chat=%s: %s", event.chat_id, exc)
 
+        async def _run_subscribe_loop():
+            """订阅循环，支持 SIGUSR2 触发重连。"""
+            nonlocal _reconnect_flag
+            while True:
+                _reconnect_flag = False
+                try:
+                    async for event in bus_pool.sub_bus.subscribe_group_pattern():
+                        if _reconnect_flag:
+                            # eventbus 热更：重连 Redis 订阅
+                            log.info("reconnecting eventbus...")
+                            await bus_pool.disconnect()
+                            _importlib.reload(
+                                _importlib.import_module("feishu.group_chat.event_bus")
+                            )
+                            await bus_pool.connect()
+                            log.info("eventbus reconnected ✅")
+                            break  # 跳出内层循环，重新订阅
+
+                        existing = active_chat_tasks.get(event.chat_id)
+                        if existing and not existing.done():
+                            # 游戏进行中 → 转发用户消息给场景消费（而非丢弃）
+                            await bus_pool.pub_bus.publish_user_input(
+                                event.chat_id, event.text, event.message_id,
+                                sender=event.sender,
+                            )
+                            log.info("forwarded user_input to active session chat=%s",
+                                     event.chat_id)
+                            continue
+
+                        task = asyncio.create_task(handle_event(event))
+                        active_chat_tasks[event.chat_id] = task
+                        done = [cid for cid, t in active_chat_tasks.items() if t.done()]
+                        for cid in done:
+                            del active_chat_tasks[cid]
+                except asyncio.CancelledError:
+                    raise
+                except Exception as exc:
+                    log.error("subscribe loop error: %s, retrying in 2s...", exc)
+                    await asyncio.sleep(2)
+                else:
+                    if not _reconnect_flag:
+                        break  # 正常退出
         try:
-            # Subscribe to all group messages
-            async for event in bus_pool.sub_bus.subscribe_group_pattern():
-                task = asyncio.create_task(handle_event(event))
-                active_chat_tasks[event.chat_id] = task
-                # Clean up completed tasks periodically
-                done = [cid for cid, t in active_chat_tasks.items() if t.done()]
-                for cid in done:
-                    del active_chat_tasks[cid]
+            await _run_subscribe_loop()
         except asyncio.CancelledError:
             log.info("Orchestrator shutting down...")
         finally:

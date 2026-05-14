@@ -16,24 +16,27 @@ from .models import (
 
 _DECIDE_PROMPT_TEMPLATE = """你是群聊调度员，根据最新消息决定如何响应。
 
-员工列表：
+员工列表（key → 名字 职责）：
 {employee_list}
 
 消息中的 [@名字] 标签表示用户 @了该员工。可识别的中英文别名：
 {name_aliases}
 
 路由规则（按优先级）：
-1. 消息含 [全员] → mode=sequential, participants=全部员工
-2. 消息含 [@具体人] → mode=single, participants=[该人]（该人负责组织/回答）
-3. "头脑风暴/大家说说/集思广益/brainstorm" → mode=sequential, 选≤6个最相关专家
-4. "同时/并行/大家一起" → mode=parallel, 选相关专家
-5. 游戏/互动/娱乐/趣味活动/猜谜/投票/竞猜/比赛 → mode=sequential, participants=全部员工（全员参与最有趣）
-6. 技术问题但无明确@人 → mode=single, participants=[最相关专家]
-7. 项目进度/任务分配/里程碑/协调类（明确与工作相关） → mode=single, participants=[project_manager]
-8. 纯闲聊/表情/打卡 → mode=ignore
+1. 消息含 [全员] → mode=sequential, participants=全部员工key列表
+2. 消息含 [@具体人] → mode=single, participants=[该人的key]（该人负责组织/回答）
+3. "头脑风暴/大家说说/集思广益/brainstorm" → mode=sequential, 选≤6个最相关专家key
+4. "同时/并行/大家一起" → mode=parallel, 选相关专家key
+5. 游戏/互动/娱乐/趣味活动/猜谜/投票/竞猜/比赛/规则/怎么玩 → mode=sequential, participants=全部员工key列表（全员参与最有趣）
+6. 技术问题但无明确@人 → mode=single, participants=[最相关专家key]
+7. 只有消息是「纯表情符号」或「空白」才 → mode=ignore
+8. 其他所有情况（包括闲聊、任务、对话、游戏互动）→ mode=single, participants=["project_manager"]
+
+⚠️ 重要：participants 数组里必须填员工的 key（如 project_manager、mechanical、hardware），
+绝对不能填中文名字（如 芳芳、小明）或员工编号。
 
 输出格式（只输出 JSON）：
-{{"mode": "single|sequential|parallel|ignore", "participants": [...], "reason": "一句话理由"}}"""
+{{"mode": "single|sequential|parallel|ignore", "participants": ["key1", "key2"], "reason": "一句话理由"}}"""
 
 
 def build_decide_prompt() -> str:
@@ -59,7 +62,7 @@ def build_decide_prompt() -> str:
     role_map = registry.role_descriptions_compat_sync()
 
     employee_list = "\n".join(
-        f"- {key:<18} {cfg_map.get(key, ('👤', key))[1]}  {role_map.get(key, '')}"
+        f"- key={key:<18} 名字={cfg_map.get(key, ('👤', key))[1]}  {role_map.get(key, '')}"
         for key in employees
     )
     name_aliases = "  ".join(
