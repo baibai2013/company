@@ -7,8 +7,8 @@
       </div>
       <div class="actions">
         <el-button @click="refresh" :loading="loading" size="small">刷新</el-button>
-        <el-button type="primary" disabled size="small">+ 添加员工 (P9)</el-button>
-        <el-button disabled size="small">⚙️ 全局配置 (P9)</el-button>
+        <el-button type="primary" @click="$router.push('/employees/new')" size="small">+ 添加员工</el-button>
+        <el-button @click="$router.push('/system-config')" size="small">⚙️ 全局配置</el-button>
       </div>
     </header>
 

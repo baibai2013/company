@@ -62,13 +62,25 @@ def _human_msg(task_input: Any, prefix: str = "") -> HumanMessage:
 
 
 def _load_config(employee_key: str):
-    """Read EffectiveConfig from registry. Lazy warmup on first access."""
+    """Read EffectiveConfig from registry. Lazy warmup + start LISTEN on first event-loop access."""
+    import asyncio
     from backend.services import registry
+
     if not registry._loaded:  # type: ignore[attr-defined]
         try:
             registry.warmup_sync()
         except RuntimeError:
             pass
+
+    # If we're inside an event loop and the registry listener hasn't started,
+    # spawn it so this process gets PG NOTIFY hot-reloads.
+    if not registry._listener_task or registry._listener_task.done():  # type: ignore[attr-defined]
+        try:
+            asyncio.get_running_loop()
+            registry.start_listener()
+        except RuntimeError:
+            pass
+
     return registry.get_effective_sync(employee_key)
 
 

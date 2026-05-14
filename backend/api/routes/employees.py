@@ -108,16 +108,19 @@ async def deactivate_employee(key: str) -> dict:
 
 @router.post("/{key}/start")
 async def start_employee(key: str) -> dict:
+    await registry.get_effective(key)  # ensure cache contains the employee
     return process_manager.start(key)
 
 
 @router.post("/{key}/stop")
 async def stop_employee(key: str) -> dict:
+    await registry.get_effective(key)
     return process_manager.stop(key)
 
 
 @router.post("/{key}/restart")
 async def restart_employee(key: str) -> dict:
+    await registry.get_effective(key)
     return process_manager.restart(key)
 
 
@@ -130,6 +133,7 @@ async def reload_employee(key: str) -> dict:
 
 @router.get("/{key}/status")
 async def status_employee(key: str) -> dict:
+    await registry.get_effective(key)
     return process_manager.status(key)
 
 
