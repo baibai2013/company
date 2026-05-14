@@ -168,7 +168,12 @@ while IFS= read -r entry; do
   [[ -z "$entry" ]] && continue
   name="${entry%%:*}"
   port="${entry##*:}"
-  start_py "$name" "$port" -m "agents_v2.$name.main"
+  # 有独立目录的走自己的 main.py，其他统一走 generic
+  if [ -d "agents_v2/$name" ] && [ -f "agents_v2/$name/main.py" ]; then
+    start_py "$name" "$port" -m "agents_v2.$name.main"
+  else
+    EMPLOYEE_KEY="$name" start_py "$name" "$port" -m "agents_v2.generic.main" "$name"
+  fi
 done <<< "$EMPLOYEE_LIST"
 
 # ── 5. Frontend (port 5173) ───────────────────────────────────────────────────
