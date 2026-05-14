@@ -94,12 +94,13 @@ class WerewolfScenario(Scenario):
         state = session.game_state
         host = session.host
 
+        _win = {"max_messages": 40, "keep_marks": ["system_event", "death"]}
         # 开场
         await announce(session, host, bus_pool, context=(
             "你是狼人杀游戏的上帝（主持人）。游戏即将开始！\n"
             "宣布：「各位玩家，狼人杀游戏开始！请大家确认自己的身份牌，"
             "天黑请闭眼。」简短开场，30字以内。"
-        ))
+        ), marks=["system_event"], **_win)
 
         # 私密通知每人身份
         for key in state["alive"]:
@@ -118,6 +119,7 @@ class WerewolfScenario(Scenario):
                     f"请记住身份，不要透露给其他人。」20字以内。"
                 ),
                 visible_to=[key, host],
+                marks=["system_event"],
             )
 
         # 主循环
@@ -151,7 +153,7 @@ class WerewolfScenario(Scenario):
         await announce(session, host, bus_pool, context=(
             f"游戏结束！{result}\n公布所有身份：{roles_reveal}\n"
             "做一个简短有趣的总结点评。50字以内。"
-        ))
+        ), marks=["system_event"], **_win)
         log.info("Werewolf: game over, winner=%s", winner)
 
     # ── Night Phase ───────────────────────────────────────────────────────────
@@ -163,10 +165,11 @@ class WerewolfScenario(Scenario):
         host = session.host
         wolves = [w for w in state["wolves"] if w in state["alive"]]
         dead_tonight: list[str] = []
+        _win = {"max_messages": 40, "keep_marks": ["system_event", "death"]}
 
         await announce(session, host, bus_pool, context=(
             f"第{state['round']}个夜晚降临。「天黑请闭眼。」5字以内。"
-        ))
+        ), marks=["system_event"], **_win)
 
         # 1. 狼人选目标
         if wolves:
@@ -184,6 +187,8 @@ class WerewolfScenario(Scenario):
                 ),
                 visible_to=wolves + [host],
                 timeout=60,
+                marks=["wolf_night"],
+                **_win,
             )
 
             # 提取杀人目标
@@ -207,6 +212,8 @@ class WerewolfScenario(Scenario):
                 ),
                 visible_to=[seer, host],
                 timeout=60,
+                marks=["seer_night"],
+                **_win,
             )
             check_target = self._extract_action(resp or "", "查验")
             if check_target and check_target in state["roles"]:
@@ -216,6 +223,8 @@ class WerewolfScenario(Scenario):
                     session, host, bus_pool,
                     context=f"告诉预言家查验结果：「{check_target} 是{result}。」10字以内。",
                     visible_to=[seer, host],
+                    marks=["system_event"],
+                    **_win,
                 )
 
         # 3. 女巫行动
@@ -239,6 +248,8 @@ class WerewolfScenario(Scenario):
                     ),
                     visible_to=[witch, host],
                     timeout=60,
+                    marks=["witch_night"],
+                    **_win,
                 )
                 if resp:
                     if "救" in resp and dead_tonight and state["witch_heal"]:
@@ -277,17 +288,19 @@ class WerewolfScenario(Scenario):
         host = session.host
         alive = state["alive"]
 
+        _win = {"max_messages": 40, "keep_marks": ["system_event", "death"]}
+
         # 宣布死讯
         if killed_tonight:
             dead_names = "、".join(self._p(d).display_name for d in killed_tonight)
             await announce(session, host, bus_pool, context=(
                 f"天亮了。昨晚 {dead_names} 死了。"
                 f"请存活玩家发表意见，讨论谁是狼人。10字以内宣布。"
-            ))
+            ), marks=["death", "system_event"], **_win)
         else:
             await announce(session, host, bus_pool, context=(
                 "天亮了。昨晚是平安夜，无人死亡。请开始讨论。10字以内。"
-            ))
+            ), marks=["system_event"], **_win)
 
         # 讨论：所有存活者统一接口发言
         alive_participants = self._alive_participants()
@@ -298,6 +311,8 @@ class WerewolfScenario(Scenario):
                 f"白天讨论环节，分析局势，推测谁是狼人。40字以内。"
             ),
             timeout=90,
+            marks=[f"day_{state['round']}"],
+            **_win,
         )
 
         # 投票：所有存活者统一投票
@@ -311,6 +326,8 @@ class WerewolfScenario(Scenario):
                 f"在回复最后写【投票:目标key】。20字以内。"
             ),
             timeout=60,
+            marks=[f"day_{state['round']}", "vote"],
+            **_win,
         )
 
         # 从 history 中提取所有投票
@@ -334,7 +351,7 @@ class WerewolfScenario(Scenario):
             await announce(session, host, bus_pool, context=(
                 f"投票结果：{winner_p.display_name} 被放逐。"
                 f"翻牌：{winner_p.display_name} 的身份是{role_name}。简短宣布，15字以内。"
-            ))
+            ), marks=["death", "system_event"], **_win)
             log.info("Werewolf day: %s (%s) exiled", winner, role_name)
 
             # 猎人被投出时开枪
@@ -343,7 +360,7 @@ class WerewolfScenario(Scenario):
         else:
             await announce(session, host, bus_pool, context=(
                 "投票平票，无人被放逐。简短宣布，10字以内。"
-            ))
+            ), marks=["system_event"], **_win)
 
     # ── Helpers ───────────────────────────────────────────────────────────────
 

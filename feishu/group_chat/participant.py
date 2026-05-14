@@ -54,6 +54,9 @@ class Participant(ABC):
         context: str,
         visible_to: list[str] | None = None,
         timeout: float = 120.0,
+        marks: list[str] | None = None,
+        max_messages: int = 0,
+        keep_marks: list[str] | None = None,
     ) -> str | None:
         """获取参与者的发言。
 
@@ -68,6 +71,7 @@ class Participant(ABC):
             context: 给参与者的角色指令/上下文（AI 会用来生成回复，用户看不到）。
             visible_to: 消息可见范围，空=全员可见。
             timeout: 超时秒数。
+            marks: 语义标签写入历史消息，如 "wolf_night"/"system_event"。
 
         Returns:
             发言内容文本，超时或失败返回 None。
@@ -123,11 +127,15 @@ class AiParticipant(Participant):
         context: str,
         visible_to: list[str] | None = None,
         timeout: float = 120.0,
+        marks: list[str] | None = None,
+        max_messages: int = 0,
+        keep_marks: list[str] | None = None,
     ) -> str | None:
         from .pipelines import announce
         return await announce(
             session, self._key, bus_pool,
             context=context, visible_to=visible_to, timeout=timeout,
+            marks=marks, max_messages=max_messages, keep_marks=keep_marks,
         )
 
 
@@ -154,6 +162,12 @@ class HumanParticipant(Participant):
     def is_human(self) -> bool:
         return True
 
+    _input_method = None
+
+    def override_input(self, method) -> None:
+        """替换输入源，用于测试或回放（method: async (context, timeout) -> str）。"""
+        self._input_method = method
+
     async def speak(
         self,
         session: "GroupSession",
@@ -161,7 +175,12 @@ class HumanParticipant(Participant):
         context: str,
         visible_to: list[str] | None = None,
         timeout: float = 120.0,
+        marks: list[str] | None = None,
+        max_messages: int = 0,
+        keep_marks: list[str] | None = None,
     ) -> str | None:
+        if self._input_method:
+            return await self._input_method(context, timeout)
         from .pipelines import wait_for_user_msg
         return await wait_for_user_msg(
             session, bus_pool, sender=self._key, timeout=timeout,

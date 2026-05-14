@@ -98,6 +98,7 @@ def _append_to_history(
     employee: str,
     content: str,
     visible_to: list[str] | None = None,
+    marks: list[str] | None = None,
 ) -> None:
     """将员工发言追加到会话历史。
 
@@ -106,6 +107,7 @@ def _append_to_history(
         employee: 发言员工 key。
         content: 发言内容。
         visible_to: 可见范围。设置后仅指定员工可看到此消息；为空则全员可见。
+        marks: 语义标签，如 "wolf_night"/"system_event"/"death"，用于滑动窗口过滤。
     """
     if employee == "user":
         emoji, name = "👔", "老板"
@@ -123,6 +125,7 @@ def _append_to_history(
         created_at=time.time(),
         role=role,
         visible_to=visible_to or [],
+        marks=marks or [],
     )
     session.history.append(msg)
 
@@ -232,6 +235,9 @@ async def announce(
     visible_to: list[str] | None = None,
     viewer: str = "",
     timeout: float = 60.0,
+    marks: list[str] | None = None,
+    max_messages: int = 0,
+    keep_marks: list[str] | None = None,
 ) -> str | None:
     """单人公告：指定一名员工发言（如主持人宣布规则、结果等）。
 
@@ -243,6 +249,9 @@ async def announce(
         visible_to: 该发言的可见范围，为空则全员可见。
         viewer: 发言者能看到的历史范围（用于私密阶段过滤 history）。
         timeout: 超时时间（秒）。
+        marks: 语义标签，写入历史消息供滑动窗口过滤使用。
+        max_messages: 滑动窗口大小，0=不限制。
+        keep_marks: 即使截断也保留这些标签的消息（如 "system_event"）。
 
     Returns:
         发言内容字符串，失败返回 None。
@@ -252,7 +261,10 @@ async def announce(
         session_id=session.id,
         chat_id=session.chat_id,
         employee=speaker,
-        history_text=format_history(session.history, viewer=viewer or speaker),
+        history_text=format_history(
+            session.history, viewer=viewer or speaker,
+            max_messages=max_messages, keep_marks=keep_marks,
+        ),
         trigger_message_id=session.trigger_message_id,
         order=-1,
         role_context=context,
@@ -263,7 +275,7 @@ async def announce(
     elapsed = time.perf_counter() - t0
     resp = responses.get(speaker)
     if resp and resp.success:
-        _append_to_history(session, speaker, resp.content, visible_to=visible_to)
+        _append_to_history(session, speaker, resp.content, visible_to=visible_to, marks=marks)
         log.info("TRACE announce session=%s speaker=%s elapsed=%.2fs ctx≈%dtok",
                  session.id[:8], speaker, elapsed, len(context) // 4)
         return resp.content
@@ -399,6 +411,9 @@ async def speak_sequential(
     context_fn=None,
     visible_to: list[str] | None = None,
     timeout: float = _SPEAK_TIMEOUT,
+    marks: list[str] | None = None,
+    max_messages: int = 0,
+    keep_marks: list[str] | None = None,
 ) -> list[str]:
     """顺序让所有 Participant 发言（AI 和用户自动区分）。
 
@@ -409,6 +424,9 @@ async def speak_sequential(
         context_fn: 上下文生成函数 (participant) -> str。
         visible_to: 消息可见范围。
         timeout: 单人超时时间。
+        marks: 语义标签，写入历史消息。
+        max_messages: 滑动窗口大小，0=不限制。
+        keep_marks: 即使截断也保留这些标签的消息。
 
     Returns:
         成功发言的 participant key 列表。
@@ -419,7 +437,8 @@ async def speak_sequential(
         t0 = time.perf_counter()
         content = await p.speak(
             session, bus_pool, context=ctx,
-            visible_to=visible_to, timeout=timeout,
+            visible_to=visible_to, timeout=timeout, marks=marks,
+            max_messages=max_messages, keep_marks=keep_marks,
         )
         elapsed = time.perf_counter() - t0
         if content:

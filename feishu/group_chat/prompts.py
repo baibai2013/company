@@ -205,19 +205,33 @@ def format_history(
     history: list[ConversationMessage],
     current_employee: str = "",
     viewer: str = "",
+    max_messages: int = 0,
+    keep_marks: list[str] | None = None,
 ) -> str:
     """Format conversation history for LLM context.
 
     Args:
-        viewer: If set, filter out messages whose visible_to doesn't include this viewer.
-                Messages with empty visible_to are always included (public).
+        viewer: If set, filter out messages not visible to this viewer.
+        max_messages: If > 0, cap total messages (keep_marks messages are never dropped).
+        keep_marks: Messages with any of these marks are preserved even when truncating.
     """
+    # 1. 可见性过滤
+    msgs = [m for m in history if m.is_visible_to(viewer)] if viewer else list(history)
+
+    # 2. 滑动窗口：保留 keep_marks 消息，普通消息截到最近 N 条
+    if max_messages and len(msgs) > max_messages:
+        if keep_marks:
+            important = [m for m in msgs if any(mk in m.marks for mk in keep_marks)]
+            normal = [m for m in msgs if m not in important]
+        else:
+            important, normal = [], msgs
+        keep_count = max(0, max_messages - len(important))
+        normal = normal[-keep_count:] if keep_count else []
+        msgs = sorted(important + normal, key=lambda m: m.created_at)
+
     now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M")
     lines = [f"【群聊记录 · {now}】"]
-    for msg in history:
-        # Visibility filter: skip private messages not meant for this viewer
-        if viewer and msg.visible_to and viewer not in msg.visible_to:
-            continue
+    for msg in msgs:
         emoji, name = EMPLOYEE_CONFIG.get(msg.sender, ("👤", msg.sender))
         label = "用户" if msg.sender == "user" else f"{emoji} {name}（{ROLE_DESCRIPTIONS.get(msg.sender, '')}）"
         lines.append("─────────────────────────────")

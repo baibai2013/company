@@ -16,6 +16,11 @@ class ConversationMessage:
     created_at: float          # unix timestamp
     role: str = "user"         # "user" | "assistant"
     visible_to: list[str] = field(default_factory=list)  # empty = visible to all
+    marks: list[str] = field(default_factory=list)       # semantic tags, e.g. "wolf_night", "system_event"
+
+    def is_visible_to(self, viewer: str) -> bool:
+        """空列表 = 全员可见；否则 viewer 必须在列表里。"""
+        return not self.visible_to or viewer in self.visible_to
 
 
 @dataclass
