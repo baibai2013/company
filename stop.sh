@@ -32,7 +32,7 @@ else
 fi
 
 # ── 按端口补充清理 ────────────────────────────────────────────────────────────
-ALL_PORTS="8000 8180 8089 9000 9001 9002 9003 9004 9005 9006 9007 9008 5173"
+ALL_PORTS="8000 8180 8089 9000 9001 9002 9003 9004 9005 9006 9007 9008 9009 5173"
 for port in $ALL_PORTS; do
   pids=$(lsof -ti:"$port" 2>/dev/null || true)
   if [[ -n "$pids" ]]; then
@@ -40,6 +40,12 @@ for port in $ALL_PORTS; do
     kill $pids 2>/dev/null && ok "停止端口 $port (PID=$pids)"
   fi
 done
+
+# ── 清理 process_manager 的 per-employee PID 目录 ─────────────────────────────
+PIDS_DIR="$COMPANY_DIR/logs/.pids"
+if [[ -d "$PIDS_DIR" ]]; then
+  rm -f "$PIDS_DIR"/*.pid 2>/dev/null || true
+fi
 
 # ── 可选：停止 Docker ─────────────────────────────────────────────────────────
 if [[ "${1:-}" == "--with-docker" ]]; then

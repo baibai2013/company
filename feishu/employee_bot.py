@@ -487,7 +487,8 @@ def _start_group_listener(employee: str, client: lark.Client, app_id: str = "", 
                 llm = make_langchain_llm("claude-haiku-4-5-20251001")
 
                 if summary_mode:
-                    system = f"你是{emoji} {name}，项目经理。请根据讨论内容做简短总结。"
+                    # Use the full role_context (SUMMARY_PROMPT with format rules)
+                    system = role_context if role_context else f"你是{emoji} {name}，请根据讨论内容做简短总结，200字以内。"
                 else:
                     persona = get_persona_prompt(employee)
                     system = (

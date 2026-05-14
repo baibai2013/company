@@ -110,14 +110,18 @@ def status(employee: str) -> dict:
     cfg = _warmed_cfg(employee)
     agent_pid = _read_pid(_pid_file(employee, "agent"))
     bot_pid   = _read_pid(_pid_file(employee, "bot"))
+    listening = _port_listening(cfg.agent_port) if cfg and cfg.agent_port else False
+    # An agent is "running" if either our PID is alive OR the port is occupied
+    # (the latter handles processes started outside ProcessManager — e.g. start.sh).
+    agent_running = _is_alive(agent_pid) or listening
 
     return {
         "employee": employee,
         "agent": {
             "pid": agent_pid,
-            "running": _is_alive(agent_pid),
+            "running": agent_running,
             "port": cfg.agent_port if cfg else None,
-            "listening": _port_listening(cfg.agent_port) if cfg and cfg.agent_port else False,
+            "listening": listening,
         },
         "bot": {
             "pid": bot_pid,
@@ -193,7 +197,7 @@ def stop_role(employee: str, role: str, timeout: float = 5.0) -> dict:
         return {"ok": True, "stopped": False, "reason": "not running"}
 
     try:
-        os.killpg(os.getpgid(pid), signal.SIGTERM)
+        os.kill(pid, signal.SIGTERM)
     except ProcessLookupError:
         pass
 
@@ -203,7 +207,7 @@ def stop_role(employee: str, role: str, timeout: float = 5.0) -> dict:
 
     if _is_alive(pid):
         with contextlib.suppress(ProcessLookupError):
-            os.killpg(os.getpgid(pid), signal.SIGKILL)
+            os.kill(pid, signal.SIGKILL)
         time.sleep(0.2)
 
     with contextlib.suppress(FileNotFoundError):
