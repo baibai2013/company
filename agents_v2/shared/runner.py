@@ -5,6 +5,7 @@ All employees call run_with_events() instead of ainvoke().
 import base64
 import io
 import json
+import time as _time
 
 import redis.asyncio as aioredis
 
@@ -67,6 +68,7 @@ async def run_with_events(
         task_input = text
 
     result_data: dict = {"route": "WORK", "plan": "", "result": "", "cc": []}
+    _t0 = _time.perf_counter()
 
     async with aioredis.from_url(REDIS_URL) as r:
 
@@ -108,6 +110,8 @@ async def run_with_events(
                     if node_out.get("cc"):
                         result_data["cc"] = node_out["cc"]
 
+        _elapsed = _time.perf_counter() - _t0
+        _input_text = text if isinstance(text, str) else str(text)
         await _pub({
             "type": "employee_status",
             "employee": employee,
@@ -115,6 +119,9 @@ async def run_with_events(
             "message": "任务完成",
             "task": text[:80],
             "task_id": task_id,
+            "elapsed_s": round(_elapsed, 2),
+            "tokens_in_approx": len(_input_text) // 4,
+            "tokens_out_approx": len(result_data.get("result", "")) // 4,
         })
 
     return result_data

@@ -247,6 +247,7 @@ async def announce(
     Returns:
         发言内容字符串，失败返回 None。
     """
+    t0 = time.perf_counter()
     req = SpeakRequest(
         session_id=session.id,
         chat_id=session.chat_id,
@@ -259,10 +260,15 @@ async def announce(
     await bus_pool.pub_bus.publish_speak_req(req)
 
     responses = await _wait_for_responses(bus_pool, session.id, [speaker], timeout=timeout)
+    elapsed = time.perf_counter() - t0
     resp = responses.get(speaker)
     if resp and resp.success:
         _append_to_history(session, speaker, resp.content, visible_to=visible_to)
+        log.info("TRACE announce session=%s speaker=%s elapsed=%.2fs ctx≈%dtok",
+                 session.id[:8], speaker, elapsed, len(context) // 4)
         return resp.content
+    log.info("TRACE announce session=%s speaker=%s elapsed=%.2fs TIMEOUT/FAIL",
+             session.id[:8], speaker, elapsed)
     return None
 
 
@@ -410,10 +416,17 @@ async def speak_sequential(
     completed = []
     for p in participants:
         ctx = context_fn(p) if context_fn else ""
+        t0 = time.perf_counter()
         content = await p.speak(
             session, bus_pool, context=ctx,
             visible_to=visible_to, timeout=timeout,
         )
+        elapsed = time.perf_counter() - t0
         if content:
+            log.info("TRACE speak session=%s participant=%s elapsed=%.2fs",
+                     session.id[:8], p.key, elapsed)
             completed.append(p.key)
+        else:
+            log.info("TRACE speak session=%s participant=%s elapsed=%.2fs TIMEOUT/SKIP",
+                     session.id[:8], p.key, elapsed)
     return completed
