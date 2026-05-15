@@ -251,7 +251,7 @@ fi
 # ── 8. GroupOrchestrator ──────────────────────────────────────────────────────
 echo ""
 info "启动 GroupOrchestrator（群聊调度器）..."
-nohup .venv/bin/python -m feishu.group_chat.orchestrator > "$LOG_DIR/orchestrator.log" 2>&1 &
+nohup .venv/bin/python -m group_chat.orchestrator > "$LOG_DIR/orchestrator.log" 2>&1 &
 echo "orchestrator $!" >> "$PID_FILE"
 ok "GroupOrchestrator (logs/orchestrator.log)"
 

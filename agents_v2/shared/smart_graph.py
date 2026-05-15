@@ -156,7 +156,7 @@ def _chat_node(state: SmartState, employee_key: str) -> dict:
 
 def _plan_node(state: SmartState, employee_key: str) -> dict:
     query = _text_only(state["task_input"])
-    llm = _llm_for(employee_key, "plan", default_model="claude-opus-4-7")
+    llm = _llm_for(employee_key, "plan", default_model="claude-opus-4-6")
     resp = llm.invoke([
         SystemMessage(_system_prompt_for(employee_key, _DEFAULT_PLAN_SUFFIX, query=query)),
         _human_msg(state["task_input"]),
@@ -166,7 +166,7 @@ def _plan_node(state: SmartState, employee_key: str) -> dict:
 
 def _execute_node(state: SmartState, employee_key: str) -> dict:
     query = _text_only(state["task_input"])
-    llm = _llm_for(employee_key, "execute", default_model="claude-opus-4-7")
+    llm = _llm_for(employee_key, "execute", default_model="claude-opus-4-6")
     resp = llm.invoke([
         SystemMessage(_system_prompt_for(employee_key, query=query)),
         _human_msg(state["task_input"], prefix=f"执行方案：{state['plan']}\n\n原始需求（如有图请一并分析）：\n"),
@@ -271,12 +271,12 @@ def _build_with_static_prompt(system_prompt: str, checkpointer, cc_prompt: str =
         return {"execution_result": resp.content}
 
     def plan(state):
-        llm = make_langchain_llm("claude-opus-4-7")
+        llm = make_langchain_llm("claude-opus-4-6")
         resp = llm.invoke([SystemMessage(system_prompt + _DEFAULT_PLAN_SUFFIX), _human_msg(state["task_input"])])
         return {"plan": resp.content}
 
     def execute(state):
-        llm = make_langchain_llm("claude-opus-4-7")
+        llm = make_langchain_llm("claude-opus-4-6")
         resp = llm.invoke([
             SystemMessage(system_prompt),
             _human_msg(state["task_input"], prefix=f"执行方案：{state['plan']}\n\n原始需求（如有图请一并分析）：\n"),

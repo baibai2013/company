@@ -53,13 +53,14 @@ async def test_cad_design_task_full_lifecycle(client: AsyncClient):
     main_id = main_task["id"]
 
     # ── Step 2: 群聊广播任务启动 ─────────────────────────────────────────────
-    # CEO broadcasts to group chat: new urgent task assigned
-    r = await client.post("/api/chat/group", json={
+    # Group chat is now WebSocket-only; write message directly via DB helper
+    # (POST /api/chat/group 已废弃，改由 WS 写入)
+    r = await client.post("/api/chat/direct/kanban_group", json={
         "content": f"【P0 紧急】前腿 CAD 设计任务已创建 (id={main_id[:8]}…)，机械工程师请接单",
         "sender":  "CEO",
     })
     assert r.status_code == 200
-    assert r.json()["channel"] == "group"
+    assert r.json()["channel"] == "kanban_group"
 
     # ── Step 3: 分配执行者 ────────────────────────────────────────────────────
     # Assign mechanical engineer as executor
@@ -138,8 +139,8 @@ async def test_cad_design_task_full_lifecycle(client: AsyncClient):
         assert d.json()["status"] == "done"
 
     # ── Step 8: 机械工程师通知完成 ───────────────────────────────────────────
-    # Mechanical engineer notifies group: work done, awaiting verification
-    r = await client.post("/api/chat/group", json={
+    # 群聊改为 WS；通过 direct channel 写入 kanban_group 模拟
+    r = await client.post("/api/chat/direct/kanban_group", json={
         "content": "前腿 CAD 完成！关节建模 + 受力分析均通过，STEP 文件已提交，请测试验收",
         "sender":  "mechanical",
     })
@@ -170,13 +171,13 @@ async def test_cad_design_task_full_lifecycle(client: AsyncClient):
     assert sub2["id"] not in pending_ids
 
     # ── Step 11: 沟通记录完整性检查 ──────────────────────────────────────────
-    # Communication logs: group history has at least 2 messages and is ordered
-    group_hist = await client.get("/api/chat/group/history")
+    # Communication logs: kanban_group channel history has at least 2 messages
+    # (群聊已改为 WebSocket，历史通过 direct channel "kanban_group" 模拟)
+    group_hist = await client.get("/api/chat/direct/kanban_group/history")
     group_msgs = group_hist.json()
     assert len(group_msgs) >= 2
 
     # 群聊时间有序（升序）
-    # Group messages must be in ascending time order
     times = [m["created_at"] for m in group_msgs]
     assert times == sorted(times)
 
