@@ -38,12 +38,13 @@ from .pipelines import (
     fanout as pipe_fanout,
     _append_to_history,
     _wait_for_responses,
+    add_participant,
 )
 from . import prompts as _p  # 模块级引用，支持 watchdog 热重载后自动使用新值
 from .scenarios import SCENARIO_REGISTRY
 from .session import SessionStore
 
-log = logging.getLogger("feishu.group_chat.orchestrator")
+log = logging.getLogger("group_chat.orchestrator")
 
 
 
@@ -129,7 +130,7 @@ async def _receive_node(
         sender="user",
         sender_name="用户",
         content=event.text or "[图片]",
-        feishu_message_id=event.message_id,
+        platform_message_id=event.message_id,
         created_at=time.time(),
         role="user",
     )
@@ -238,10 +239,10 @@ async def _decide_node(
                     if scenario_cls and session.host and not session.game_state:
                         # 游戏场景自动加入 CEO（真实用户）
                         if "user" not in session.participants:
-                            session.participants.append("user")
+                            await add_participant(session, session_store, "user")
                             session.pending.append("user")
                             decision.participants.append("user")
-                        scenario = scenario_cls(session)
+                        scenario = scenario_cls(session, session_store=session_store)
                         session.game_state = scenario.initialize(session.activity_rules)
                         log.info("decide_node: scenario=%s state=%s (user joined)",
                                  session.template, session.game_state)
@@ -280,7 +281,7 @@ async def _dispatch_node(
     scenario_cls = SCENARIO_REGISTRY.get(session.template)
     if scenario_cls and session.game_state:
         # Delegate entirely to the scenario's run() method
-        scenario = scenario_cls(session)
+        scenario = scenario_cls(session, session_store=session_store)
         await scenario.run(bus_pool)
         completed = list(decision.participants)
     else:
@@ -421,8 +422,8 @@ async def run_orchestrator():
     # SIGUSR2：eventbus 重连（scripts/reload.py eventbus 触发）
     import signal as _signal
     import importlib as _importlib
-    from feishu.group_chat.scenarios import reload_all as _reload_scenarios
-    from feishu.group_chat import pipelines as _pipelines_mod
+    from group_chat.scenarios import reload_all as _reload_scenarios
+    from group_chat import pipelines as _pipelines_mod
 
     _reconnect_flag = False
 
@@ -512,7 +513,7 @@ async def run_orchestrator():
                             log.info("reconnecting eventbus...")
                             await bus_pool.disconnect()
                             _importlib.reload(
-                                _importlib.import_module("feishu.group_chat.event_bus")
+                                _importlib.import_module("group_chat.event_bus")
                             )
                             await bus_pool.connect()
                             log.info("eventbus reconnected ✅")

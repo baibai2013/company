@@ -7,8 +7,8 @@ hot_reload.py 守护进程发送 SIGUSR1 时，自动 reload 指定模块。
 用法（在 main.py 或进程入口加一行）：
     from agents_v2.shared.hot_reload_receiver import setup
     setup("agents_v2.tech_lead")        # reload agents_v2/tech_lead/prompts.py
-    setup("feishu.group_chat.prompts")  # reload 整个 prompts 模块
-    setup(["agents_v2.tech_lead", "feishu.group_chat.prompts"])  # 多个
+    setup("group_chat.prompts")  # reload 整个 prompts 模块
+    setup(["agents_v2.tech_lead", "group_chat.prompts"])  # 多个
 """
 from __future__ import annotations
 

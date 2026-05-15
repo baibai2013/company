@@ -10,6 +10,7 @@ class Settings(BaseSettings):
     POSTGRES_PORT: int = 5432
     REDIS_URL: str = "redis://localhost:6379/0"
     OPENAI_API_KEY: str = ""   # 用于 text-embedding-3-small；留空则跳过语义检索
+    OPENAI_BASE_URL: str = ""  # 代理地址，如 https://your-proxy.com/v1；留空走官方
 
     model_config = {
         "env_file": str(Path(__file__).parent.parent.parent / "infra" / ".env"),

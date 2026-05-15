@@ -12,7 +12,7 @@ class ConversationMessage:
     sender: str                # employee key or "user"
     sender_name: str           # display name
     content: str
-    feishu_message_id: str     # feishu message_id for thread replies
+    platform_message_id: str     # platform message_id for thread replies
     created_at: float          # unix timestamp
     role: str = "user"         # "user" | "assistant"
     visible_to: list[str] = field(default_factory=list)  # empty = visible to all
@@ -34,7 +34,7 @@ class SessionRole:
 
 @dataclass
 class GroupSession:
-    id: str = ""               # = trigger message feishu message_id
+    id: str = ""               # = trigger message platform message_id
     chat_id: str = ""
     mode: str = "single"       # "single" | "sequential" | "parallel"
     status: str = "active"     # "active" | "speaking" | "done"

@@ -19,7 +19,7 @@ from backend.core.db import AsyncSessionLocal
 from backend.models.memory import EmployeeMemory
 
 if TYPE_CHECKING:
-    from feishu.group_chat.models import GroupSession
+    from group_chat.models import GroupSession
 
 log = logging.getLogger(__name__)
 
@@ -81,7 +81,10 @@ async def _embed(text_: str) -> list[float] | None:
         if not settings.OPENAI_API_KEY:
             return None
         from openai import AsyncOpenAI
-        client = AsyncOpenAI(api_key=settings.OPENAI_API_KEY)
+        client = AsyncOpenAI(
+            api_key=settings.OPENAI_API_KEY,
+            base_url=settings.OPENAI_BASE_URL or None,
+        )
         resp = await client.embeddings.create(
             model="text-embedding-3-small",
             input=text_,

@@ -81,19 +81,7 @@ async def _call_agent_and_save(
 
 
 # ── group chat ────────────────────────────────────────────────────────────────
-
-@router.post("/group", response_model=MessageRead)
-async def post_group(body: MessageCreate, db: AsyncSession = Depends(get_db)):
-    msg = ChatMessage(channel="group", role="user", sender=body.sender, content=body.content)
-    db.add(msg)
-    await db.commit()
-    await db.refresh(msg)
-    # project_manager monitors the group channel and replies on behalf of the team
-    asyncio.create_task(
-        _call_agent_and_save("project_manager", body.content, channel="group")
-    )
-    return msg
-
+# POST /group 已迁移至 WebSocket /api/ws/chat/{channel_id}
 
 @router.get("/group/history", response_model=list[MessageRead])
 async def group_history(db: AsyncSession = Depends(get_db)):

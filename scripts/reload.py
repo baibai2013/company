@@ -201,7 +201,7 @@ def reload_scenario(dry_run: bool = False):
     for f in SCENARIOS_DIR.glob("*.py"):
         if f.stem in ("__init__", "base"):
             continue
-        mod_name = f"feishu.group_chat.scenarios.{f.stem}"
+        mod_name = f"group_chat.scenarios.{f.stem}"
         found.append(mod_name)
 
     log.info("found scenario files: %s", [f.stem for f in SCENARIOS_DIR.glob("*.py")
@@ -230,7 +230,7 @@ def reload_scenario(dry_run: bool = False):
     # 打印当前注册表（仅本进程可见，orchestrator 侧由 SIGUSR1 触发）
     try:
         sys.path.insert(0, str(ROOT))
-        from feishu.group_chat.scenarios.base import SCENARIO_REGISTRY
+        from group_chat.scenarios.base import SCENARIO_REGISTRY
         log.info("SCENARIO_REGISTRY now: %s", list(SCENARIO_REGISTRY.keys()))
     except Exception:
         pass

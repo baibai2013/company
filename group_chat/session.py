@@ -15,7 +15,7 @@ REDIS_URL = "redis://localhost:6379/0"
 SESSION_PREFIX = "group_session:"
 DEFAULT_TTL = 1800  # 30 min
 
-log = logging.getLogger("feishu.group_chat.session")
+log = logging.getLogger("group_chat.session")
 
 
 class SessionStore:
@@ -48,7 +48,7 @@ class SessionStore:
                     "sender": m.sender,
                     "sender_name": m.sender_name,
                     "content": m.content,
-                    "feishu_message_id": m.feishu_message_id,
+                    "platform_message_id": m.platform_message_id,
                     "created_at": m.created_at,
                     "role": m.role,
                     "visible_to": m.visible_to,
@@ -103,7 +103,7 @@ class SessionStore:
                     sender=m["sender"],
                     sender_name=m["sender_name"],
                     content=m["content"],
-                    feishu_message_id=m["feishu_message_id"],
+                    platform_message_id=m["platform_message_id"],
                     created_at=m["created_at"],
                     role=m.get("role", "user"),
                     visible_to=m.get("visible_to", []),

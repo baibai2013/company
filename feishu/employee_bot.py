@@ -31,7 +31,7 @@ import lark_oapi as lark
 from lark_oapi.api.im.v1.model.p2_im_message_receive_v1 import P2ImMessageReceiveV1
 
 from feishu.commands.dispatch import handle_dispatch
-from feishu.group_chat.prompts import (
+from group_chat.prompts import (
     GROUP_SPEAK_PREFIX,
     build_role_context,
     build_simple_role_context,
@@ -43,8 +43,8 @@ from feishu.sender import add_reaction, download_image, fetch_recent_image, fetc
 logging.basicConfig(level=logging.INFO, format="%(asctime)s  %(levelname)s  %(message)s")
 log = logging.getLogger("feishu.employee_bot")
 
-# Employee config sourced from DB registry (see feishu/group_chat/models.py).
-from feishu.group_chat.models import EMPLOYEE_CONFIG, ROLE_DESCRIPTIONS as _ROLE_DESCRIPTIONS  # noqa: F401
+# Employee config sourced from DB registry (see group_chat/models.py).
+from group_chat.models import EMPLOYEE_CONFIG, ROLE_DESCRIPTIONS as _ROLE_DESCRIPTIONS  # noqa: F401
 
 
 _processed: set[str] = set()

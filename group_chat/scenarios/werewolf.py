@@ -18,7 +18,7 @@ if TYPE_CHECKING:
     from ..models import GroupSession
 
 from ..participant import Participant
-from ..pipelines import announce, speak_sequential, VisibleScope
+from ..pipelines import announce, speak_sequential, VisibleScope, remove_participant
 from .base import Scenario, register
 
 log = logging.getLogger(__name__)
@@ -268,6 +268,7 @@ class WerewolfScenario(Scenario):
         for dead in dead_tonight:
             if dead in state["alive"]:
                 state["alive"].remove(dead)
+                await remove_participant(self.session, self.session_store, dead)
 
         # 猎人被杀时开枪
         hunter = state["hunter"]
@@ -345,6 +346,7 @@ class WerewolfScenario(Scenario):
 
         if winner:
             state["alive"].remove(winner)
+            await remove_participant(self.session, self.session_store, winner)
             role_name = ROLE_NAMES[state["roles"][winner]]
             winner_p = self._p(winner)
             await announce(session, host, bus_pool, context=(
@@ -387,6 +389,7 @@ class WerewolfScenario(Scenario):
             target = self._extract_action(resp, "开枪")
             if target and target in alive:
                 state["alive"].remove(target)
+                await remove_participant(self.session, self.session_store, target)
                 await announce(self.session, host, bus_pool, context=(
                     f"{hunter_p.display_name} 开枪带走了 {self._p(target).display_name}！10字以内。"
                 ))

@@ -5,9 +5,9 @@
 进程侧通过 agents_v2.shared.hot_reload_receiver 接收信号并 reload。
 
 监听规则：
-  feishu/group_chat/prompts.py      → orchestrator
-  feishu/group_chat/pipelines.py    → orchestrator
-  feishu/group_chat/scenarios/*.py  → orchestrator
+  group_chat/prompts.py      → orchestrator
+  group_chat/pipelines.py    → orchestrator
+  group_chat/scenarios/*.py  → orchestrator
   agents_v2/<name>/prompts.py       → <name> 进程
 
 用法：
@@ -118,7 +118,7 @@ class _HotReloadHandler(FileSystemEventHandler):
         name = str(rel)
 
         # feishu group_chat 层
-        if "feishu/group_chat" in name and name.endswith(".py"):
+        if "group_chat" in name and name.endswith(".py"):
             if "scenarios" in name or "pipelines" in name or "prompts" in name:
                 _send_usr1("orchestrator")
                 return

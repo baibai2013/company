@@ -146,7 +146,7 @@ def _append_to_history(
         sender=employee,
         sender_name=f"{emoji} {name}",
         content=content,
-        feishu_message_id="",
+        platform_message_id="",
         created_at=time.time(),
         role=role,
         visible_to=visible_to or [],
@@ -528,3 +528,37 @@ async def conditional(
         await if_fn()
     elif else_fn is not None:
         await else_fn()
+
+
+async def add_participant(
+    session: "GroupSession",
+    session_store,
+    participant_key: str,
+    announcement: str = "",
+) -> bool:
+    """动态加入参与者。已存在则幂等返回 False，否则加入、写历史、持久化返回 True。"""
+    if participant_key in session.participants:
+        return False
+    session.participants.append(participant_key)
+    if announcement:
+        _append_to_history(session, "system", announcement, marks=["system_event"])
+    if session_store is not None:
+        await session_store.save(session)
+    return True
+
+
+async def remove_participant(
+    session: "GroupSession",
+    session_store,
+    participant_key: str,
+    announcement: str = "",
+) -> bool:
+    """动态移除参与者。不存在则幂等返回 False，否则移除、写历史、持久化返回 True。"""
+    if participant_key not in session.participants:
+        return False
+    session.participants.remove(participant_key)
+    if announcement:
+        _append_to_history(session, "system", announcement, marks=["system_event"])
+    if session_store is not None:
+        await session_store.save(session)
+    return True

@@ -10,6 +10,8 @@ from backend.api.routes.events import router as events_router
 from backend.api.routes.llm_stats import router as llm_stats_router
 from backend.api.routes.system_config import router as system_config_router
 from backend.api.routes.tasks import router as tasks_router
+from backend.chat.kanban_adapter import kanban_adapter
+from backend.chat.ws import router as ws_router
 from backend.services import registry
 
 
@@ -17,7 +19,17 @@ from backend.services import registry
 async def lifespan(app: FastAPI):
     await registry.warmup()
     registry.start_listener()
+
+    # 启动看板聊天适配器（连接 Redis 事件总线）
+    from group_chat.event_bus import GroupEventBusPool
+    bus_pool = GroupEventBusPool()
+    await bus_pool.connect()
+    await kanban_adapter.start(bus_pool)
+
     yield
+
+    await kanban_adapter.stop()
+    await bus_pool.disconnect()
     await registry.stop_listener()
 
 
@@ -33,6 +45,7 @@ app.add_middleware(
 app.include_router(tasks_router)
 app.include_router(employees_router)
 app.include_router(chat_router)
+app.include_router(ws_router)
 app.include_router(events_router)
 app.include_router(system_config_router)
 app.include_router(audit_router)

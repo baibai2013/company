@@ -19,7 +19,7 @@ from .models import MessageEvent, SpeakRequest, SpeakResponse
 
 REDIS_URL = "redis://localhost:6379/0"
 
-log = logging.getLogger("feishu.group_chat.event_bus")
+log = logging.getLogger("group_chat.event_bus")
 
 
 class GroupEventBus:
@@ -184,6 +184,36 @@ class GroupEventBus:
                 await callback(req)
             except Exception as exc:
                 log.warning("handle speak_req failed: %s", exc)
+
+    async def subscribe_speak_req_pattern(
+        self, channel_pattern: str, callback: Callable[[SpeakRequest], Awaitable[None]],
+    ) -> None:
+        """用 Redis PSUBSCRIBE 订阅 speak_req:{pattern} 频道，供平台适配器使用。
+
+        例：channel_pattern="kanban_*" 会订阅所有 speak_req:*:kanban_* 频道。
+        """
+        pattern = f"speak_req:*:{channel_pattern}"
+        await self._sub.psubscribe(pattern)
+        log.info("psubscribed to %s", pattern)
+        async for msg in self._sub.listen():
+            if msg["type"] != "pmessage":
+                continue
+            try:
+                data = json.loads(msg["data"])
+                req = SpeakRequest(
+                    session_id=data["session_id"],
+                    chat_id=data["chat_id"],
+                    employee=data["employee"],
+                    history_text=data["history_text"],
+                    trigger_message_id=data["trigger_message_id"],
+                    image_base64=data.get("image_base64", ""),
+                    order=data.get("order", 0),
+                    summary_mode=data.get("summary_mode", False),
+                    role_context=data.get("role_context", ""),
+                )
+                await callback(req)
+            except Exception as exc:
+                log.warning("handle speak_req (pattern) failed: %s", exc)
 
     async def wait_for_speak_resp(
         self, session_id: str, timeout: float = 90.0,

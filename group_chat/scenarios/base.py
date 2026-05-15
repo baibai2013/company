@@ -41,8 +41,9 @@ class Scenario:
     会将控制权委托给 scenario.run()。
     """
 
-    def __init__(self, session: "GroupSession"):
+    def __init__(self, session: "GroupSession", session_store=None):
         self.session = session
+        self.session_store = session_store
 
     def initialize(self, activity_rules: str) -> dict:
         """初始化游戏状态（在 decide_node 中调用）。

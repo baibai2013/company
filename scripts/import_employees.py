@@ -2,7 +2,7 @@
 One-shot import: load existing 10 employees + global config into DB.
 
 Reads from:
-  - feishu/group_chat/models.py    (EMPLOYEE_CONFIG, ROLE_DESCRIPTIONS)
+  - group_chat/models.py    (EMPLOYEE_CONFIG, ROLE_DESCRIPTIONS)
   - feishu/personas.py             (_PERSONAS)
   - agents_v2/<key>/prompts.py     (SYSTEM_PROMPT)
   - agents_v2/sysadmin/main.py     (inline SYSTEM_PROMPT)
@@ -27,7 +27,7 @@ from dotenv import load_dotenv
 
 load_dotenv(ROOT / "infra" / ".env")
 
-from feishu.group_chat.models import EMPLOYEE_CONFIG, ROLE_DESCRIPTIONS  # noqa: E402
+from group_chat.models import EMPLOYEE_CONFIG, ROLE_DESCRIPTIONS  # noqa: E402
 from feishu.personas import _PERSONAS  # noqa: E402
 
 from backend.repos import config_repo, employee_repo  # noqa: E402
@@ -86,7 +86,7 @@ def _read_global_prompts() -> dict:
     show up automatically. CEO can still override via the panel later.
     """
     from agents_v2.shared.smart_graph import _CHAT_SUFFIX, _ROUTE_PROMPT
-    from feishu.group_chat.prompts import GROUP_SPEAK_PREFIX
+    from group_chat.prompts import GROUP_SPEAK_PREFIX
     return {
         "route_prompt":       _ROUTE_PROMPT,
         "chat_suffix":        _CHAT_SUFFIX,

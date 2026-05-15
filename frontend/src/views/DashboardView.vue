@@ -155,6 +155,7 @@ const selectedConv = ref<string | null>(null)
 const groupMessages = ref<ChatMessage[]>([])
 const directMessages = ref<Record<string, ChatMessage[]>>({})
 let pollTimer: ReturnType<typeof setInterval> | null = null
+let groupWs: WebSocket | null = null
 
 const form = ref({
   title: '',
@@ -238,6 +239,41 @@ async function fetchCurrentConv(key: string) {
   }
 }
 
+// ── group chat: WebSocket（直连实时推送） ──────────────────────────────────
+
+function connectGroupWs() {
+  if (groupWs) return
+  const proto = location.protocol === 'https:' ? 'wss' : 'ws'
+  const url = `${proto}://${location.host}/api/ws/chat/kanban_group`
+  groupWs = new WebSocket(url)
+
+  groupWs.onmessage = (e) => {
+    try {
+      const msg = JSON.parse(e.data)
+      if (msg.type === 'message') {
+        groupMessages.value = [...groupMessages.value, msg as ChatMessage]
+      }
+    } catch { /* ignore parse errors */ }
+  }
+
+  groupWs.onclose = () => {
+    groupWs = null
+    // 断线后 3 秒重连
+    if (selectedConv.value === 'group') {
+      setTimeout(connectGroupWs, 3000)
+    }
+  }
+}
+
+function disconnectGroupWs() {
+  if (groupWs) {
+    groupWs.close()
+    groupWs = null
+  }
+}
+
+// ── direct chat: 保留轮询（单员工私聊，消息量小） ───────────────────────────
+
 function stopPolling() {
   if (pollTimer !== null) {
     clearInterval(pollTimer)
@@ -250,9 +286,17 @@ function startPolling(key: string) {
   pollTimer = setInterval(() => fetchCurrentConv(key), 4000)
 }
 
-watch(selectedConv, (key) => {
-  if (key) startPolling(key)
-  else stopPolling()
+watch(selectedConv, (key, prev) => {
+  if (prev === 'group') disconnectGroupWs()
+  if (key === 'group') {
+    // group 用 WebSocket
+    connectGroupWs()
+  } else if (key) {
+    // direct 用轮询
+    startPolling(key)
+  } else {
+    stopPolling()
+  }
 })
 
 async function onSelectConv(key: string) {
@@ -297,8 +341,19 @@ async function onSendMsg(content: string) {
   chatSending.value = true
   try {
     if (selectedConv.value === 'group') {
-      const msg = await chatApi.postGroup('CEO', content)
-      groupMessages.value = [...groupMessages.value, msg]
+      // group 走 WebSocket
+      if (groupWs?.readyState === WebSocket.OPEN) {
+        groupWs.send(JSON.stringify({ type: 'message', sender: 'CEO', content }))
+        // 乐观追加用户消息（服务端不会回推用户自己的消息）
+        groupMessages.value = [...groupMessages.value, {
+          id: Date.now().toString(),
+          channel: 'kanban_group',
+          role: 'user',
+          sender: 'CEO',
+          content,
+          created_at: new Date().toISOString(),
+        } as ChatMessage]
+      }
     } else if (selectedConv.value) {
       const msg = await chatApi.postDirect(selectedConv.value, 'CEO', content)
       directMessages.value[selectedConv.value] = [
@@ -317,6 +372,7 @@ onMounted(async () => {
 onUnmounted(() => {
   taskStore.stopSSE()
   stopPolling()
+  disconnectGroupWs()
 })
 </script>
 
