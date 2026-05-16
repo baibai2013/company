@@ -3,8 +3,6 @@ CC — 飞书机器人对接 Claude Code CLI 桥接服务入口。
 
 Usage:
   python -m feishu.cc_bridge.main
-
-# 进度卡路径去重验证：本次提交用于测试 _file_change_block(with_path=False) 在进度卡中只显示一次文件路径。
 """
 import asyncio
 import base64
@@ -59,9 +57,12 @@ def _release_singleton() -> None:
 # ── 配置 ─────────────────────────────────────────────────────────────────────
 APP_ID = os.getenv("CC_BRIDGE_APP_ID", "cli_aa89f97f83f89be6")
 APP_SECRET = os.getenv("CC_BRIDGE_APP_SECRET", "COozkvL5KVAtlwNGStqDig6uykU2kLgj")
+# 群聊 @ 检测需要机器人自己的 open_id；可在 .env 里配 CC_BRIDGE_BOT_OPEN_ID 跳过 API 拉取
+BOT_OPEN_ID: str = os.getenv("CC_BRIDGE_BOT_OPEN_ID", "")
 
 # ── 待处理图片（等用户补充问题）────────────────────────────────────────────────
-_pending_images: dict[str, bytes] = {}  # chat_id → image bytes
+# key 用 (chat_id, sender_id)：群里每个人独立缓存，避免互相串图
+_pending_images: dict[tuple[str, str], bytes] = {}
 
 # ── 去重 ─────────────────────────────────────────────────────────────────────
 _processed: set[str] = set()
@@ -223,13 +224,46 @@ def on_message(data: P2ImMessageReceiveV1) -> None:
         log.exception("on_message 未捕获异常")
 
 
+def _is_at_bot(msg) -> bool:
+    """群消息：判断是否 @ 了本机器人。
+
+    需要 CC_BRIDGE_BOT_OPEN_ID 环境变量。未配置时退化为"消息含任意 mention 即视为 @ 机器人"，
+    此举会导致 A @ B 也触发，仅作启动调试用，正式运行务必填上 open_id。
+    """
+    mentions = getattr(msg, "mentions", None) or []
+    if not mentions:
+        return False
+    if not BOT_OPEN_ID:
+        return True  # 退化模式
+    for m in mentions:
+        mid = getattr(m, "id", None)
+        if mid and getattr(mid, "open_id", "") == BOT_OPEN_ID:
+            return True
+    return False
+
+
+def _strip_mentions(text: str, msg) -> str:
+    """把 text 里的 @_user_N placeholder 全部去掉。"""
+    mentions = getattr(msg, "mentions", None) or []
+    for m in mentions:
+        key = getattr(m, "key", "")
+        if key:
+            text = text.replace(key, "")
+    return text.strip()
+
+
 def _on_message_inner(data: P2ImMessageReceiveV1) -> None:
     msg = data.event.message if data.event else None
     if not msg:
         return
 
-    # 只处理 P2P 单聊
-    if msg.chat_type != "p2p":
+    # P2P 私聊全收；群聊只收 @ 机器人的消息
+    if msg.chat_type == "p2p":
+        pass
+    elif msg.chat_type == "group":
+        if not _is_at_bot(msg):
+            return
+    else:
         return
 
     message_id = msg.message_id
@@ -243,16 +277,22 @@ def _on_message_inner(data: P2ImMessageReceiveV1) -> None:
     chat_id = msg.chat_id
     msg_type = msg.message_type
 
-    log.info("📨[poll]收到消息: type=%s chat_id=%s sender=%s", msg_type, chat_id, sender_id)
+    log.info(
+        "📨 收到消息: type=%s chat_type=%s chat_id=%s sender=%s",
+        msg_type, msg.chat_type, chat_id, sender_id,
+    )
 
     # 提取文本
     text = ""
     image_bytes = None
 
+    pending_key = (chat_id, sender_id)
+
     if msg_type == "text":
         try:
             content = json.loads(msg.content)
             text = content.get("text", "").strip()
+            text = _strip_mentions(text, msg)
         except (json.JSONDecodeError, TypeError):
             return
 
@@ -269,7 +309,7 @@ def _on_message_inner(data: P2ImMessageReceiveV1) -> None:
             log.warning("图片处理失败: %s", exc)
             return
         if image_bytes:
-            _pending_images[chat_id] = image_bytes
+            _pending_images[pending_key] = image_bytes
             reply_rich_card(_client, message_id, "📷 已收到图片", "请问您有什么问题？", "blue")
             return
 
@@ -300,10 +340,10 @@ def _on_message_inner(data: P2ImMessageReceiveV1) -> None:
                             )
                         if q:
                             quote_parts.append(str(q).strip())
-            text = "".join(texts).strip()
+            text = _strip_mentions("".join(texts).strip(), msg)
             if not text and image_bytes:
                 # post 有图无文字：同纯图片处理，等用户补充问题
-                _pending_images[chat_id] = image_bytes
+                _pending_images[pending_key] = image_bytes
                 reply_rich_card(_client, message_id, "📷 已收到图片", "请问您有什么问题？", "blue")
                 return
             if quote_parts:
@@ -326,14 +366,20 @@ def _on_message_inner(data: P2ImMessageReceiveV1) -> None:
         return
 
     # 有文字时，检查是否有待处理的图片并附上
-    if text and not image_bytes and chat_id in _pending_images:
-        image_bytes = _pending_images.pop(chat_id)
-        log.info("附加待处理图片: chat_id=%s", chat_id)
+    if text and not image_bytes and pending_key in _pending_images:
+        image_bytes = _pending_images.pop(pending_key)
+        log.info("附加待处理图片: %s", pending_key)
 
     # 提交到异步事件循环执行
     loop = _get_loop()
     asyncio.run_coroutine_threadsafe(
-        handle_message(_client, chat_id, text, image_bytes=image_bytes, sender_id=sender_id, message_id=message_id),
+        handle_message(
+            _client, chat_id, text,
+            image_bytes=image_bytes,
+            sender_id=sender_id,
+            message_id=message_id,
+            parent_id=parent_id,
+        ),
         loop,
     )
 

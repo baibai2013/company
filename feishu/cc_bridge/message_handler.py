@@ -1,7 +1,8 @@
 """
 飞书消息处理 + 回传模块。
 
-一张进度卡 patch 工具调用过程，完成后发新结果卡（含 diff）触发通知。
+每条机器人卡片 reply 到原消息下，并登记到 ThreadRouter 用于后续 parent_id 引用回查。
+进度卡持续 patch 工具调用过程，完成后另发结果卡（含 diff）触发推送。
 """
 import asyncio
 import difflib
@@ -23,21 +24,17 @@ from lark_oapi.api.im.v1 import (
 
 from feishu.sender import build_card_json, send_rich_card
 from feishu.cc_bridge.claude_runner import (
-    ClaudeRunner,
     compress_image,
     save_temp_image,
 )
+from feishu.cc_bridge.thread_router import Thread, get_router
 
 log = logging.getLogger("cc_bridge.handler")
-
-_runner = ClaudeRunner()
-_run_lock = asyncio.Lock()
 
 ALLOWED_USER_IDS: set[str] = set()
 
 MAX_CARD_LEN = 3500
 MAX_DIFF_LINES = 50
-MAX_STEPS = 30
 
 # 思考中 spinner 动画帧（点点累加）
 _SPINNER_FRAMES = [".", "..", "..."]
@@ -89,7 +86,10 @@ def _build_card_json(title: str, content: str, color: str) -> str:
     return build_card_json(title, content, color)
 
 
-def _create_card(client: lark.Client, chat_id: str, title: str, content: str, color: str = "grey") -> str | None:
+def _create_card(
+    client: lark.Client, chat_id: str, title: str, content: str, color: str = "grey",
+    thread_key: str | None = None,
+) -> str | None:
     body = (
         CreateMessageRequestBody.builder()
         .receive_id(chat_id).msg_type("interactive")
@@ -99,13 +99,19 @@ def _create_card(client: lark.Client, chat_id: str, title: str, content: str, co
     req = CreateMessageRequest.builder().receive_id_type("chat_id").request_body(body).build()
     resp = client.im.v1.message.create(req)
     if resp.success() and resp.data and resp.data.message_id:
-        _remember_card(resp.data.message_id, title, content)
-        return resp.data.message_id
+        mid = resp.data.message_id
+        _remember_card(mid, title, content)
+        if thread_key:
+            get_router().tag_message(mid, thread_key)
+        return mid
     log.error("create_card failed: %s %s", resp.code, resp.msg)
     return None
 
 
-def _reply_card(client: lark.Client, parent_id: str, title: str, content: str, color: str = "grey") -> str | None:
+def _reply_card(
+    client: lark.Client, parent_id: str, title: str, content: str, color: str = "grey",
+    thread_key: str | None = None,
+) -> str | None:
     """以卡片形式回复用户消息，返回新卡片的 message_id 供后续 patch。"""
     body = (
         ReplyMessageRequestBody.builder()
@@ -116,8 +122,11 @@ def _reply_card(client: lark.Client, parent_id: str, title: str, content: str, c
     req = ReplyMessageRequest.builder().message_id(parent_id).request_body(body).build()
     resp = client.im.v1.message.reply(req)
     if resp.success() and resp.data and resp.data.message_id:
-        _remember_card(resp.data.message_id, title, content)
-        return resp.data.message_id
+        mid = resp.data.message_id
+        _remember_card(mid, title, content)
+        if thread_key:
+            get_router().tag_message(mid, thread_key)
+        return mid
     log.error("reply_card failed: %s %s", resp.code, resp.msg)
     return None
 
@@ -142,31 +151,30 @@ _TOOL_ICONS = {
 }
 
 
-def _short_path(path: str) -> str:
+def _short_path(path: str, cwd: str) -> str:
     """绝对路径若位于当前 cwd 下，转为相对路径；否则原样返回。
 
-    cwd 取 `_runner.cwd`（用户可通过 /cwd 切换），不是进程实际 cwd。
     走出 cwd 范围（relpath 以 `..` 开头）的保留绝对，避免出现一长串 ../。
     """
     if not path or not os.path.isabs(path):
         return path
     try:
-        rel = os.path.relpath(path, _runner.cwd)
+        rel = os.path.relpath(path, cwd)
     except (ValueError, OSError):
         return path
     return path if rel.startswith("..") else rel
 
 
-def _step_line(name: str, input_dict: dict) -> str:
+def _step_line(name: str, input_dict: dict, cwd: str) -> str:
     icon = _TOOL_ICONS.get(name, "🔧")
     if name == "Bash":
         cmd = input_dict.get("command", "").replace("\n", " ").strip()
         short = (cmd[:80] + "…") if len(cmd) > 80 else cmd
         return f"{icon} {short}"
     elif name in ("Edit", "Write", "MultiEdit"):
-        return f"{icon} {_short_path(input_dict.get('file_path', name))}"
+        return f"{icon} {_short_path(input_dict.get('file_path', name), cwd)}"
     elif name == "Read":
-        return f"{icon} {_short_path(input_dict.get('file_path', ''))}"
+        return f"{icon} {_short_path(input_dict.get('file_path', ''), cwd)}"
     elif name in ("Glob", "Grep"):
         return f"{icon} {input_dict.get('pattern', '')}"
     elif name == "Agent":
@@ -198,11 +206,11 @@ def _format_diff(old: str, new: str, fname: str) -> str:
     return "```diff\n" + "".join(diff) + "\n```"
 
 
-def _file_change_block(name: str, input_dict: dict, with_path: bool = True) -> str | None:
+def _file_change_block(name: str, input_dict: dict, cwd: str, with_path: bool = True) -> str | None:
     """生成文件变更展示，仅 Edit/Write/MultiEdit 有内容。
 
     with_path=False：进度卡用，路径已由 _step_line 显示，避免重复。
-    with_path=True：结果卡 file_changes 用，没有 step_line 引导，必须自带路径。
+    with_path=True：结果卡用，没有 step_line 引导，必须自带路径。
     """
     if name == "Edit":
         path = input_dict.get("file_path", "")
@@ -211,7 +219,7 @@ def _file_change_block(name: str, input_dict: dict, with_path: bool = True) -> s
             input_dict.get("new_string", ""),
             Path(path).name if path else "file",
         )
-        return f"`{_short_path(path)}`\n\n{diff}" if with_path else diff
+        return f"`{_short_path(path, cwd)}`\n\n{diff}" if with_path else diff
 
     elif name == "Write":
         path = input_dict.get("file_path", "")
@@ -221,12 +229,12 @@ def _file_change_block(name: str, input_dict: dict, with_path: bool = True) -> s
         suffix = f"\n… (共 {len(lines)} 行)" if len(lines) > 60 else ""
         ext = Path(path).suffix.lstrip(".") or "text"
         body = f"```{ext}\n{preview}{suffix}\n```"
-        return f"`{_short_path(path)}`\n\n{body}" if with_path else body
+        return f"`{_short_path(path, cwd)}`\n\n{body}" if with_path else body
 
     elif name == "MultiEdit":
         path = input_dict.get("file_path", "")
         fname = Path(path).name if path else "file"
-        parts: list[str] = [f"`{_short_path(path)}`"] if with_path else []
+        parts: list[str] = [f"`{_short_path(path, cwd)}`"] if with_path else []
         for i, edit in enumerate(input_dict.get("edits", [])[:6], 1):
             parts.append(f"**修改 {i}:**\n" + _format_diff(
                 edit.get("old_string", ""), edit.get("new_string", ""), fname
@@ -248,29 +256,46 @@ async def handle_message(
     image_bytes: bytes | None = None,
     sender_id: str = "",
     message_id: str = "",
+    parent_id: str = "",
 ):
     if ALLOWED_USER_IDS and sender_id not in ALLOWED_USER_IDS:
         log.warning("非白名单用户: %s", sender_id)
         return
 
+    router = get_router()
+
     if text.startswith("/"):
-        await _handle_command(client, chat_id, text, message_id)
+        await _handle_command(client, chat_id, sender_id, text, message_id, parent_id, router)
         return
 
-    if _run_lock.locked():
+    # 解析归属话题
+    thread, source = await router.resolve(chat_id, sender_id, parent_id, text)
+    log.info(
+        "route: source=%s key=%s session=%s cwd=%s",
+        source, thread.key, thread.session_id, thread.cwd,
+    )
+
+    # 同话题串行：上一条还在跑就发排队提示
+    if thread.lock.locked():
         if message_id:
-            _reply_card(client, message_id, "⏳ 排队中", "上一条消息还在处理，请稍候…", "grey")
-        else:
-            send_rich_card(client, chat_id, "⏳ 排队中", "上一条消息还在处理，请稍候…", "grey")
+            _reply_card(
+                client, message_id, "⏳ 排队中",
+                f"话题 `{thread.title}` 还在执行，已排队…", "grey",
+                thread_key=thread.key,
+            )
 
-    async with _run_lock:
-        question_preview = (text[:60] + "…") if len(text) > 60 else text
-
+    async with thread.lock:
         # 进度卡（持续 patch）：reply 到用户消息下，fallback 到普通发送
         if message_id:
-            progress_id = _reply_card(client, message_id, "⏳ 执行中", "处理中…", "grey")
+            progress_id = _reply_card(
+                client, message_id, "⏳ 执行中", "处理中…", "grey",
+                thread_key=thread.key,
+            )
         else:
-            progress_id = _create_card(client, chat_id, "⏳ 执行中", "处理中…", "grey")
+            progress_id = _create_card(
+                client, chat_id, "⏳ 执行中", "处理中…", "grey",
+                thread_key=thread.key,
+            )
 
         steps: list[str] = []           # 进度卡步骤列表
         last_patch = [0.0]
@@ -284,7 +309,6 @@ async def handle_message(
                 _patch_card(client, progress_id, "⏳ 执行中", "处理中…", "grey")
                 return
             # 进度卡按字符数从尾部往前累，超出 MAX_CARD_LEN 就停并加省略提示。
-            # diff 块进来后单 step 可能多行，旧的按行数截断会把工具步骤挤掉。
             sep = "\n\n"
             picked: list[str] = []
             total = 0
@@ -299,9 +323,9 @@ async def handle_message(
             _patch_card(client, progress_id, "⏳ 执行中", content, "grey")
 
         async def on_tool_start(tool_use_id: str, name: str, input_dict: dict):
-            line = _step_line(name, input_dict)
+            line = _step_line(name, input_dict, thread.cwd)
             # 进度卡的 diff 不带路径（_step_line 已经给过），与路径行紧贴，避免被 \n\n 拆开
-            prog_block = _file_change_block(name, input_dict, with_path=False)
+            prog_block = _file_change_block(name, input_dict, thread.cwd, with_path=False)
             if prog_block:
                 line = f"{line}\n{prog_block}"
             steps.append(line)
@@ -313,8 +337,8 @@ async def handle_message(
         async def on_tool_result(_id: str, _text: str):
             pass
 
-        async def on_thinking(text: str):
-            # 4.7 thinking 是 redacted（无明文），text 仅占位用；统一替换成 spinner 行，
+        async def on_thinking(_text: str):
+            # 4.7 thinking 是 redacted（无明文），text 仅占位用；
             # 由 _spinner_tick 后台 task 持续旋转动画
             line = _SPINNER_PREFIX + _SPINNER_FRAMES[spinner_idx[0]]
             if steps and steps[-1].startswith("🤔"):
@@ -335,16 +359,15 @@ async def handle_message(
                         continue
                     spinner_idx[0] = (spinner_idx[0] + 1) % len(_SPINNER_FRAMES)
                     steps[-1] = _SPINNER_PREFIX + _SPINNER_FRAMES[spinner_idx[0]]
-                    # 不与工具事件抢 patch：仅在距上次 patch 超过 _SPINNER_TICK 时再发
                     if time.time() - last_patch[0] >= _SPINNER_TICK:
                         last_patch[0] = time.time()
                         _do_patch()
             except asyncio.CancelledError:
                 pass
 
-        async def on_text(text: str):
-            last_text[0] = text
-            preview = text[:100] + "…" if len(text) > 100 else text
+        async def on_text(t: str):
+            last_text[0] = t
+            preview = t[:100] + "…" if len(t) > 100 else t
             line = f"💬 {preview}"
             if steps and steps[-1].startswith("💬"):
                 steps[-1] = line
@@ -361,15 +384,19 @@ async def handle_message(
             image_paths.append(save_temp_image(compress_image(image_bytes)))
 
         spinner_task = asyncio.create_task(_spinner_tick())
+        new_session_id: str | None = None
         try:
-            result, _ = await _runner.run(
-                text,
-                image_paths=image_paths,
-                on_tool_start=on_tool_start,
-                on_tool_result=on_tool_result,
-                on_text=on_text,
-                on_thinking=on_thinking,
-            )
+            async with router.global_sema:
+                result, _, new_session_id = await thread.get_runner().run(
+                    text,
+                    cwd=thread.cwd,
+                    session_id=thread.session_id,
+                    image_paths=image_paths,
+                    on_tool_start=on_tool_start,
+                    on_tool_result=on_tool_result,
+                    on_text=on_text,
+                    on_thinking=on_thinking,
+                )
         except Exception as exc:
             log.exception("Claude runner 异常")
             result = f"❌ 执行出错: {exc}"
@@ -385,6 +412,9 @@ async def handle_message(
                 os.unlink(p)
             except OSError:
                 pass
+
+        # 写回 session_id 并落盘
+        router.touch(thread, new_session_id)
 
         # 进度卡：移除末尾的 🤔/💬 行，只保留工具步骤
         while steps and (steps[-1].startswith("💬") or steps[-1].startswith("🤔")):
@@ -404,53 +434,100 @@ async def handle_message(
 
         log.info("发送结果卡片: title=%s len=%d", final_title, len(answer))
         if message_id:
-            _reply_card(client, message_id, final_title, answer, final_color)
+            _reply_card(
+                client, message_id, final_title, answer, final_color,
+                thread_key=thread.key,
+            )
         else:
-            _create_card(client, chat_id, final_title, answer, final_color)
+            _create_card(
+                client, chat_id, final_title, answer, final_color,
+                thread_key=thread.key,
+            )
 
 
 # ── 命令处理 ──────────────────────────────────────────────────────────────────
 
-async def _handle_command(client: lark.Client, chat_id: str, text: str, message_id: str = ""):
+async def _handle_command(
+    client: lark.Client, chat_id: str, sender_id: str, text: str,
+    message_id: str, parent_id: str, router,
+):
     parts = text.strip().split(maxsplit=1)
     cmd = parts[0].lower()
     arg = parts[1] if len(parts) > 1 else ""
 
     def _send(title: str, content: str, color: str):
-        """命令响应：优先 reply 用户那条命令消息，无 message_id 时退回普通发送。"""
         if message_id:
             _reply_card(client, message_id, title, content, color)
         else:
             send_rich_card(client, chat_id, title, content, color)
 
     if cmd == "/new":
-        _runner.new_session()
-        _send("🔄 新会话", "已清空上下文，开始新对话。", "green")
-
-    elif cmd == "/stop":
-        stopped = await _runner.stop()
-        if stopped:
-            _send("⏹ 已中止", "当前任务已终止。", "orange")
+        old = router.reset_current(chat_id, sender_id)
+        if old:
+            _send("🔄 新话题", f"已离开 `{old.title}`，下条消息开新话题。", "green")
         else:
-            _send("ℹ️ 无任务", "当前没有正在执行的任务。", "grey")
+            _send("🔄 新话题", "下条消息开新话题。", "green")
+        return
+
+    if cmd == "/threads":
+        threads = router.list_threads(chat_id)
+        cur = router.get_current(chat_id, sender_id)
+        if not threads:
+            _send("🧵 话题列表", "（暂无话题）", "blue")
+            return
+        lines = ["| | 标题 | 目录 | 上次活跃 |", "|---|---|---|---|"]
+        now = time.time()
+        for t in sorted(threads, key=lambda x: -x.last_active):
+            mark = "▸" if cur and t.key == cur.key else " "
+            idle = now - t.last_active
+            if idle < 60:
+                idle_s = f"{int(idle)}s"
+            elif idle < 3600:
+                idle_s = f"{int(idle/60)}m"
+            else:
+                idle_s = f"{int(idle/3600)}h"
+            cwd_short = Path(t.cwd).name or t.cwd
+            title = t.title.replace("|", "/") or "（空）"
+            lines.append(f"| {mark} | {title} | {cwd_short} | {idle_s}前 |")
+        _send("🧵 话题列表", "\n".join(lines), "blue")
+        return
+
+    # /stop /cwd /status 都按当前 sender 的"将进入的话题"操作
+    thread = await router.try_resolve(chat_id, sender_id, parent_id)
+    if thread is None:
+        _send("ℹ️ 无活跃话题", "尚未开启对话；先发一条消息试试。", "grey")
+        return
+
+    if cmd == "/stop":
+        stopped = await thread.get_runner().stop()
+        if stopped:
+            _send("⏹ 已中止", f"话题 `{thread.title}` 的当前任务已终止。", "orange")
+        else:
+            _send("ℹ️ 无任务", "当前话题没有正在执行的任务。", "grey")
 
     elif cmd == "/cwd":
         if not arg:
-            _send("📂 当前目录", f"`{_runner.cwd}`", "blue")
+            _send("📂 当前目录", f"`{thread.cwd}`", "blue")
         else:
-            err = _runner.set_cwd(arg)
+            err = router.set_cwd(thread, arg)
             if err:
                 _send("❌ 切换失败", err, "red")
             else:
-                _send("📂 已切换", f"`{_runner.cwd}`", "green")
+                _send("📂 已切换", f"`{thread.cwd}`", "green")
 
     elif cmd == "/status":
-        running = _runner._process is not None and _runner._process.returncode is None
+        running = thread.runner is not None and thread.runner.is_running
         _send("📊 状态", "\n".join([
-            f"**会话:** {_runner.session_id or '(无)'}",
-            f"**工作目录:** `{_runner.cwd}`",
+            f"**话题:** {thread.title}",
+            f"**Key:** `{thread.key}`",
+            f"**会话:** `{thread.session_id or '(无)'}`",
+            f"**工作目录:** `{thread.cwd}`",
             f"**状态:** {'⚙️ 执行中' if running else '💤 空闲'}",
         ]), "blue")
 
     else:
-        _send("❓ 未知命令", "可用命令: `/new` `/stop` `/cwd <path>` `/status`", "grey")
+        _send(
+            "❓ 未知命令",
+            "可用命令: `/new` `/stop` `/cwd <path>` `/status` `/threads`",
+            "grey",
+        )

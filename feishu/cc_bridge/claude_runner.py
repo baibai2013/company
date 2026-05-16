@@ -70,26 +70,14 @@ def compress_image(image_bytes: bytes, max_side: int = 1568) -> bytes:
 
 
 class ClaudeRunner:
-    """管理 Claude Code CLI 子进程，一个用户一个实例。"""
+    """管理 Claude Code CLI 子进程。无状态：cwd / session_id 每次 run() 传入。
+
+    实例字段只保留 _process（用于 stop）。每个 Thread 持有一个独立 ClaudeRunner，
+    所以不同话题并发 run 不会相互踩 _process。
+    """
 
     def __init__(self):
-        self.cwd: str = DEFAULT_CWD
-        self.session_id: str | None = None
         self._process: asyncio.subprocess.Process | None = None
-
-    def set_cwd(self, path: str) -> str | None:
-        """切换工作目录，返回错误信息或 None。"""
-        path = os.path.expanduser(path)
-        if not path.startswith(ALLOWED_CWD_PREFIX):
-            return f"不允许的路径，必须在 {ALLOWED_CWD_PREFIX} 下"
-        if not os.path.isdir(path):
-            return f"目录不存在: {path}"
-        self.cwd = path
-        return None
-
-    def new_session(self):
-        """新建会话，清空 session_id。"""
-        self.session_id = None
 
     async def stop(self):
         """中止当前正在运行的 Claude 进程。"""
@@ -103,21 +91,31 @@ class ClaudeRunner:
             return True
         return False
 
+    @property
+    def is_running(self) -> bool:
+        return self._process is not None and self._process.returncode is None
+
     async def run(
         self,
         prompt: str,
+        cwd: str,
+        session_id: str | None = None,
         image_paths: list[str] | None = None,
         on_chunk: callable = None,
         on_tool_start: callable = None,
         on_tool_result: callable = None,
         on_text: callable = None,
         on_thinking: callable = None,
-    ) -> tuple[str, list[str]]:
+    ) -> tuple[str, list[str], str | None]:
         """
         执行 Claude Code CLI，流式返回结果。
 
-        on_chunk(text, tool_log, current_tool, force): 中间状态回调。
-        返回 (最终文本, 工具调用日志列表)。
+        参数：
+          cwd:        本次运行的工作目录
+          session_id: 如有则 --resume 复用上下文
+
+        返回 (最终文本, 工具调用日志, 新 session_id)。
+        新 session_id 由调用方写回 Thread。
         """
         # 4.7 用 --effort 控制 thinking（adaptive 模式），不接受 --max-thinking-tokens
         # --include-partial-messages 启用 stream_event 增量事件
@@ -125,8 +123,8 @@ class ClaudeRunner:
                "--include-partial-messages", "--effort", "high",
                "--model", "claude-opus-4-7"]
 
-        if self.session_id:
-            cmd.extend(["--resume", self.session_id])
+        if session_id:
+            cmd.extend(["--resume", session_id])
 
         # 图片：告知 Claude 文件路径，由其 Read 工具读取（支持多模态）
         if image_paths:
@@ -135,7 +133,7 @@ class ClaudeRunner:
 
         cmd.append(prompt)
 
-        log.info("执行: cwd=%s cmd=%s", self.cwd, " ".join(cmd[:6]) + "...")
+        log.info("执行: cwd=%s session=%s cmd=%s", cwd, session_id, " ".join(cmd[:6]) + "...")
 
         # limit=4MB：claude 的 system init 行包含所有 slash_commands，远超默认 64KB
         _limit = 4 * 1024 * 1024
@@ -143,7 +141,7 @@ class ClaudeRunner:
             *cmd,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
-            cwd=self.cwd,
+            cwd=cwd,
             limit=_limit,
         )
 
@@ -281,11 +279,8 @@ class ClaudeRunner:
         if current_tool:
             tool_log.append(f"✅ {current_tool}")
 
-        if new_session_id:
-            self.session_id = new_session_id
-
         final = result_text or "".join(accumulated)
-        return (final.strip() if final else "(无输出)"), tool_log
+        return (final.strip() if final else "(无输出)"), tool_log, new_session_id
 
 
 def save_temp_image(image_bytes: bytes) -> str:

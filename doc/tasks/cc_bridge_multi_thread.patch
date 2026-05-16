@@ -1,0 +1,946 @@
+diff --git a/feishu/cc_bridge/claude_runner.py b/feishu/cc_bridge/claude_runner.py
+index 8d0e61d..905eeee 100644
+--- a/feishu/cc_bridge/claude_runner.py
++++ b/feishu/cc_bridge/claude_runner.py
+@@ -70,27 +70,15 @@ def compress_image(image_bytes: bytes, max_side: int = 1568) -> bytes:
+ 
+ 
+ class ClaudeRunner:
+-    """管理 Claude Code CLI 子进程，一个用户一个实例。"""
++    """管理 Claude Code CLI 子进程。无状态：cwd / session_id 每次 run() 传入。
++
++    实例字段只保留 _process（用于 stop）。每个 Thread 持有一个独立 ClaudeRunner，
++    所以不同话题并发 run 不会相互踩 _process。
++    """
+ 
+     def __init__(self):
+-        self.cwd: str = DEFAULT_CWD
+-        self.session_id: str | None = None
+         self._process: asyncio.subprocess.Process | None = None
+ 
+-    def set_cwd(self, path: str) -> str | None:
+-        """切换工作目录，返回错误信息或 None。"""
+-        path = os.path.expanduser(path)
+-        if not path.startswith(ALLOWED_CWD_PREFIX):
+-            return f"不允许的路径，必须在 {ALLOWED_CWD_PREFIX} 下"
+-        if not os.path.isdir(path):
+-            return f"目录不存在: {path}"
+-        self.cwd = path
+-        return None
+-
+-    def new_session(self):
+-        """新建会话，清空 session_id。"""
+-        self.session_id = None
+-
+     async def stop(self):
+         """中止当前正在运行的 Claude 进程。"""
+         if self._process and self._process.returncode is None:
+@@ -103,21 +91,31 @@ class ClaudeRunner:
+             return True
+         return False
+ 
++    @property
++    def is_running(self) -> bool:
++        return self._process is not None and self._process.returncode is None
++
+     async def run(
+         self,
+         prompt: str,
++        cwd: str,
++        session_id: str | None = None,
+         image_paths: list[str] | None = None,
+         on_chunk: callable = None,
+         on_tool_start: callable = None,
+         on_tool_result: callable = None,
+         on_text: callable = None,
+         on_thinking: callable = None,
+-    ) -> tuple[str, list[str]]:
++    ) -> tuple[str, list[str], str | None]:
+         """
+         执行 Claude Code CLI，流式返回结果。
+ 
+-        on_chunk(text, tool_log, current_tool, force): 中间状态回调。
+-        返回 (最终文本, 工具调用日志列表)。
++        参数：
++          cwd:        本次运行的工作目录
++          session_id: 如有则 --resume 复用上下文
++
++        返回 (最终文本, 工具调用日志, 新 session_id)。
++        新 session_id 由调用方写回 Thread。
+         """
+         # 4.7 用 --effort 控制 thinking（adaptive 模式），不接受 --max-thinking-tokens
+         # --include-partial-messages 启用 stream_event 增量事件
+@@ -125,8 +123,8 @@ class ClaudeRunner:
+                "--include-partial-messages", "--effort", "high",
+                "--model", "claude-opus-4-7"]
+ 
+-        if self.session_id:
+-            cmd.extend(["--resume", self.session_id])
++        if session_id:
++            cmd.extend(["--resume", session_id])
+ 
+         # 图片：告知 Claude 文件路径，由其 Read 工具读取（支持多模态）
+         if image_paths:
+@@ -135,7 +133,7 @@ class ClaudeRunner:
+ 
+         cmd.append(prompt)
+ 
+-        log.info("执行: cwd=%s cmd=%s", self.cwd, " ".join(cmd[:6]) + "...")
++        log.info("执行: cwd=%s session=%s cmd=%s", cwd, session_id, " ".join(cmd[:6]) + "...")
+ 
+         # limit=4MB：claude 的 system init 行包含所有 slash_commands，远超默认 64KB
+         _limit = 4 * 1024 * 1024
+@@ -143,7 +141,7 @@ class ClaudeRunner:
+             *cmd,
+             stdout=asyncio.subprocess.PIPE,
+             stderr=asyncio.subprocess.PIPE,
+-            cwd=self.cwd,
++            cwd=cwd,
+             limit=_limit,
+         )
+ 
+@@ -281,11 +279,8 @@ class ClaudeRunner:
+         if current_tool:
+             tool_log.append(f"✅ {current_tool}")
+ 
+-        if new_session_id:
+-            self.session_id = new_session_id
+-
+         final = result_text or "".join(accumulated)
+-        return (final.strip() if final else "(无输出)"), tool_log
++        return (final.strip() if final else "(无输出)"), tool_log, new_session_id
+ 
+ 
+ def save_temp_image(image_bytes: bytes) -> str:
+diff --git a/feishu/cc_bridge/main.py b/feishu/cc_bridge/main.py
+index 4155f08..bd2340d 100644
+--- a/feishu/cc_bridge/main.py
++++ b/feishu/cc_bridge/main.py
+@@ -3,8 +3,6 @@ CC — 飞书机器人对接 Claude Code CLI 桥接服务入口。
+ 
+ Usage:
+   python -m feishu.cc_bridge.main
+-
+-# 进度卡路径去重验证：本次提交用于测试 _file_change_block(with_path=False) 在进度卡中只显示一次文件路径。
+ """
+ import asyncio
+ import base64
+@@ -59,9 +57,12 @@ def _release_singleton() -> None:
+ # ── 配置 ─────────────────────────────────────────────────────────────────────
+ APP_ID = os.getenv("CC_BRIDGE_APP_ID", "cli_aa89f97f83f89be6")
+ APP_SECRET = os.getenv("CC_BRIDGE_APP_SECRET", "COozkvL5KVAtlwNGStqDig6uykU2kLgj")
++# 群聊 @ 检测需要机器人自己的 open_id；可在 .env 里配 CC_BRIDGE_BOT_OPEN_ID 跳过 API 拉取
++BOT_OPEN_ID: str = os.getenv("CC_BRIDGE_BOT_OPEN_ID", "")
+ 
+ # ── 待处理图片（等用户补充问题）────────────────────────────────────────────────
+-_pending_images: dict[str, bytes] = {}  # chat_id → image bytes
++# key 用 (chat_id, sender_id)：群里每个人独立缓存，避免互相串图
++_pending_images: dict[tuple[str, str], bytes] = {}
+ 
+ # ── 去重 ─────────────────────────────────────────────────────────────────────
+ _processed: set[str] = set()
+@@ -223,13 +224,46 @@ def on_message(data: P2ImMessageReceiveV1) -> None:
+         log.exception("on_message 未捕获异常")
+ 
+ 
++def _is_at_bot(msg) -> bool:
++    """群消息：判断是否 @ 了本机器人。
++
++    需要 CC_BRIDGE_BOT_OPEN_ID 环境变量。未配置时退化为"消息含任意 mention 即视为 @ 机器人"，
++    此举会导致 A @ B 也触发，仅作启动调试用，正式运行务必填上 open_id。
++    """
++    mentions = getattr(msg, "mentions", None) or []
++    if not mentions:
++        return False
++    if not BOT_OPEN_ID:
++        return True  # 退化模式
++    for m in mentions:
++        mid = getattr(m, "id", None)
++        if mid and getattr(mid, "open_id", "") == BOT_OPEN_ID:
++            return True
++    return False
++
++
++def _strip_mentions(text: str, msg) -> str:
++    """把 text 里的 @_user_N placeholder 全部去掉。"""
++    mentions = getattr(msg, "mentions", None) or []
++    for m in mentions:
++        key = getattr(m, "key", "")
++        if key:
++            text = text.replace(key, "")
++    return text.strip()
++
++
+ def _on_message_inner(data: P2ImMessageReceiveV1) -> None:
+     msg = data.event.message if data.event else None
+     if not msg:
+         return
+ 
+-    # 只处理 P2P 单聊
+-    if msg.chat_type != "p2p":
++    # P2P 私聊全收；群聊只收 @ 机器人的消息
++    if msg.chat_type == "p2p":
++        pass
++    elif msg.chat_type == "group":
++        if not _is_at_bot(msg):
++            return
++    else:
+         return
+ 
+     message_id = msg.message_id
+@@ -243,16 +277,22 @@ def _on_message_inner(data: P2ImMessageReceiveV1) -> None:
+     chat_id = msg.chat_id
+     msg_type = msg.message_type
+ 
+-    log.info("📨[poll]收到消息: type=%s chat_id=%s sender=%s", msg_type, chat_id, sender_id)
++    log.info(
++        "📨 收到消息: type=%s chat_type=%s chat_id=%s sender=%s",
++        msg_type, msg.chat_type, chat_id, sender_id,
++    )
+ 
+     # 提取文本
+     text = ""
+     image_bytes = None
+ 
++    pending_key = (chat_id, sender_id)
++
+     if msg_type == "text":
+         try:
+             content = json.loads(msg.content)
+             text = content.get("text", "").strip()
++            text = _strip_mentions(text, msg)
+         except (json.JSONDecodeError, TypeError):
+             return
+ 
+@@ -269,7 +309,7 @@ def _on_message_inner(data: P2ImMessageReceiveV1) -> None:
+             log.warning("图片处理失败: %s", exc)
+             return
+         if image_bytes:
+-            _pending_images[chat_id] = image_bytes
++            _pending_images[pending_key] = image_bytes
+             reply_rich_card(_client, message_id, "📷 已收到图片", "请问您有什么问题？", "blue")
+             return
+ 
+@@ -300,10 +340,10 @@ def _on_message_inner(data: P2ImMessageReceiveV1) -> None:
+                             )
+                         if q:
+                             quote_parts.append(str(q).strip())
+-            text = "".join(texts).strip()
++            text = _strip_mentions("".join(texts).strip(), msg)
+             if not text and image_bytes:
+                 # post 有图无文字：同纯图片处理，等用户补充问题
+-                _pending_images[chat_id] = image_bytes
++                _pending_images[pending_key] = image_bytes
+                 reply_rich_card(_client, message_id, "📷 已收到图片", "请问您有什么问题？", "blue")
+                 return
+             if quote_parts:
+@@ -326,14 +366,20 @@ def _on_message_inner(data: P2ImMessageReceiveV1) -> None:
+         return
+ 
+     # 有文字时，检查是否有待处理的图片并附上
+-    if text and not image_bytes and chat_id in _pending_images:
+-        image_bytes = _pending_images.pop(chat_id)
+-        log.info("附加待处理图片: chat_id=%s", chat_id)
++    if text and not image_bytes and pending_key in _pending_images:
++        image_bytes = _pending_images.pop(pending_key)
++        log.info("附加待处理图片: %s", pending_key)
+ 
+     # 提交到异步事件循环执行
+     loop = _get_loop()
+     asyncio.run_coroutine_threadsafe(
+-        handle_message(_client, chat_id, text, image_bytes=image_bytes, sender_id=sender_id, message_id=message_id),
++        handle_message(
++            _client, chat_id, text,
++            image_bytes=image_bytes,
++            sender_id=sender_id,
++            message_id=message_id,
++            parent_id=parent_id,
++        ),
+         loop,
+     )
+ 
+diff --git a/feishu/cc_bridge/message_handler.py b/feishu/cc_bridge/message_handler.py
+index 5dee5d2..c615927 100644
+--- a/feishu/cc_bridge/message_handler.py
++++ b/feishu/cc_bridge/message_handler.py
+@@ -1,7 +1,8 @@
+ """
+ 飞书消息处理 + 回传模块。
+ 
+-一张进度卡 patch 工具调用过程，完成后发新结果卡（含 diff）触发通知。
++每条机器人卡片 reply 到原消息下，并登记到 ThreadRouter 用于后续 parent_id 引用回查。
++进度卡持续 patch 工具调用过程，完成后另发结果卡（含 diff）触发推送。
+ """
+ import asyncio
+ import difflib
+@@ -23,21 +24,17 @@ from lark_oapi.api.im.v1 import (
+ 
+ from feishu.sender import build_card_json, send_rich_card
+ from feishu.cc_bridge.claude_runner import (
+-    ClaudeRunner,
+     compress_image,
+     save_temp_image,
+ )
++from feishu.cc_bridge.thread_router import Thread, get_router
+ 
+ log = logging.getLogger("cc_bridge.handler")
+ 
+-_runner = ClaudeRunner()
+-_run_lock = asyncio.Lock()
+-
+ ALLOWED_USER_IDS: set[str] = set()
+ 
+ MAX_CARD_LEN = 3500
+ MAX_DIFF_LINES = 50
+-MAX_STEPS = 30
+ 
+ # 思考中 spinner 动画帧（点点累加）
+ _SPINNER_FRAMES = [".", "..", "..."]
+@@ -89,7 +86,10 @@ def _build_card_json(title: str, content: str, color: str) -> str:
+     return build_card_json(title, content, color)
+ 
+ 
+-def _create_card(client: lark.Client, chat_id: str, title: str, content: str, color: str = "grey") -> str | None:
++def _create_card(
++    client: lark.Client, chat_id: str, title: str, content: str, color: str = "grey",
++    thread_key: str | None = None,
++) -> str | None:
+     body = (
+         CreateMessageRequestBody.builder()
+         .receive_id(chat_id).msg_type("interactive")
+@@ -99,13 +99,19 @@ def _create_card(client: lark.Client, chat_id: str, title: str, content: str, co
+     req = CreateMessageRequest.builder().receive_id_type("chat_id").request_body(body).build()
+     resp = client.im.v1.message.create(req)
+     if resp.success() and resp.data and resp.data.message_id:
+-        _remember_card(resp.data.message_id, title, content)
+-        return resp.data.message_id
++        mid = resp.data.message_id
++        _remember_card(mid, title, content)
++        if thread_key:
++            get_router().tag_message(mid, thread_key)
++        return mid
+     log.error("create_card failed: %s %s", resp.code, resp.msg)
+     return None
+ 
+ 
+-def _reply_card(client: lark.Client, parent_id: str, title: str, content: str, color: str = "grey") -> str | None:
++def _reply_card(
++    client: lark.Client, parent_id: str, title: str, content: str, color: str = "grey",
++    thread_key: str | None = None,
++) -> str | None:
+     """以卡片形式回复用户消息，返回新卡片的 message_id 供后续 patch。"""
+     body = (
+         ReplyMessageRequestBody.builder()
+@@ -116,8 +122,11 @@ def _reply_card(client: lark.Client, parent_id: str, title: str, content: str, c
+     req = ReplyMessageRequest.builder().message_id(parent_id).request_body(body).build()
+     resp = client.im.v1.message.reply(req)
+     if resp.success() and resp.data and resp.data.message_id:
+-        _remember_card(resp.data.message_id, title, content)
+-        return resp.data.message_id
++        mid = resp.data.message_id
++        _remember_card(mid, title, content)
++        if thread_key:
++            get_router().tag_message(mid, thread_key)
++        return mid
+     log.error("reply_card failed: %s %s", resp.code, resp.msg)
+     return None
+ 
+@@ -142,31 +151,30 @@ _TOOL_ICONS = {
+ }
+ 
+ 
+-def _short_path(path: str) -> str:
++def _short_path(path: str, cwd: str) -> str:
+     """绝对路径若位于当前 cwd 下，转为相对路径；否则原样返回。
+ 
+-    cwd 取 `_runner.cwd`（用户可通过 /cwd 切换），不是进程实际 cwd。
+     走出 cwd 范围（relpath 以 `..` 开头）的保留绝对，避免出现一长串 ../。
+     """
+     if not path or not os.path.isabs(path):
+         return path
+     try:
+-        rel = os.path.relpath(path, _runner.cwd)
++        rel = os.path.relpath(path, cwd)
+     except (ValueError, OSError):
+         return path
+     return path if rel.startswith("..") else rel
+ 
+ 
+-def _step_line(name: str, input_dict: dict) -> str:
++def _step_line(name: str, input_dict: dict, cwd: str) -> str:
+     icon = _TOOL_ICONS.get(name, "🔧")
+     if name == "Bash":
+         cmd = input_dict.get("command", "").replace("\n", " ").strip()
+         short = (cmd[:80] + "…") if len(cmd) > 80 else cmd
+         return f"{icon} {short}"
+     elif name in ("Edit", "Write", "MultiEdit"):
+-        return f"{icon} {_short_path(input_dict.get('file_path', name))}"
++        return f"{icon} {_short_path(input_dict.get('file_path', name), cwd)}"
+     elif name == "Read":
+-        return f"{icon} {_short_path(input_dict.get('file_path', ''))}"
++        return f"{icon} {_short_path(input_dict.get('file_path', ''), cwd)}"
+     elif name in ("Glob", "Grep"):
+         return f"{icon} {input_dict.get('pattern', '')}"
+     elif name == "Agent":
+@@ -198,11 +206,11 @@ def _format_diff(old: str, new: str, fname: str) -> str:
+     return "```diff\n" + "".join(diff) + "\n```"
+ 
+ 
+-def _file_change_block(name: str, input_dict: dict, with_path: bool = True) -> str | None:
++def _file_change_block(name: str, input_dict: dict, cwd: str, with_path: bool = True) -> str | None:
+     """生成文件变更展示，仅 Edit/Write/MultiEdit 有内容。
+ 
+     with_path=False：进度卡用，路径已由 _step_line 显示，避免重复。
+-    with_path=True：结果卡 file_changes 用，没有 step_line 引导，必须自带路径。
++    with_path=True：结果卡用，没有 step_line 引导，必须自带路径。
+     """
+     if name == "Edit":
+         path = input_dict.get("file_path", "")
+@@ -211,7 +219,7 @@ def _file_change_block(name: str, input_dict: dict, with_path: bool = True) -> s
+             input_dict.get("new_string", ""),
+             Path(path).name if path else "file",
+         )
+-        return f"`{_short_path(path)}`\n\n{diff}" if with_path else diff
++        return f"`{_short_path(path, cwd)}`\n\n{diff}" if with_path else diff
+ 
+     elif name == "Write":
+         path = input_dict.get("file_path", "")
+@@ -221,12 +229,12 @@ def _file_change_block(name: str, input_dict: dict, with_path: bool = True) -> s
+         suffix = f"\n… (共 {len(lines)} 行)" if len(lines) > 60 else ""
+         ext = Path(path).suffix.lstrip(".") or "text"
+         body = f"```{ext}\n{preview}{suffix}\n```"
+-        return f"`{_short_path(path)}`\n\n{body}" if with_path else body
++        return f"`{_short_path(path, cwd)}`\n\n{body}" if with_path else body
+ 
+     elif name == "MultiEdit":
+         path = input_dict.get("file_path", "")
+         fname = Path(path).name if path else "file"
+-        parts: list[str] = [f"`{_short_path(path)}`"] if with_path else []
++        parts: list[str] = [f"`{_short_path(path, cwd)}`"] if with_path else []
+         for i, edit in enumerate(input_dict.get("edits", [])[:6], 1):
+             parts.append(f"**修改 {i}:**\n" + _format_diff(
+                 edit.get("old_string", ""), edit.get("new_string", ""), fname
+@@ -248,29 +256,46 @@ async def handle_message(
+     image_bytes: bytes | None = None,
+     sender_id: str = "",
+     message_id: str = "",
++    parent_id: str = "",
+ ):
+     if ALLOWED_USER_IDS and sender_id not in ALLOWED_USER_IDS:
+         log.warning("非白名单用户: %s", sender_id)
+         return
+ 
++    router = get_router()
++
+     if text.startswith("/"):
+-        await _handle_command(client, chat_id, text, message_id)
++        await _handle_command(client, chat_id, sender_id, text, message_id, parent_id, router)
+         return
+ 
+-    if _run_lock.locked():
+-        if message_id:
+-            _reply_card(client, message_id, "⏳ 排队中", "上一条消息还在处理，请稍候…", "grey")
+-        else:
+-            send_rich_card(client, chat_id, "⏳ 排队中", "上一条消息还在处理，请稍候…", "grey")
++    # 解析归属话题
++    thread, source = await router.resolve(chat_id, sender_id, parent_id, text)
++    log.info(
++        "route: source=%s key=%s session=%s cwd=%s",
++        source, thread.key, thread.session_id, thread.cwd,
++    )
+ 
+-    async with _run_lock:
+-        question_preview = (text[:60] + "…") if len(text) > 60 else text
++    # 同话题串行：上一条还在跑就发排队提示
++    if thread.lock.locked():
++        if message_id:
++            _reply_card(
++                client, message_id, "⏳ 排队中",
++                f"话题 `{thread.title}` 还在执行，已排队…", "grey",
++                thread_key=thread.key,
++            )
+ 
++    async with thread.lock:
+         # 进度卡（持续 patch）：reply 到用户消息下，fallback 到普通发送
+         if message_id:
+-            progress_id = _reply_card(client, message_id, "⏳ 执行中", "处理中…", "grey")
++            progress_id = _reply_card(
++                client, message_id, "⏳ 执行中", "处理中…", "grey",
++                thread_key=thread.key,
++            )
+         else:
+-            progress_id = _create_card(client, chat_id, "⏳ 执行中", "处理中…", "grey")
++            progress_id = _create_card(
++                client, chat_id, "⏳ 执行中", "处理中…", "grey",
++                thread_key=thread.key,
++            )
+ 
+         steps: list[str] = []           # 进度卡步骤列表
+         last_patch = [0.0]
+@@ -284,7 +309,6 @@ async def handle_message(
+                 _patch_card(client, progress_id, "⏳ 执行中", "处理中…", "grey")
+                 return
+             # 进度卡按字符数从尾部往前累，超出 MAX_CARD_LEN 就停并加省略提示。
+-            # diff 块进来后单 step 可能多行，旧的按行数截断会把工具步骤挤掉。
+             sep = "\n\n"
+             picked: list[str] = []
+             total = 0
+@@ -299,9 +323,9 @@ async def handle_message(
+             _patch_card(client, progress_id, "⏳ 执行中", content, "grey")
+ 
+         async def on_tool_start(tool_use_id: str, name: str, input_dict: dict):
+-            line = _step_line(name, input_dict)
++            line = _step_line(name, input_dict, thread.cwd)
+             # 进度卡的 diff 不带路径（_step_line 已经给过），与路径行紧贴，避免被 \n\n 拆开
+-            prog_block = _file_change_block(name, input_dict, with_path=False)
++            prog_block = _file_change_block(name, input_dict, thread.cwd, with_path=False)
+             if prog_block:
+                 line = f"{line}\n{prog_block}"
+             steps.append(line)
+@@ -313,8 +337,8 @@ async def handle_message(
+         async def on_tool_result(_id: str, _text: str):
+             pass
+ 
+-        async def on_thinking(text: str):
+-            # 4.7 thinking 是 redacted（无明文），text 仅占位用；统一替换成 spinner 行，
++        async def on_thinking(_text: str):
++            # 4.7 thinking 是 redacted（无明文），text 仅占位用；
+             # 由 _spinner_tick 后台 task 持续旋转动画
+             line = _SPINNER_PREFIX + _SPINNER_FRAMES[spinner_idx[0]]
+             if steps and steps[-1].startswith("🤔"):
+@@ -335,16 +359,15 @@ async def handle_message(
+                         continue
+                     spinner_idx[0] = (spinner_idx[0] + 1) % len(_SPINNER_FRAMES)
+                     steps[-1] = _SPINNER_PREFIX + _SPINNER_FRAMES[spinner_idx[0]]
+-                    # 不与工具事件抢 patch：仅在距上次 patch 超过 _SPINNER_TICK 时再发
+                     if time.time() - last_patch[0] >= _SPINNER_TICK:
+                         last_patch[0] = time.time()
+                         _do_patch()
+             except asyncio.CancelledError:
+                 pass
+ 
+-        async def on_text(text: str):
+-            last_text[0] = text
+-            preview = text[:100] + "…" if len(text) > 100 else text
++        async def on_text(t: str):
++            last_text[0] = t
++            preview = t[:100] + "…" if len(t) > 100 else t
+             line = f"💬 {preview}"
+             if steps and steps[-1].startswith("💬"):
+                 steps[-1] = line
+@@ -361,15 +384,19 @@ async def handle_message(
+             image_paths.append(save_temp_image(compress_image(image_bytes)))
+ 
+         spinner_task = asyncio.create_task(_spinner_tick())
++        new_session_id: str | None = None
+         try:
+-            result, _ = await _runner.run(
+-                text,
+-                image_paths=image_paths,
+-                on_tool_start=on_tool_start,
+-                on_tool_result=on_tool_result,
+-                on_text=on_text,
+-                on_thinking=on_thinking,
+-            )
++            async with router.global_sema:
++                result, _, new_session_id = await thread.get_runner().run(
++                    text,
++                    cwd=thread.cwd,
++                    session_id=thread.session_id,
++                    image_paths=image_paths,
++                    on_tool_start=on_tool_start,
++                    on_tool_result=on_tool_result,
++                    on_text=on_text,
++                    on_thinking=on_thinking,
++                )
+         except Exception as exc:
+             log.exception("Claude runner 异常")
+             result = f"❌ 执行出错: {exc}"
+@@ -386,6 +413,9 @@ async def handle_message(
+             except OSError:
+                 pass
+ 
++        # 写回 session_id 并落盘
++        router.touch(thread, new_session_id)
++
+         # 进度卡：移除末尾的 🤔/💬 行，只保留工具步骤
+         while steps and (steps[-1].startswith("💬") or steps[-1].startswith("🤔")):
+             steps.pop()
+@@ -404,53 +434,100 @@ async def handle_message(
+ 
+         log.info("发送结果卡片: title=%s len=%d", final_title, len(answer))
+         if message_id:
+-            _reply_card(client, message_id, final_title, answer, final_color)
++            _reply_card(
++                client, message_id, final_title, answer, final_color,
++                thread_key=thread.key,
++            )
+         else:
+-            _create_card(client, chat_id, final_title, answer, final_color)
++            _create_card(
++                client, chat_id, final_title, answer, final_color,
++                thread_key=thread.key,
++            )
+ 
+ 
+ # ── 命令处理 ──────────────────────────────────────────────────────────────────
+ 
+-async def _handle_command(client: lark.Client, chat_id: str, text: str, message_id: str = ""):
++async def _handle_command(
++    client: lark.Client, chat_id: str, sender_id: str, text: str,
++    message_id: str, parent_id: str, router,
++):
+     parts = text.strip().split(maxsplit=1)
+     cmd = parts[0].lower()
+     arg = parts[1] if len(parts) > 1 else ""
+ 
+     def _send(title: str, content: str, color: str):
+-        """命令响应：优先 reply 用户那条命令消息，无 message_id 时退回普通发送。"""
+         if message_id:
+             _reply_card(client, message_id, title, content, color)
+         else:
+             send_rich_card(client, chat_id, title, content, color)
+ 
+     if cmd == "/new":
+-        _runner.new_session()
+-        _send("🔄 新会话", "已清空上下文，开始新对话。", "green")
++        old = router.reset_current(chat_id, sender_id)
++        if old:
++            _send("🔄 新话题", f"已离开 `{old.title}`，下条消息开新话题。", "green")
++        else:
++            _send("🔄 新话题", "下条消息开新话题。", "green")
++        return
+ 
+-    elif cmd == "/stop":
+-        stopped = await _runner.stop()
++    if cmd == "/threads":
++        threads = router.list_threads(chat_id)
++        cur = router.get_current(chat_id, sender_id)
++        if not threads:
++            _send("🧵 话题列表", "（暂无话题）", "blue")
++            return
++        lines = ["| | 标题 | 目录 | 上次活跃 |", "|---|---|---|---|"]
++        now = time.time()
++        for t in sorted(threads, key=lambda x: -x.last_active):
++            mark = "▸" if cur and t.key == cur.key else " "
++            idle = now - t.last_active
++            if idle < 60:
++                idle_s = f"{int(idle)}s"
++            elif idle < 3600:
++                idle_s = f"{int(idle/60)}m"
++            else:
++                idle_s = f"{int(idle/3600)}h"
++            cwd_short = Path(t.cwd).name or t.cwd
++            title = t.title.replace("|", "/") or "（空）"
++            lines.append(f"| {mark} | {title} | {cwd_short} | {idle_s}前 |")
++        _send("🧵 话题列表", "\n".join(lines), "blue")
++        return
++
++    # /stop /cwd /status 都按当前 sender 的"将进入的话题"操作
++    thread = await router.try_resolve(chat_id, sender_id, parent_id)
++    if thread is None:
++        _send("ℹ️ 无活跃话题", "尚未开启对话；先发一条消息试试。", "grey")
++        return
++
++    if cmd == "/stop":
++        stopped = await thread.get_runner().stop()
+         if stopped:
+-            _send("⏹ 已中止", "当前任务已终止。", "orange")
++            _send("⏹ 已中止", f"话题 `{thread.title}` 的当前任务已终止。", "orange")
+         else:
+-            _send("ℹ️ 无任务", "当前没有正在执行的任务。", "grey")
++            _send("ℹ️ 无任务", "当前话题没有正在执行的任务。", "grey")
+ 
+     elif cmd == "/cwd":
+         if not arg:
+-            _send("📂 当前目录", f"`{_runner.cwd}`", "blue")
++            _send("📂 当前目录", f"`{thread.cwd}`", "blue")
+         else:
+-            err = _runner.set_cwd(arg)
++            err = router.set_cwd(thread, arg)
+             if err:
+                 _send("❌ 切换失败", err, "red")
+             else:
+-                _send("📂 已切换", f"`{_runner.cwd}`", "green")
++                _send("📂 已切换", f"`{thread.cwd}`", "green")
+ 
+     elif cmd == "/status":
+-        running = _runner._process is not None and _runner._process.returncode is None
++        running = thread.runner is not None and thread.runner.is_running
+         _send("📊 状态", "\n".join([
+-            f"**会话:** {_runner.session_id or '(无)'}",
+-            f"**工作目录:** `{_runner.cwd}`",
++            f"**话题:** {thread.title}",
++            f"**Key:** `{thread.key}`",
++            f"**会话:** `{thread.session_id or '(无)'}`",
++            f"**工作目录:** `{thread.cwd}`",
+             f"**状态:** {'⚙️ 执行中' if running else '💤 空闲'}",
+         ]), "blue")
+ 
+     else:
+-        _send("❓ 未知命令", "可用命令: `/new` `/stop` `/cwd <path>` `/status`", "grey")
++        _send(
++            "❓ 未知命令",
++            "可用命令: `/new` `/stop` `/cwd <path>` `/status` `/threads`",
++            "grey",
++        )
+diff --git a/feishu/cc_bridge/thread_router.py b/feishu/cc_bridge/thread_router.py
+new file mode 100644
+index 0000000..8c8e9f2
+--- /dev/null
++++ b/feishu/cc_bridge/thread_router.py
+@@ -0,0 +1,254 @@
++"""
++话题（Thread）路由：把"会话上下文"从全局单例升级成多话题模型。
++
++核心模型
++========
++- Thread: 一组 (session_id, cwd, runner)，对应 Claude Code 一次连续对话
++- _msg_to_thread: 机器人发出的每张卡片 mid → thread.key（用于 parent_id 引用回查）
++- _current[(chat_id, sender_id)] → thread.key：每个用户在每个 chat 里的"当前话题指针"
++
++路由规则（resolve 4 步）
++========================
++1. 群消息已在 main.py 过滤掉非 @ 机器人的
++2. parent_id 命中 _msg_to_thread → 进对应话题（哪怕属于别人或自己旧的）
++3. _current 有指针 → 进当前话题
++4. 都不命中 → 新建话题，设为当前
++
++注意第 2 步**不会修改 _current**：引用旧话题视为"临时插入"，回到主线时仍走当前指针。
++"""
++import asyncio
++import json
++import logging
++import os
++import time
++import uuid
++from collections import OrderedDict
++from dataclasses import dataclass, field
++from pathlib import Path
++from typing import TYPE_CHECKING
++
++if TYPE_CHECKING:
++    from feishu.cc_bridge.claude_runner import ClaudeRunner
++
++log = logging.getLogger("cc_bridge.router")
++
++DEFAULT_CWD = "/Users/liyijiang/work/company"
++ALLOWED_CWD_PREFIX = "/Users/liyijiang/work/"
++PERSIST_PATH = Path.home() / ".claude" / "cc_bridge_threads.json"
++
++IDLE_TIMEOUT = int(os.getenv("CC_BRIDGE_IDLE_TIMEOUT", "1800"))      # 30 分钟无活动回收子进程
++IDLE_DROP = int(os.getenv("CC_BRIDGE_IDLE_DROP", str(7 * 86400)))    # 7 天彻底丢弃
++MAX_CONCURRENCY = int(os.getenv("CC_BRIDGE_MAX_CONCURRENCY", "4"))   # 全局并发 claude 子进程数上限
++MSG_MAP_CAP = 2000                                                    # mid → key 反查表上限
++THREAD_CAP = 200                                                      # 内存中保留的话题数上限
++
++
++@dataclass
++class Thread:
++    """一个话题 = 一段持续的 claude 会话。"""
++    key: str                                # 内部 uuid 短串
++    chat_id: str
++    title: str = ""                         # 用户首条消息前 30 字，给 /threads 列表用
++    session_id: str | None = None           # claude --resume id
++    cwd: str = DEFAULT_CWD
++    last_active: float = field(default_factory=time.time)
++    # 以下字段不持久化
++    lock: asyncio.Lock = field(default_factory=asyncio.Lock, repr=False, compare=False)
++    runner: "ClaudeRunner | None" = field(default=None, repr=False, compare=False)
++
++    def get_runner(self) -> "ClaudeRunner":
++        """懒创建 ClaudeRunner（避免反序列化时强依赖）。"""
++        if self.runner is None:
++            from feishu.cc_bridge.claude_runner import ClaudeRunner
++            self.runner = ClaudeRunner()
++        return self.runner
++
++
++class ThreadRouter:
++    def __init__(self):
++        self._threads: OrderedDict[str, Thread] = OrderedDict()
++        self._msg_to_thread: OrderedDict[str, str] = OrderedDict()
++        self._current: dict[tuple[str, str], str] = {}
++        self._global_sema: asyncio.Semaphore | None = None
++        self._mutex: asyncio.Lock | None = None
++        self._loaded = False
++
++    def _ensure_async_primitives(self):
++        # 在 event loop 里第一次访问时再创建，避免主线程 import 时报 no running loop
++        if self._global_sema is None:
++            self._global_sema = asyncio.Semaphore(MAX_CONCURRENCY)
++        if self._mutex is None:
++            self._mutex = asyncio.Lock()
++        if not self._loaded:
++            self._load()
++            self._loaded = True
++
++    @property
++    def global_sema(self) -> asyncio.Semaphore:
++        self._ensure_async_primitives()
++        return self._global_sema
++
++    async def resolve(
++        self,
++        chat_id: str,
++        sender_id: str,
++        parent_id: str,
++        first_text: str,
++    ) -> tuple[Thread, str]:
++        """返回 (thread, source)。source ∈ {'reply', 'current', 'new'}。"""
++        self._ensure_async_primitives()
++        async with self._mutex:
++            # 1. parent 引用命中
++            if parent_id:
++                key = self._msg_to_thread.get(parent_id)
++                if key and key in self._threads:
++                    t = self._threads[key]
++                    self._threads.move_to_end(key)
++                    t.last_active = time.time()
++                    return t, "reply"
++            # 2. 当前指针
++            cur_key = self._current.get((chat_id, sender_id))
++            if cur_key and cur_key in self._threads:
++                t = self._threads[cur_key]
++                self._threads.move_to_end(cur_key)
++                t.last_active = time.time()
++                return t, "current"
++            # 3. 新建并设为当前
++            new_key = uuid.uuid4().hex[:8]
++            title = (first_text[:30] or "新话题").replace("\n", " ").strip()
++            t = Thread(key=new_key, chat_id=chat_id, title=title)
++            self._threads[new_key] = t
++            self._current[(chat_id, sender_id)] = new_key
++            self._evict_threads()
++            return t, "new"
++
++    async def try_resolve(
++        self, chat_id: str, sender_id: str, parent_id: str
++    ) -> Thread | None:
++        """命令用：仅 reply / current 命中，不创建新话题。"""
++        self._ensure_async_primitives()
++        async with self._mutex:
++            if parent_id:
++                key = self._msg_to_thread.get(parent_id)
++                if key and key in self._threads:
++                    return self._threads[key]
++            cur_key = self._current.get((chat_id, sender_id))
++            if cur_key and cur_key in self._threads:
++                return self._threads[cur_key]
++            return None
++
++    def tag_message(self, message_id: str | None, thread_key: str) -> None:
++        """登记机器人发出的卡片归属哪个话题，供后续 parent_id 引用回查。"""
++        if not message_id or not thread_key:
++            return
++        self._msg_to_thread[message_id] = thread_key
++        self._msg_to_thread.move_to_end(message_id)
++        while len(self._msg_to_thread) > MSG_MAP_CAP:
++            self._msg_to_thread.popitem(last=False)
++
++    def reset_current(self, chat_id: str, sender_id: str) -> Thread | None:
++        """/new：清空指针。下条不引用的消息会建新话题。返回原指针指向的话题（仅展示）。"""
++        key = self._current.pop((chat_id, sender_id), None)
++        return self._threads.get(key) if key else None
++
++    def list_threads(self, chat_id: str) -> list[Thread]:
++        return [t for t in self._threads.values() if t.chat_id == chat_id]
++
++    def get_current(self, chat_id: str, sender_id: str) -> Thread | None:
++        key = self._current.get((chat_id, sender_id))
++        return self._threads.get(key) if key else None
++
++    def touch(self, thread: Thread, new_session_id: str | None) -> None:
++        """run 完成后调，更新 session_id + last_active 并落盘。"""
++        if new_session_id:
++            thread.session_id = new_session_id
++        thread.last_active = time.time()
++        self._save()
++
++    def set_cwd(self, thread: Thread, path: str) -> str | None:
++        path = os.path.expanduser(path)
++        if not path.startswith(ALLOWED_CWD_PREFIX):
++            return f"不允许的路径，必须在 {ALLOWED_CWD_PREFIX} 下"
++        if not os.path.isdir(path):
++            return f"目录不存在: {path}"
++        thread.cwd = path
++        self._save()
++        return None
++
++    def _evict_threads(self):
++        # OrderedDict 头部 = 最久未活跃；超出 cap 时丢最久的，并顺手清反向引用
++        while len(self._threads) > THREAD_CAP:
++            k, _ = self._threads.popitem(last=False)
++            for sk, tk in list(self._current.items()):
++                if tk == k:
++                    self._current.pop(sk, None)
++
++    # ── 持久化 ──────────────────────────────────────────────────────────────
++
++    def _save(self):
++        try:
++            PERSIST_PATH.parent.mkdir(parents=True, exist_ok=True)
++            data = {
++                "threads": {
++                    t.key: {
++                        "chat_id": t.chat_id,
++                        "title": t.title,
++                        "session_id": t.session_id,
++                        "cwd": t.cwd,
++                        "last_active": t.last_active,
++                    }
++                    for t in self._threads.values()
++                },
++                # tuple 不能当 json key，用 "chat_id|sender_id" 编码
++                "current": {f"{c}|{s}": k for (c, s), k in self._current.items()},
++            }
++            tmp = PERSIST_PATH.with_suffix(".json.tmp")
++            tmp.write_text(json.dumps(data, ensure_ascii=False, indent=2))
++            tmp.replace(PERSIST_PATH)
++        except Exception as exc:
++            log.warning("save threads failed: %s", exc)
++
++    def _load(self):
++        if not PERSIST_PATH.exists():
++            return
++        try:
++            data = json.loads(PERSIST_PATH.read_text())
++            now = time.time()
++            for k, info in data.get("threads", {}).items():
++                last_active = info.get("last_active", now)
++                # 7 天没动直接丢
++                if now - last_active > IDLE_DROP:
++                    continue
++                self._threads[k] = Thread(
++                    key=k,
++                    chat_id=info.get("chat_id", ""),
++                    title=info.get("title", ""),
++                    session_id=info.get("session_id"),
++                    cwd=info.get("cwd", DEFAULT_CWD),
++                    last_active=last_active,
++                )
++            for cs, k in data.get("current", {}).items():
++                if "|" not in cs or k not in self._threads:
++                    continue
++                c, s = cs.split("|", 1)
++                self._current[(c, s)] = k
++            log.info(
++                "loaded %d threads, %d current pointers",
++                len(self._threads),
++                len(self._current),
++            )
++        except Exception as exc:
++            log.warning("load threads failed: %s", exc)
++
++
++# ── 单例 ─────────────────────────────────────────────────────────────────────
++
++_router_singleton: ThreadRouter | None = None
++
++
++def get_router() -> ThreadRouter:
++    """模块级单例。jurigged 重载本模块时实例不会丢（变量被替换）。"""
++    global _router_singleton
++    if _router_singleton is None:
++        _router_singleton = ThreadRouter()
++    return _router_singleton
