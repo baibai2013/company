@@ -178,8 +178,7 @@ class ClaudeRunner:
                             if block.get("type") == "text":
                                 accumulated.append(block["text"])
                                 if on_text:
-                                    preview = "".join(accumulated)[:50]
-                                    await on_text(preview)
+                                    await on_text("".join(accumulated))
                             elif block.get("type") == "tool_use":
                                 if current_tool:
                                     tool_log.append(f"✅ {current_tool}")

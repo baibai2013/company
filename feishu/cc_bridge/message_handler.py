@@ -189,6 +189,7 @@ async def handle_message(
         steps: list[str] = []           # 进度卡步骤列表
         file_changes: list[str] = []    # 结果卡文件变更块
         last_patch = [0.0]
+        last_text = [""]                # 最后一次完整文本，用于结果卡
 
         def _do_patch():
             if not progress_id:
@@ -209,8 +210,10 @@ async def handle_message(
         async def on_tool_result(_id: str, _text: str):
             pass
 
-        async def on_text(preview: str):
-            line = f"💬 {preview}…"
+        async def on_text(text: str):
+            last_text[0] = text
+            preview = text[:50] + "…" if len(text) > 50 else text
+            line = f"💬 {preview}"
             if steps and steps[-1].startswith("💬"):
                 steps[-1] = line  # 更新上一行，避免刷屏
             else:
@@ -248,7 +251,9 @@ async def handle_message(
         final_title = "❌ 执行出错" if is_error else "✅ 执行完成"
         final_color = "red" if is_error else "green"
 
-        answer = result if len(result) <= MAX_CARD_LEN else result[:MAX_CARD_LEN] + "\n\n…（内容过长，已截断）"
+        # 优先用流式累积的最终文本，fallback 到 result 事件
+        final_text = last_text[0] or result
+        answer = final_text if len(final_text) <= MAX_CARD_LEN else final_text[:MAX_CARD_LEN] + "\n\n…（内容过长，已截断）"
         if file_changes:
             changes_text = "\n\n---\n\n**文件修改：**\n\n" + "\n\n".join(file_changes)
             if len(answer) + len(changes_text) <= MAX_CARD_LEN:
