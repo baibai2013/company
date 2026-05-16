@@ -167,6 +167,10 @@ async def run_with_events(
             if kind == "on_chat_model_stream" and node == "chat":
                 chunk = event.get("data", {}).get("chunk")
                 content = getattr(chunk, "content", None) if chunk else None
+                # content 可能是字符串（无工具 LLM）或内容块列表（bind_tools 时）
+                if isinstance(content, list):
+                    text_parts = [b.get("text", "") for b in content if isinstance(b, dict) and b.get("type") == "text"]
+                    content = "".join(text_parts)
                 if isinstance(content, str) and content:
                     _stream_buffer += content
                     if not _first_sent and result_data["route"] == "CHAT" and len(_stream_buffer) >= 10:

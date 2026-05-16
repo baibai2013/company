@@ -51,6 +51,10 @@ def create_a2a_app(
         try:
             result_text = await handle_task(text, context)
         except Exception as exc:
+            import traceback, logging
+            logging.getLogger("a2a_server").error(
+                "handle_task error: %s\n%s", exc, traceback.format_exc()
+            )
             return JSONResponse({
                 "jsonrpc": "2.0", "id": rpc_id,
                 "error": {"code": -32000, "message": str(exc)},
