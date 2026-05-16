@@ -57,7 +57,7 @@ _DEFAULT_ROUTE_PROMPT = """判断下面这条消息是「闲聊」还是「工�
 
 _DEFAULT_CHAT_SUFFIX = "\n\n性格：务实简洁，回复不超过 150 字，用中文，自然对话，不列大纲不输出 JSON。"
 
-_DEFAULT_PLAN_SUFFIX = "\n请分析需求，制定执行方案（100字以内）。"
+_DEFAULT_PLAN_SUFFIX = "\n请制定执行步骤（100字以内）。只写步骤，不要直接给出答案或结论；若需查询实时数据（如定时任务、文件、系统状态等），步骤中须注明要调用哪个工具。"
 
 # Backwards-compat aliases (some imports reference these)
 _ROUTE_PROMPT = _DEFAULT_ROUTE_PROMPT
