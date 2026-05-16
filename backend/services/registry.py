@@ -23,6 +23,7 @@ from dataclasses import dataclass
 from typing import Any
 
 from backend.core.config import settings
+
 from backend.repos import config_repo, employee_repo
 
 log = logging.getLogger("backend.services.registry")
@@ -91,9 +92,29 @@ def _to_effective(emp: dict, glob: dict) -> EffectiveConfig:
 
 
 async def _load_all() -> None:
-    """Reload employees + global config from DB into cache."""
-    rows = await employee_repo.list_all(active_only=False)
-    cfg = await config_repo.get()
+    """Reload employees + global config from DB into cache.
+
+    使用 NullPool 引擎（不缓存连接），避免与 uvicorn 主事件 loop 产生
+    "Future attached to a different loop" 冲突。
+    """
+    from sqlalchemy.ext.asyncio import create_async_engine, async_sessionmaker
+    from sqlalchemy.pool import NullPool
+    from sqlalchemy import select as _select
+    from backend.models.employee import Employee as _Employee, SystemConfig as _SysCfg
+
+    _eng = create_async_engine(settings.database_url, echo=False, poolclass=NullPool)
+    _Session = async_sessionmaker(_eng, expire_on_commit=False)
+    try:
+        async with _Session() as s:
+            emp_rows = list((await s.execute(
+                _select(_Employee).order_by(_Employee.agent_port)
+            )).scalars().all())
+            cfg_row = (await s.execute(_select(_SysCfg).limit(1))).scalars().first()
+    finally:
+        await _eng.dispose()
+
+    rows = emp_rows
+    cfg = cfg_row
     glob = {
         "default_models": cfg.default_models or {} if cfg else {},
         "global_prompts": cfg.global_prompts or {} if cfg else {},
@@ -129,7 +150,12 @@ async def get_effective(key: str) -> EffectiveConfig | None:
 # ── Synchronous read API (requires warmup) ────────────────────────────────────
 
 def warmup_sync() -> None:
-    """Block-load the cache once at process start. Safe to call multiple times."""
+    """Block-load the cache once at process start. Safe to call multiple times.
+
+    asyncio.run() 会创建临时 event loop，其中生成的 asyncpg 连接会留在 SQLAlchemy
+    连接池里。uvicorn 启动后用自己的 loop 时会报 "Future attached to a different loop"。
+    修复：warmup 完成后立即同步 dispose 连接池，让 uvicorn loop 重建连接。
+    """
     if _loaded:
         return
     try:
@@ -137,6 +163,7 @@ def warmup_sync() -> None:
     except RuntimeError:
         loop = None
     if loop is None:
+        # _load_all() 内部用 NullPool（不缓存连接），无 "different loop" 风险
         asyncio.run(_load_all())
     else:
         # Inside running loop — caller must await warmup() instead.
@@ -296,10 +323,9 @@ def register_change_hook(fn) -> None:
 
 
 async def invalidate(key: str | None) -> None:
-    """Force a reload on next access. Pass None for global change."""
-    global _loaded
-    _loaded = False
-    log.debug("registry cache invalidated (key=%s)", key)
+    """Reload the cache immediately, then call change hooks."""
+    await _load_all()  # 主动刷新，使 get_effective_sync 也能读到最新数据
+    log.debug("registry cache invalidated and reloaded (key=%s)", key)
     for hook in list(_change_hooks):
         try:
             await hook(key)
@@ -308,33 +334,60 @@ async def invalidate(key: str | None) -> None:
 
 
 async def _listen_loop() -> None:
-    """Background task: subscribe to PG 'config_changed' channel."""
-    try:
-        import psycopg
-    except ImportError:
-        log.warning("psycopg not available — LISTEN/NOTIFY disabled")
-        return
+    """Background task: subscribe to PG 'config_changed' channel.
 
-    dsn = settings.database_url_sync.replace("postgresql+psycopg://", "postgresql://")
-    while True:
-        try:
-            async with await psycopg.AsyncConnection.connect(dsn, autocommit=True) as conn:
-                async with conn.cursor() as cur:
-                    await cur.execute("LISTEN config_changed")
-                log.info("registry LISTEN config_changed connected")
-                async for notify in conn.notifies():
-                    try:
-                        payload = json.loads(notify.payload)
-                        key = payload.get("key")
-                    except Exception:
-                        key = None
-                    await invalidate(key)
-                    log.info("registry NOTIFY: %s", notify.payload)
-        except asyncio.CancelledError:
-            raise
-        except Exception as e:
-            log.warning("LISTEN loop error: %s — retry in 5s", e)
-            await asyncio.sleep(5)
+    同步 psycopg 在线程池里运行 LISTEN loop，避免 asyncpg 跨 loop Future 冲突。
+    通过 asyncio.run_coroutine_threadsafe 将 invalidate 调度回主 event loop。
+    """
+    loop = asyncio.get_running_loop()
+    dsn = (
+        settings.database_url_sync
+        .replace("postgresql+psycopg://", "")
+        .replace("postgresql+asyncpg://", "")
+        # 还原成标准 postgresql:// DSN
+    )
+    # 从 settings 直接构造同步 DSN
+    raw_dsn = (
+        f"postgresql://{settings.POSTGRES_USER}:{settings.POSTGRES_PASSWORD}"
+        f"@{settings.POSTGRES_HOST}:{settings.POSTGRES_PORT}/company_app"
+    )
+
+    import threading
+
+    stop_event = threading.Event()
+
+    def _sync_listen():
+        """同步阻塞式 LISTEN，运行在独立线程中。"""
+        while not stop_event.is_set():
+            try:
+                import psycopg
+                with psycopg.connect(raw_dsn, autocommit=True) as conn:
+                    conn.execute("LISTEN config_changed")
+                    log.warning("registry LISTEN config_changed connected (psycopg sync thread)")
+                    # 无超时阻塞等待，daemon 线程随进程退出自然终止
+                    for notify in conn.notifies():
+                        if stop_event.is_set():
+                            break
+                        try:
+                            key = json.loads(notify.payload).get("key")
+                        except Exception:
+                            key = None
+                        log.warning("registry NOTIFY: %s", notify.payload)
+                        asyncio.run_coroutine_threadsafe(invalidate(key), loop)
+            except Exception as e:
+                if not stop_event.is_set():
+                    log.warning("LISTEN sync thread error: %s — retry in 5s", e)
+                    stop_event.wait(5)
+
+    t = threading.Thread(target=_sync_listen, daemon=True, name="registry-listen-sync")
+    t.start()
+    try:
+        # 等待直到 CancelledError（lifespan 结束）
+        while t.is_alive():
+            await asyncio.sleep(1)
+    except asyncio.CancelledError:
+        stop_event.set()
+        raise
 
 
 def start_listener() -> asyncio.Task:

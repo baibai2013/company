@@ -248,7 +248,16 @@ for k in registry.list_keys_sync_cached(active_only=True):
   [[ $started_bots -eq 0 ]] && warn "无员工配置飞书 App ID，跳过"
 fi
 
-# ── 8. GroupOrchestrator ──────────────────────────────────────────────────────
+# ── 8. CC Bridge（飞书 ↔ Claude Code CLI）────────────────────────────────────
+if [[ $NO_FEISHU -eq 0 ]]; then
+  echo ""
+  info "启动 CC Bridge (飞书 ↔ Claude Code CLI)..."
+  nohup .venv/bin/python -m feishu.cc_bridge.main > "$LOG_DIR/cc_bridge.log" 2>&1 &
+  echo "cc_bridge $!" >> "$PID_FILE"
+  ok "CC Bridge PID=$!  (logs/cc_bridge.log)"
+fi
+
+# ── 9. GroupOrchestrator ──────────────────────────────────────────────────────
 echo ""
 info "启动 GroupOrchestrator（群聊调度器）..."
 nohup .venv/bin/python -m group_chat.orchestrator > "$LOG_DIR/orchestrator.log" 2>&1 &

@@ -1,0 +1,262 @@
+"""
+Claude Code CLI 子进程管理。
+
+每个用户维持一个会话（session），通过 --resume 复用上下文。
+支持流式读取输出、中止任务、切换工作目录。
+"""
+import asyncio
+import io
+import json
+import logging
+import os
+import tempfile
+from pathlib import Path
+
+from PIL import Image
+
+log = logging.getLogger("cc_bridge.runner")
+
+DEFAULT_CWD = "/Users/liyijiang/work/company"
+ALLOWED_CWD_PREFIX = "/Users/liyijiang/work/"
+CLAUDE_BIN = "/usr/local/bin/claude"
+MAX_TIMEOUT = 600  # 10 分钟
+
+# 工具图标映射
+TOOL_ICONS = {
+    "Bash": "💻",
+    "Read": "📖",
+    "Write": "✏️",
+    "Edit": "✏️",
+    "MultiEdit": "✏️",
+    "Glob": "🔍",
+    "Grep": "🔍",
+    "Agent": "🤖",
+    "WebFetch": "🌐",
+    "WebSearch": "🌐",
+    "TodoWrite": "📋",
+}
+
+
+def _tool_summary(name: str, input_dict: dict) -> str:
+    """生成工具调用的简洁摘要（含图标）。"""
+    icon = TOOL_ICONS.get(name, "🔧")
+    if name == "Bash":
+        cmd = input_dict.get("command", "").replace("\n", " ").strip()
+        summary = cmd[:60] + "…" if len(cmd) > 60 else cmd
+        return f"{icon} `{summary}`"
+    elif name in ("Read", "Write", "Edit", "MultiEdit"):
+        path = input_dict.get("file_path", input_dict.get("path", ""))
+        return f"{icon} `{Path(path).name if path else '?'}`"
+    elif name in ("Glob", "Grep"):
+        pattern = input_dict.get("pattern", "")
+        return f"{icon} `{pattern[:40]}`"
+    elif name == "Agent":
+        desc = input_dict.get("description", "subagent")
+        return f"{icon} {desc[:40]}"
+    else:
+        return f"{icon} {name}"
+
+
+def compress_image(image_bytes: bytes, max_side: int = 1568) -> bytes:
+    """压缩图片到 max_side×max_side 以内，返回 JPEG bytes。"""
+    img = Image.open(io.BytesIO(image_bytes)).convert("RGB")
+    w, h = img.size
+    if max(w, h) > max_side:
+        ratio = max_side / max(w, h)
+        img = img.resize((int(w * ratio), int(h * ratio)), Image.LANCZOS)
+    buf = io.BytesIO()
+    img.save(buf, format="JPEG", quality=85)
+    return buf.getvalue()
+
+
+class ClaudeRunner:
+    """管理 Claude Code CLI 子进程，一个用户一个实例。"""
+
+    def __init__(self):
+        self.cwd: str = DEFAULT_CWD
+        self.session_id: str | None = None
+        self._process: asyncio.subprocess.Process | None = None
+
+    def set_cwd(self, path: str) -> str | None:
+        """切换工作目录，返回错误信息或 None。"""
+        path = os.path.expanduser(path)
+        if not path.startswith(ALLOWED_CWD_PREFIX):
+            return f"不允许的路径，必须在 {ALLOWED_CWD_PREFIX} 下"
+        if not os.path.isdir(path):
+            return f"目录不存在: {path}"
+        self.cwd = path
+        return None
+
+    def new_session(self):
+        """新建会话，清空 session_id。"""
+        self.session_id = None
+
+    async def stop(self):
+        """中止当前正在运行的 Claude 进程。"""
+        if self._process and self._process.returncode is None:
+            self._process.terminate()
+            try:
+                await asyncio.wait_for(self._process.wait(), timeout=5)
+            except asyncio.TimeoutError:
+                self._process.kill()
+            self._process = None
+            return True
+        return False
+
+    async def run(
+        self,
+        prompt: str,
+        image_paths: list[str] | None = None,
+        on_chunk: callable = None,
+        on_tool_start: callable = None,
+        on_tool_result: callable = None,
+    ) -> tuple[str, list[str]]:
+        """
+        执行 Claude Code CLI，流式返回结果。
+
+        on_chunk(text, tool_log, current_tool, force): 中间状态回调。
+        返回 (最终文本, 工具调用日志列表)。
+        """
+        cmd = [CLAUDE_BIN, "-p", "--output-format", "stream-json", "--verbose"]
+
+        if self.session_id:
+            cmd.extend(["--resume", self.session_id])
+
+        # 图片：告知 Claude 文件路径，由其 Read 工具读取（支持多模态）
+        if image_paths:
+            paths_str = "\n".join(f"- {p}" for p in image_paths)
+            prompt = f"请先用 Read 工具读取以下图片文件，然后再回答：\n{paths_str}\n\n用户问题：{prompt}"
+
+        cmd.append(prompt)
+
+        log.info("执行: cwd=%s cmd=%s", self.cwd, " ".join(cmd[:6]) + "...")
+
+        # limit=4MB：claude 的 system init 行包含所有 slash_commands，远超默认 64KB
+        _limit = 4 * 1024 * 1024
+        self._process = await asyncio.create_subprocess_exec(
+            *cmd,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+            cwd=self.cwd,
+            limit=_limit,
+        )
+
+        accumulated = []
+        tool_log: list[str] = []       # 已完成的工具调用（含图标）
+        current_tool: str | None = None  # 当前进行中的工具
+        result_text = ""
+        new_session_id = None
+
+        try:
+            async def read_stream():
+                nonlocal result_text, new_session_id, current_tool
+                last_callback_len = 0
+
+                while True:
+                    line = await asyncio.wait_for(
+                        self._process.stdout.readline(), timeout=MAX_TIMEOUT
+                    )
+                    if not line:
+                        break
+                    line = line.decode("utf-8", errors="replace").strip()
+                    if not line:
+                        continue
+                    try:
+                        event = json.loads(line)
+                    except json.JSONDecodeError:
+                        continue
+
+                    if event.get("session_id"):
+                        new_session_id = event["session_id"]
+
+                    if event.get("type") == "assistant":
+                        msg = event.get("message", {})
+                        for block in msg.get("content", []):
+                            if not isinstance(block, dict):
+                                continue
+                            if block.get("type") == "text":
+                                accumulated.append(block["text"])
+                            elif block.get("type") == "tool_use":
+                                if current_tool:
+                                    tool_log.append(f"✅ {current_tool}")
+                                tool_id = block.get("id", "")
+                                name = block.get("name", "?")
+                                input_dict = block.get("input", {})
+                                current_tool = _tool_summary(name, input_dict)
+                                log.info("工具调用: %s", current_tool)
+                                if on_tool_start:
+                                    await on_tool_start(tool_id, name, input_dict)
+                                elif on_chunk:
+                                    await on_chunk(
+                                        "".join(accumulated),
+                                        list(tool_log),
+                                        current_tool,
+                                        True,
+                                    )
+
+                    elif event.get("type") == "user":
+                        msg = event.get("message", {})
+                        for block in msg.get("content", []):
+                            if not isinstance(block, dict):
+                                continue
+                            if block.get("type") == "tool_result" and on_tool_result:
+                                tool_use_id = block.get("tool_use_id", "")
+                                raw = block.get("content", [])
+                                if isinstance(raw, list):
+                                    tr_text = "\n".join(
+                                        c.get("text", "")
+                                        for c in raw
+                                        if isinstance(c, dict) and c.get("type") == "text"
+                                    )
+                                elif isinstance(raw, str):
+                                    tr_text = raw
+                                else:
+                                    tr_text = ""
+                                if tool_use_id:
+                                    await on_tool_result(tool_use_id, tr_text)
+
+                    if event.get("type") == "result":
+                        result_text = event.get("result", "")
+
+                    # 文本累积到 200 字时触发普通更新
+                    current_text = "".join(accumulated)
+                    if on_chunk and len(current_text) - last_callback_len >= 200:
+                        last_callback_len = len(current_text)
+                        await on_chunk(current_text, list(tool_log), current_tool, False)
+
+            async def drain_stderr():
+                err = await self._process.stderr.read()
+                if err:
+                    log.warning(
+                        "claude stderr: %s",
+                        err.decode("utf-8", errors="replace")[:500],
+                    )
+
+            await asyncio.gather(read_stream(), drain_stderr())
+            await self._process.wait()
+
+        except asyncio.TimeoutError:
+            log.warning("Claude 执行超时，终止进程")
+            await self.stop()
+            result_text = "".join(accumulated) + "\n\n⚠️ 执行超时（10分钟），已中止。"
+
+        finally:
+            self._process = None
+
+        # 最后一个工具完成
+        if current_tool:
+            tool_log.append(f"✅ {current_tool}")
+
+        if new_session_id:
+            self.session_id = new_session_id
+
+        final = result_text or "".join(accumulated)
+        return (final.strip() if final else "(无输出)"), tool_log
+
+
+def save_temp_image(image_bytes: bytes) -> str:
+    """将图片保存到临时文件，返回路径。"""
+    fd, path = tempfile.mkstemp(suffix=".jpg", prefix="cc_bridge_")
+    os.write(fd, image_bytes)
+    os.close(fd)
+    return path
