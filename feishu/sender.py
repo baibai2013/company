@@ -126,6 +126,8 @@ def _parse_md_table(lines: list[str]) -> dict:
 
 def _sanitize_md(text: str) -> str:
     """Convert lark_md-unsupported syntax to supported equivalents."""
+    # lark_md 不支持 HTML 标签，转义 < 避免 Feishu API 报 11310
+    text = re.sub(r'<(/?\w[\w\s="\'.\-:]*?)>', r'&lt;\1&gt;', text)
     lines = []
     for line in text.split('\n'):
         if line.startswith('> '):
