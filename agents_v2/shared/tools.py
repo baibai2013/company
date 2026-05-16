@@ -9,10 +9,25 @@ from __future__ import annotations
 
 import json
 import subprocess
+from dataclasses import dataclass
+from enum import Enum
 from pathlib import Path
 
 import psutil
 from langchain_core.tools import tool
+
+
+class ToolType(Enum):
+    QUERY  = "query"    # 查询类：结果需要 LLM 解读再回复
+    ACTION = "action"   # 执行类：操作完成即结束，不触发 LLM 汇总
+    HYBRID = "hybrid"   # 混合类：LLM 酌情回复
+
+
+@dataclass
+class ToolMeta:
+    tool: object
+    type: ToolType
+    hint: str           # 中文短描述，用于 _tools_hint
 
 COMPANY_DIR = Path(__file__).parent.parent.parent
 
@@ -432,20 +447,23 @@ def recall_history(offset: int = 20, count: int = 20) -> str:
 
 # ── 注册表 ───────────────────────────────────────────────────────────────────
 
-TOOL_REGISTRY: dict[str, object] = {
-    "run_command": run_command,
-    "read_file": read_file,
-    "write_file": write_file,
-    "get_metrics": get_metrics,
-    "schedule_task": schedule_task,
-    "cancel_scheduled_task": cancel_scheduled_task,
-    "list_scheduled_tasks": list_scheduled_tasks,
-    "send_feishu_message": send_feishu_message,
-    "send_group_chat_message": send_group_chat_message,
-    "recall_history": recall_history,
+TOOL_META: dict[str, ToolMeta] = {
+    "run_command":             ToolMeta(run_command,             ToolType.QUERY,  "执行 shell 命令"),
+    "read_file":               ToolMeta(read_file,               ToolType.QUERY,  "读取文件"),
+    "write_file":              ToolMeta(write_file,              ToolType.ACTION, "写入文件"),
+    "get_metrics":             ToolMeta(get_metrics,             ToolType.QUERY,  "获取系统指标"),
+    "schedule_task":           ToolMeta(schedule_task,           ToolType.ACTION, "创建定时任务/提醒"),
+    "cancel_scheduled_task":   ToolMeta(cancel_scheduled_task,   ToolType.ACTION, "取消任务"),
+    "list_scheduled_tasks":    ToolMeta(list_scheduled_tasks,    ToolType.HYBRID, "查看任务列表"),
+    "send_feishu_message":     ToolMeta(send_feishu_message,     ToolType.ACTION, "发送飞书消息"),
+    "send_group_chat_message": ToolMeta(send_group_chat_message, ToolType.ACTION, "发送看板群聊消息"),
+    "recall_history":          ToolMeta(recall_history,          ToolType.QUERY,  "检索历史对话"),
 }
+
+# 向后兼容
+TOOL_REGISTRY: dict[str, object] = {k: v.tool for k, v in TOOL_META.items()}
 
 
 def resolve_tools(names: list[str]) -> list:
     """从名称列表解析工具实例，忽略未知名称。"""
-    return [TOOL_REGISTRY[n] for n in names if n in TOOL_REGISTRY]
+    return [TOOL_META[n].tool for n in names if n in TOOL_META]

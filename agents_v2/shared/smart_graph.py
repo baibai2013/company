@@ -9,6 +9,8 @@
 配置：所有 LLM 调用的模型、温度、prompts 均从 registry 读取。
 节点在每次执行时实时读 config，所以 DB 修改后下次调用立刻生效。
 """
+import hashlib as _hashlib
+import time as _time
 from typing import Annotated, Any, Literal, TypedDict
 
 from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
@@ -16,6 +18,33 @@ from langgraph.graph import END, START, StateGraph
 from langgraph.graph.message import add_messages
 
 from agents_v2.shared.claude_client import make_langchain_llm
+
+# ── 路由缓存 ─────────────────────────────────────────────────────────────────
+# 相同文本的路由结果缓存 TTL=10 分钟，最多 200 条，LRU 淘汰
+
+_ROUTE_CACHE: dict[str, tuple[str, float]] = {}   # md5 → (route, expire_ts)
+_ROUTE_CACHE_TTL = 600      # 秒，10 分钟
+_ROUTE_CACHE_MAX = 200
+
+
+def _route_cache_get(text: str) -> str | None:
+    """返回缓存的路由结果，未命中或已过期返回 None。"""
+    key = _hashlib.md5(text.strip().lower().encode()).hexdigest()
+    entry = _ROUTE_CACHE.get(key)
+    if entry and _time.monotonic() < entry[1]:
+        return entry[0]
+    return None
+
+
+def _route_cache_set(text: str, route: str) -> None:
+    """写入缓存，超出上限时 LRU 淘汰最旧 10 条。"""
+    key = _hashlib.md5(text.strip().lower().encode()).hexdigest()
+    _ROUTE_CACHE[key] = (route, _time.monotonic() + _ROUTE_CACHE_TTL)
+    if len(_ROUTE_CACHE) > _ROUTE_CACHE_MAX:
+        to_drop = sorted(_ROUTE_CACHE, key=lambda k: _ROUTE_CACHE[k][1])[:10]
+        for k in to_drop:
+            _ROUTE_CACHE.pop(k, None)
+
 
 # Fallback prompts — used when registry doesn't supply a global override.
 
@@ -85,7 +114,20 @@ def _load_config(employee_key: str):
 
 
 def _llm_for(employee_key: str, call_type: str, default_model: str = "claude-sonnet-4-6"):
-    """Build a ChatAnthropic for a specific call_type. Reads model + temperature + max_tokens from registry."""
+    """Build a ChatAnthropic for a specific call_type.
+    优先级：session_config.llm_calls > DB registry > default_model。
+    """
+    from agents_v2.shared.runner import current_session_config
+    session_cfg = current_session_config.get({})  # type: ignore[call-arg]
+    session_llm = session_cfg.get("llm_calls", {})
+    if session_llm.get(call_type):
+        c = session_llm[call_type]
+        return make_langchain_llm(
+            model=c.get("model") or default_model,
+            temperature=c.get("temperature"),
+            max_tokens=c.get("max_tokens"),
+        )
+
     cfg = _load_config(employee_key)
     if cfg and cfg.llm_calls.get(call_type):
         c = cfg.llm_calls[call_type]
@@ -98,12 +140,34 @@ def _llm_for(employee_key: str, call_type: str, default_model: str = "claude-son
 
 
 def _system_prompt_for(employee_key: str, suffix: str = "", query: str = "") -> str:
-    """构建 system prompt，并注入长期记忆。
-
-    query 非空时做语义检索（pgvector），为空时回退最近 N 条。
+    """构建 system prompt。
+    优先级：session_config.system_prompt > DB registry > ""
+    追加：session_config.system_prompt_suffix > source 渠道提示 > 长期记忆 > suffix
     """
-    cfg = _load_config(employee_key)
-    base = cfg.system_prompt if cfg else ""
+    from agents_v2.shared.runner import current_session_config
+    session_cfg = current_session_config.get({})  # type: ignore[call-arg]
+
+    # system_prompt 覆盖
+    if session_cfg.get("system_prompt"):
+        base = session_cfg["system_prompt"]
+    else:
+        cfg = _load_config(employee_key)
+        base = cfg.system_prompt if cfg else ""
+
+    # system_prompt_suffix 追加
+    if session_cfg.get("system_prompt_suffix"):
+        base = (base or "") + "\n\n" + session_cfg["system_prompt_suffix"]
+
+    # source 渠道提示
+    source = session_cfg.get("source", "")
+    if source == "feishu_p2p":
+        source_hint = "\n\n【当前为飞书单聊，回复简洁口语化，不超过200字】"
+    elif source in ("feishu_group", "kanban"):
+        source_hint = "\n\n【当前为群聊，回复可适当正式，注意其他人也能看到】"
+    elif source == "scheduler":
+        source_hint = "\n\n【当前为定时任务触发，可以输出较完整的结构化内容】"
+    else:
+        source_hint = ""
 
     try:
         from backend.repos import memory_repo
@@ -116,7 +180,7 @@ def _system_prompt_for(employee_key: str, suffix: str = "", query: str = "") -> 
     except Exception:
         pass
 
-    return (base or "") + suffix
+    return (base or "") + source_hint + suffix
 
 
 def _global_prompt(employee_key: str, name: str, fallback: str) -> str:
@@ -135,10 +199,17 @@ def _route_node(state: SmartState, employee_key: str) -> dict:
     text = _text_only(state["task_input"])
     if not text:
         return {"route": "WORK"}
+
+    # 缓存命中：跳过 LLM
+    cached = _route_cache_get(text)
+    if cached:
+        return {"route": cached}
+
     llm = _llm_for(employee_key, "route", default_model="claude-haiku-4-5-20251001")
     prompt = _global_prompt(employee_key, "route_prompt", _DEFAULT_ROUTE_PROMPT)
     resp = llm.invoke([SystemMessage(prompt), HumanMessage(text)])
     route = "CHAT" if "CHAT" in resp.content.upper() else "WORK"
+    _route_cache_set(text, route)
     return {"route": route}
 
 
@@ -180,20 +251,28 @@ def _execute_node(state: SmartState, employee_key: str) -> dict:
 
 
 def _tools_hint(tools: list) -> str:
-    """告知 LLM 当前已绑定的工具，避免它否认自身能力。"""
+    """告知 LLM 当前已绑定的工具，描述从 ToolMeta 自动读取。"""
     if not tools:
         return ""
-    desc = {
-        "schedule_task": "创建定时任务/提醒",
-        "cancel_scheduled_task": "取消任务",
-        "list_scheduled_tasks": "查看任务列表",
-        "run_command": "执行 shell 命令",
-        "read_file": "读取文件",
-        "write_file": "写入文件",
-        "get_metrics": "获取系统指标",
-    }
-    items = [f"`{t.name}`（{desc.get(t.name, t.description[:20])}）" for t in tools]
+    from agents_v2.shared.tools import TOOL_META
+    items = []
+    for t in tools:
+        meta = TOOL_META.get(t.name)
+        hint = meta.hint if meta else t.description[:20]
+        items.append(f"`{t.name}`（{hint}）")
     return "\n\n你当前已绑定工具：" + "、".join(items) + "。用户询问相关能力时请如实告知并直接调用。"
+
+
+def _is_all_action(tool_calls: list, tools: list) -> bool:
+    """判断本轮所有工具调用是否都是 ACTION 类型（执行完即结束）。"""
+    from agents_v2.shared.tools import TOOL_META, ToolType
+    if not tool_calls:
+        return False
+    for tc in tool_calls:
+        meta = TOOL_META.get(tc["name"])
+        if not meta or meta.type != ToolType.ACTION:
+            return False
+    return True
 
 
 def _react_node(state: SmartState, employee_key: str, tools: list, max_rounds: int = 8) -> dict:
@@ -232,8 +311,17 @@ def _react_node(state: SmartState, employee_key: str, tools: list, max_rounds: i
         None,
     )
     if not final:
-        summary = llm.invoke(messages)
-        final = summary.content or "操作完成"
+        # ACTION 工具执行完不需要 LLM 再汇总
+        last_tool_calls = next(
+            (m.tool_calls for m in reversed(messages)
+             if isinstance(m, AIMessage) and m.tool_calls),
+            [],
+        )
+        if _is_all_action(last_tool_calls, tools):
+            final = "操作已完成"
+        else:
+            summary = llm.invoke(messages)
+            final = summary.content or "操作完成"
     # 把本轮对话写入历史：只保留无 tool_calls 的 AI 回复，避免孤立的 tool_use 块
     exchange = [
         m for m in messages[len(history) + 1:]
@@ -275,6 +363,14 @@ def _react_chat_node(state: SmartState, employee_key: str, tools: list) -> dict:
          if isinstance(m, AIMessage) and not m.tool_calls and m.content),
         None,
     )
+    if not final:
+        last_tool_calls = next(
+            (m.tool_calls for m in reversed(messages)
+             if isinstance(m, AIMessage) and m.tool_calls),
+            [],
+        )
+        if _is_all_action(last_tool_calls, tools):
+            final = "操作已完成"
     # 把本轮对话写入历史：只保留无 tool_calls 的 AI 回复，避免历史里出现孤立的 tool_use 块
     exchange = [
         m for m in messages[len(history) + 1:]

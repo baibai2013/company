@@ -9,6 +9,7 @@ import json
 import logging
 import time as _time
 from contextvars import ContextVar
+from typing import TypedDict
 
 import redis.asyncio as aioredis
 
@@ -19,6 +20,19 @@ current_feishu_chat_id: ContextVar[str] = ContextVar("feishu_chat_id", default="
 
 # 当前对话的 LangGraph thread_id —— 供 recall_history 工具读取
 current_thread_id: ContextVar[str] = ContextVar("thread_id", default="")
+
+
+class SessionConfig(TypedDict, total=False):
+    system_prompt: str          # 覆盖 employee 的全局 system_prompt
+    system_prompt_suffix: str   # 追加到 system_prompt 末尾（不覆盖）
+    source: str                 # 请求来源：feishu_p2p | feishu_group | kanban | scheduler
+    llm_calls: dict             # 覆盖特定 call_type 的模型配置
+
+
+# 当前请求的会话级配置覆盖（仅作用于本次调用链，不修改 DB）
+current_session_config: ContextVar[SessionConfig] = ContextVar(
+    "session_config", default={}  # type: ignore[arg-type]
+)
 
 # 进程内消息缓存：thread_id → 完整 messages 列表（每次 run_with_events 完成后更新）
 _thread_history: dict[str, list] = {}
@@ -70,10 +84,11 @@ async def run_with_events(
     image_base64 = ctx.get("image_base64", "")
     image_media_type = ctx.get("image_media_type", "image/jpeg")
 
-    # 注入 ContextVar：chat_id 供发消息工具用，thread_id 供 recall_history 工具用
+    # 注入 ContextVar：chat_id / thread_id / session_config
     _chat_token = current_feishu_chat_id.set(ctx.get("chat_id", ""))
     _thread = config.get("configurable", {}).get("thread_id", task_id)
     _thread_token = current_thread_id.set(_thread)
+    _session_token = current_session_config.set(ctx.get("session_config", {}))  # type: ignore[arg-type]
 
     # 压缩图片到 Claude 推荐的最大尺寸（避免超 token 限制）
     if image_base64:
@@ -156,6 +171,7 @@ async def run_with_events(
     except Exception:
         pass
 
+    current_session_config.reset(_session_token)
     current_feishu_chat_id.reset(_chat_token)
     current_thread_id.reset(_thread_token)
     return result_data

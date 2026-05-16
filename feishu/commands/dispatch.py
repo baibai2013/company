@@ -21,7 +21,8 @@ EMPLOYEE_PORTS = {
 
 
 async def handle_dispatch(employee: str, task: str, task_id: str = "default", chat_id: str = "",
-                          image_base64: str = "", image_media_type: str = "image/jpeg") -> dict:
+                          image_base64: str = "", image_media_type: str = "image/jpeg",
+                          session_config: dict | None = None) -> dict:
     port = EMPLOYEE_PORTS.get(employee)
     if not port:
         return {"route": "WORK", "plan": "", "result": f"❌ 未知员工: {employee}"}
@@ -31,6 +32,8 @@ async def handle_dispatch(employee: str, task: str, task_id: str = "default", ch
         if image_base64:
             context["image_base64"] = image_base64
             context["image_media_type"] = image_media_type
+        if session_config:
+            context["session_config"] = session_config
         raw = await call_agent(url, task, context=context)
         try:
             data = json.loads(raw)

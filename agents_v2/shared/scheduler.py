@@ -272,6 +272,18 @@ class AgentScheduler:
                         remaining = delay_seconds
                 else:
                     remaining = delay_seconds
+
+                # Bug fix: 一次性任务且 fire_at 已过，且 last_run_at 有值说明已执行过
+                # 跳过重复执行，直接清理，避免每次重启重复触发
+                last_run_at_str = cfg.get("last_run_at")
+                if once and remaining < 0 and last_run_at_str:
+                    log.info(
+                        "[%s] one-shot task %s: already executed at %s, skipping re-execution",
+                        self.key, task_id, last_run_at_str[:19],
+                    )
+                    await self._auto_delete(task_id)
+                    return
+
                 self._status[task_id]["next_run"] = (
                     datetime.now(timezone.utc) + __import__('datetime').timedelta(seconds=max(remaining, 0))
                 ).isoformat()
@@ -305,6 +317,10 @@ class AgentScheduler:
                             gap_s,
                         )
                         await self._execute(task_id, cfg)
+                        # Bug fix: once=True 的 cron 任务补跑后立即删除，不能 fall-through 到 while 再触发一次
+                        if once:
+                            await self._auto_delete(task_id)
+                            return
                 except Exception as e:
                     log.warning("[%s] catch-up check failed for %s: %s", self.key, task_id, e)
 
@@ -541,6 +557,7 @@ class AgentScheduler:
         context = {
             "task_id": f"sched_{task_id}_{int(datetime.now(timezone.utc).timestamp())}",
             "chat_id": feishu_chat_id,
+            "session_config": {"source": "scheduler"},
         }
 
         coro = self.agent_fn(full_prompt, context)
