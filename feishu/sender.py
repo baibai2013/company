@@ -25,10 +25,18 @@ from lark_oapi.api.im.v1 import (
 log = logging.getLogger("feishu.sender")
 
 def make_client() -> lark.Client:
+    # 优先从 pydantic settings 读取（已从 infra/.env 加载），fallback 到 os.getenv
+    try:
+        from backend.core.config import settings as _s
+        app_id = _s.FEISHU_APP_ID or os.getenv("FEISHU_APP_ID", "")
+        app_secret = _s.FEISHU_APP_SECRET or os.getenv("FEISHU_APP_SECRET", "")
+    except Exception:
+        app_id = os.getenv("FEISHU_APP_ID", "")
+        app_secret = os.getenv("FEISHU_APP_SECRET", "")
     return (
         lark.Client.builder()
-        .app_id(os.getenv("FEISHU_APP_ID", ""))
-        .app_secret(os.getenv("FEISHU_APP_SECRET", ""))
+        .app_id(app_id)
+        .app_secret(app_secret)
         .log_level(lark.LogLevel.WARNING)
         .build()
     )

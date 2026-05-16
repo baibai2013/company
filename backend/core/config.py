@@ -11,6 +11,9 @@ class Settings(BaseSettings):
     REDIS_URL: str = "redis://localhost:6379/0"
     OPENAI_API_KEY: str = ""   # 用于 text-embedding-3-small；留空则跳过语义检索
     OPENAI_BASE_URL: str = ""  # 代理地址，如 https://your-proxy.com/v1；留空走官方
+    FEISHU_CHAT_ID: str = ""       # 定时任务 output_to=feishu 的默认推送群
+    FEISHU_APP_ID: str = ""        # 飞书应用 App ID
+    FEISHU_APP_SECRET: str = ""    # 飞书应用 App Secret
 
     model_config = {
         "env_file": str(Path(__file__).parent.parent.parent / "infra" / ".env"),

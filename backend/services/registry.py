@@ -34,6 +34,7 @@ _global: dict[str, Any] = {}           # full system_config dict
 _loaded = False
 _lock = asyncio.Lock()
 _listener_task: asyncio.Task | None = None
+_change_hooks: list = []               # (key_or_None) -> None async callbacks
 
 
 # ── Effective config dataclass ────────────────────────────────────────────────
@@ -289,11 +290,21 @@ def _jsonable(v):
 
 # ── Cache invalidation (manual + LISTEN/NOTIFY) ───────────────────────────────
 
+def register_change_hook(fn) -> None:
+    """注册配置变更回调。fn(key) 在 PG NOTIFY 或手动 invalidate 后被调用。"""
+    _change_hooks.append(fn)
+
+
 async def invalidate(key: str | None) -> None:
     """Force a reload on next access. Pass None for global change."""
     global _loaded
     _loaded = False
     log.debug("registry cache invalidated (key=%s)", key)
+    for hook in list(_change_hooks):
+        try:
+            await hook(key)
+        except Exception as e:
+            log.warning("change hook error: %s", e)
 
 
 async def _listen_loop() -> None:

@@ -1,7 +1,7 @@
 <template>
   <div class="detail-view" v-loading="loading">
     <header class="detail-header">
-      <el-button @click="$router.back()" size="small">← 返回</el-button>
+      <el-button @click="$router.push('/?tab=team')" size="small">← 返回</el-button>
       <div v-if="emp" class="title-block">
         <span class="big-emoji">{{ form.emoji || emp.emoji }}</span>
         <div class="title-text">
@@ -57,18 +57,47 @@
         <el-descriptions :column="2" border size="small">
           <el-descriptions-item label="Agent PID">{{ emp.agent_status?.pid ?? '—' }}</el-descriptions-item>
           <el-descriptions-item label="Agent 端口">
-            {{ emp.agent_port ?? '—' }}
-            <el-tag v-if="emp.agent_status?.listening" size="small" type="success" style="margin-left: 8px">监听中</el-tag>
-            <el-tag v-else size="small" type="info" style="margin-left: 8px">未监听</el-tag>
+            <template v-if="!editing">
+              {{ emp.agent_port ?? '—' }}
+              <el-tag v-if="emp.agent_status?.listening" size="small" type="success" style="margin-left: 8px">监听中</el-tag>
+              <el-tag v-else size="small" type="info" style="margin-left: 8px">未监听</el-tag>
+            </template>
+            <el-input-number
+              v-else
+              v-model="form.agent_port"
+              :min="9010" :max="9100" :controls="false"
+              size="small" style="width: 100px"
+              placeholder="自动分配"
+            />
           </el-descriptions-item>
           <el-descriptions-item label="Bot PID">{{ emp.bot_status?.pid ?? '—' }}</el-descriptions-item>
           <el-descriptions-item label="飞书凭证">
-            <el-tag v-if="emp.bot_status?.has_credentials" size="small" type="success">已配置</el-tag>
-            <el-tag v-else size="small" type="info">未配置</el-tag>
-            <span v-if="emp.feishu_app_id" class="appid">{{ emp.feishu_app_id }}</span>
+            <template v-if="!editing">
+              <el-tag v-if="emp.bot_status?.has_credentials" size="small" type="success">已配置</el-tag>
+              <el-tag v-else size="small" type="info">未配置</el-tag>
+              <span v-if="emp.feishu_app_id" class="appid">{{ emp.feishu_app_id }}</span>
+            </template>
+            <el-input
+              v-else
+              v-model="form.feishu_app_id"
+              size="small"
+              placeholder="cli_xxxxxxxxxxxxxxx"
+              style="width: 220px"
+            />
           </el-descriptions-item>
           <el-descriptions-item label="App Secret">
-            <span class="redacted">{{ emp.feishu_app_secret || '—' }}</span>
+            <template v-if="!editing">
+              <span class="redacted">{{ emp.feishu_app_secret || '—' }}</span>
+            </template>
+            <el-input
+              v-else
+              v-model="form.feishu_app_secret"
+              size="small"
+              type="password"
+              show-password
+              placeholder="留空则不修改"
+              style="width: 220px"
+            />
           </el-descriptions-item>
           <el-descriptions-item label="版本">v{{ emp.version }}</el-descriptions-item>
         </el-descriptions>
@@ -241,6 +270,9 @@ interface EditForm {
   emoji: string
   role_desc: string
   system_prompt: string
+  agent_port: number | null
+  feishu_app_id: string
+  feishu_app_secret: string
   persona: Record<string, any>
   llm_calls: Record<string, Record<string, any>>
   behavior: Record<string, boolean>
@@ -248,6 +280,7 @@ interface EditForm {
 
 const form = ref<EditForm>({
   name: '', emoji: '', role_desc: '', system_prompt: '',
+  agent_port: null, feishu_app_id: '', feishu_app_secret: '',
   persona: {}, llm_calls: {}, behavior: {},
 })
 const personalityText = ref('')
@@ -356,6 +389,9 @@ function snapshotForm() {
     emoji: e.emoji || '',
     role_desc: e.role_desc || '',
     system_prompt: e.system_prompt || '',
+    agent_port: e.agent_port ?? null,
+    feishu_app_id: e.feishu_app_id || '',
+    feishu_app_secret: '',  // 不回填密钥，留空=不修改
     persona: personaCopy,
     llm_calls: llmCallsCopy,
     behavior: behaviorCopy,
@@ -397,6 +433,9 @@ async function saveEdit() {
   if (form.value.emoji !== (e.emoji ?? '')) patch.emoji = form.value.emoji
   if (form.value.role_desc !== (e.role_desc ?? '')) patch.role_desc = form.value.role_desc
   if (form.value.system_prompt !== (e.system_prompt ?? '')) patch.system_prompt = form.value.system_prompt
+  if (form.value.agent_port !== (e.agent_port ?? null)) patch.agent_port = form.value.agent_port
+  if (form.value.feishu_app_id !== (e.feishu_app_id ?? '')) patch.feishu_app_id = form.value.feishu_app_id
+  if (form.value.feishu_app_secret) patch.feishu_app_secret = form.value.feishu_app_secret
   if (canon(form.value.persona)   !== canon(e.persona ?? {}))   patch.persona   = form.value.persona
   if (canon(form.value.llm_calls) !== canon(e.llm_calls ?? {})) patch.llm_calls = form.value.llm_calls
   if (canon(form.value.behavior)  !== canon(e.behavior ?? {}))  patch.behavior  = form.value.behavior

@@ -62,25 +62,14 @@ def _human_msg(task_input: Any, prefix: str = "") -> HumanMessage:
 
 
 def _load_config(employee_key: str):
-    """Read EffectiveConfig from registry. Lazy warmup + start LISTEN on first event-loop access."""
-    import asyncio
+    """Read EffectiveConfig from registry (in-memory cache only — no DB calls).
+
+    Agent processes pre-warm the registry at startup. Calling warmup_sync() or
+    any async DB path here would create a new asyncio event loop in the thread
+    pool executor, which conflicts with the shared asyncpg connection pool and
+    causes 'another operation is in progress' errors.
+    """
     from backend.services import registry
-
-    if not registry._loaded:  # type: ignore[attr-defined]
-        try:
-            registry.warmup_sync()
-        except RuntimeError:
-            pass
-
-    # If we're inside an event loop and the registry listener hasn't started,
-    # spawn it so this process gets PG NOTIFY hot-reloads.
-    if not registry._listener_task or registry._listener_task.done():  # type: ignore[attr-defined]
-        try:
-            asyncio.get_running_loop()
-            registry.start_listener()
-        except RuntimeError:
-            pass
-
     return registry.get_effective_sync(employee_key)
 
 
@@ -107,10 +96,9 @@ def _system_prompt_for(employee_key: str, suffix: str = "", query: str = "") -> 
 
     try:
         from backend.repos import memory_repo
-        if query:
-            memories = memory_repo.search_semantic_sync(employee_key, query, limit=5)
-        else:
-            memories = memory_repo.get_sync(employee_key)[:5]
+        # Always use in-memory cache (get_sync) — avoid asyncio.run() in thread
+        # pool context which conflicts with the shared asyncpg connection pool.
+        memories = memory_repo.get_sync(employee_key)[:5]
         if memories:
             mem_block = "\n".join(f"- {m[:200]}" for m in memories)
             base = (base or "") + f"\n\n【近期参与的讨论（供参考）】\n{mem_block}"
@@ -174,6 +162,93 @@ def _execute_node(state: SmartState, employee_key: str) -> dict:
     return {"execution_result": resp.content}
 
 
+def _tools_hint(tools: list) -> str:
+    """告知 LLM 当前已绑定的工具，避免它否认自身能力。"""
+    if not tools:
+        return ""
+    desc = {
+        "schedule_task": "创建定时任务/提醒",
+        "cancel_scheduled_task": "取消任务",
+        "list_scheduled_tasks": "查看任务列表",
+        "run_command": "执行 shell 命令",
+        "read_file": "读取文件",
+        "write_file": "写入文件",
+        "get_metrics": "获取系统指标",
+    }
+    items = [f"`{t.name}`（{desc.get(t.name, t.description[:20])}）" for t in tools]
+    return "\n\n你当前已绑定工具：" + "、".join(items) + "。用户询问相关能力时请如实告知并直接调用。"
+
+
+def _react_node(state: SmartState, employee_key: str, tools: list, max_rounds: int = 8) -> dict:
+    """ReAct 工具调用循环 — 带工具的 execute node。"""
+    from langchain_core.messages import AIMessage, ToolMessage as TM
+
+    query = _text_only(state["task_input"])
+    llm = _llm_for(employee_key, "execute", default_model="claude-opus-4-6").bind_tools(tools)
+    tool_map = {t.name: t for t in tools}
+
+    plan_prefix = f"执行方案：{state['plan']}\n\n" if state.get("plan") else ""
+    messages = [
+        SystemMessage(_system_prompt_for(employee_key, _tools_hint(tools), query=query)),
+        _human_msg(state["task_input"], prefix=f"{plan_prefix}原始需求：\n"),
+    ]
+
+    for _ in range(max_rounds):
+        resp = llm.invoke(messages)
+        messages.append(resp)
+
+        if not resp.tool_calls:
+            break
+
+        for tc in resp.tool_calls:
+            tool_fn = tool_map.get(tc["name"])
+            result = tool_fn.invoke(tc["args"]) if tool_fn else f"未知工具: {tc['name']}"
+            messages.append(TM(content=str(result), tool_call_id=tc["id"]))
+
+    # 取最后一条 AI 文本回复
+    final = next(
+        (m.content for m in reversed(messages)
+         if isinstance(m, AIMessage) and not m.tool_calls and m.content),
+        None,
+    )
+    if not final:
+        summary = llm.invoke(messages)
+        final = summary.content or "操作完成"
+    return {"execution_result": final}
+
+
+def _react_chat_node(state: SmartState, employee_key: str, tools: list) -> dict:
+    """带工具的 chat node — 闲聊时也可调用工具。"""
+    from langchain_core.messages import AIMessage, ToolMessage as TM
+
+    suffix = _global_prompt(employee_key, "chat_suffix", _DEFAULT_CHAT_SUFFIX)
+    query = _text_only(state["task_input"])
+    llm = _llm_for(employee_key, "chat", default_model="claude-sonnet-4-6").bind_tools(tools)
+    tool_map = {t.name: t for t in tools}
+
+    messages = [
+        SystemMessage(_system_prompt_for(employee_key, suffix + _tools_hint(tools), query=query)),
+        _human_msg(state["task_input"]),
+    ]
+
+    for _ in range(4):
+        resp = llm.invoke(messages)
+        messages.append(resp)
+        if not resp.tool_calls:
+            break
+        for tc in resp.tool_calls:
+            tool_fn = tool_map.get(tc["name"])
+            result = tool_fn.invoke(tc["args"]) if tool_fn else f"未知工具: {tc['name']}"
+            messages.append(TM(content=str(result), tool_call_id=tc["id"]))
+
+    final = next(
+        (m.content for m in reversed(messages)
+         if isinstance(m, AIMessage) and not m.tool_calls and m.content),
+        None,
+    )
+    return {"execution_result": final or ""}
+
+
 def _valid_employees() -> set[str]:
     from backend.services import registry
     if not registry._loaded:  # type: ignore[attr-defined]
@@ -208,13 +283,14 @@ def _decide_after_route(state: SmartState) -> Literal["chat", "plan"]:
 
 # ── Public builder ───────────────────────────────────────────────────────────
 
-def build_smart_agent(employee_key_or_prompt, checkpointer, cc_prompt: str = ""):
+def build_smart_agent(employee_key_or_prompt, checkpointer, cc_prompt: str = "", tools: list | None = None):
     """Build the routing graph for an employee.
 
     Two call shapes (the first is the new one; the second is kept for
     backwards compatibility with code that still passes a system_prompt):
 
         build_smart_agent("mechanical", checkpointer)
+        build_smart_agent("mechanical", checkpointer, tools=[run_command, ...])
         build_smart_agent(SYSTEM_PROMPT_TEXT, checkpointer)  # legacy
     """
     from functools import partial
@@ -228,10 +304,16 @@ def build_smart_agent(employee_key_or_prompt, checkpointer, cc_prompt: str = "")
     employee_key = arg
 
     g = StateGraph(SmartState)
-    g.add_node("route",   partial(_route_node,   employee_key=employee_key))
-    g.add_node("chat",    partial(_chat_node,    employee_key=employee_key))
-    g.add_node("plan",    partial(_plan_node,    employee_key=employee_key))
-    g.add_node("execute", partial(_execute_node, employee_key=employee_key))
+    g.add_node("route", partial(_route_node, employee_key=employee_key))
+    g.add_node("plan",  partial(_plan_node,  employee_key=employee_key))
+
+    # 有工具时用 ReAct 循环，无工具时用纯 LLM
+    if tools:
+        g.add_node("chat",    partial(_react_chat_node, employee_key=employee_key, tools=tools))
+        g.add_node("execute", partial(_react_node,      employee_key=employee_key, tools=tools))
+    else:
+        g.add_node("chat",    partial(_chat_node,    employee_key=employee_key))
+        g.add_node("execute", partial(_execute_node, employee_key=employee_key))
 
     g.add_edge(START, "route")
     g.add_conditional_edges("route", _decide_after_route, {"chat": "chat", "plan": "plan"})

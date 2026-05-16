@@ -61,6 +61,7 @@ export interface EmployeeRecord {
   persona: Record<string, unknown> | null
   llm_calls: Record<string, Record<string, unknown>> | null
   behavior: Record<string, unknown> | null
+  avatar_url: string | null
   version: number
   created_at: string | null
   updated_at: string | null

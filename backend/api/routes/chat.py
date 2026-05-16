@@ -81,7 +81,18 @@ async def _call_agent_and_save(
 
 
 # ── group chat ────────────────────────────────────────────────────────────────
-# POST /group 已迁移至 WebSocket /api/ws/chat/{channel_id}
+
+@router.post("/group")
+async def post_group_message(body: MessageCreate) -> dict:
+    """供 agent 工具调用：将消息注入群聊（持久化 + Redis publish）。"""
+    from backend.chat.kanban_adapter import kanban_adapter
+    await kanban_adapter.on_message(
+        channel_id="group",
+        sender=body.sender or "system",
+        text=body.content if isinstance(body.content, str) else str(body.content),
+    )
+    return {"ok": True}
+
 
 @router.get("/group/history", response_model=list[MessageRead])
 async def group_history(db: AsyncSession = Depends(get_db)):

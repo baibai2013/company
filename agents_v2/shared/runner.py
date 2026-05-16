@@ -6,8 +6,12 @@ import base64
 import io
 import json
 import time as _time
+from contextvars import ContextVar
 
 import redis.asyncio as aioredis
+
+# 当前 Feishu 对话的 chat_id（P2P 或群）—— 供工具在调用期间读取
+current_feishu_chat_id: ContextVar[str] = ContextVar("feishu_chat_id", default="")
 
 
 def _resize_image_b64(b64: str, max_side: int = 1568) -> str:
@@ -53,6 +57,9 @@ async def run_with_events(
     ctx = context or {}
     image_base64 = ctx.get("image_base64", "")
     image_media_type = ctx.get("image_media_type", "image/jpeg")
+
+    # 把当前对话的 chat_id 注入 ContextVar，工具（send_feishu_message / schedule_task）可读取
+    _chat_token = current_feishu_chat_id.set(ctx.get("chat_id", ""))
 
     # 压缩图片到 Claude 推荐的最大尺寸（避免超 token 限制）
     if image_base64:
@@ -124,4 +131,5 @@ async def run_with_events(
             "tokens_out_approx": len(result_data.get("result", "")) // 4,
         })
 
+    current_feishu_chat_id.reset(_chat_token)
     return result_data

@@ -33,21 +33,22 @@
       @click="emit('select', emp.key)"
     >
       <div class="conv-avatar-wrap">
-        <span class="conv-avatar">{{ AVATARS[emp.key] ?? '👤' }}</span>
-        <span class="status-badge" :class="emp.status" />
+        <img v-if="emp.avatar_url" :src="emp.avatar_url" class="conv-avatar-img" />
+        <span v-else class="conv-avatar">{{ emp.emoji ?? AVATARS[emp.key] ?? '👤' }}</span>
+        <span class="status-badge" :class="emp.agent_status?.listening ? 'online' : ''" />
       </div>
       <div class="conv-info">
         <span class="conv-name">{{ emp.name }}</span>
-        <span class="conv-sub">{{ emp.status === 'online' ? '在线' : '离线' }}</span>
+        <span class="conv-sub">{{ emp.agent_status?.listening ? '在线' : '离线' }}</span>
       </div>
     </div>
   </div>
 </template>
 
 <script setup lang="ts">
-import type { Employee } from '@/api/client'
+import type { EmployeeRecord } from '@/api/client'
 
-defineProps<{ employees: Employee[]; selected: string | null }>()
+defineProps<{ employees: EmployeeRecord[]; selected: string | null }>()
 const emit = defineEmits<{ (e: 'select', key: string): void }>()
 
 const AVATARS: Record<string, string> = {
@@ -82,7 +83,8 @@ const AVATARS: Record<string, string> = {
 .conv-item:hover { background: #1e2233; }
 .conv-item.active { background: #1a3060; }
 .conv-avatar-wrap { position: relative; flex-shrink: 0; }
-.conv-avatar { font-size: 22px; display: block; }
+.conv-avatar     { font-size: 22px; display: block; }
+.conv-avatar-img { width: 28px; height: 28px; border-radius: 50%; object-fit: cover; display: block; }
 .status-badge {
   position: absolute; bottom: -1px; right: -3px;
   width: 8px; height: 8px; border-radius: 50%;

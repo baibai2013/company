@@ -16,6 +16,9 @@ from backend.services import process_manager, registry
 
 router = APIRouter(prefix="/api/employees", tags=["employees"])
 
+# P4.3: 跨员工事件路由（独立 router，挂到 /api/scheduler）
+scheduler_router = APIRouter(prefix="/api/scheduler", tags=["scheduler"])
+
 
 def _serialize(emp_dict: dict, redact_secret: bool = True) -> dict:
     out = dict(emp_dict)
@@ -148,3 +151,166 @@ async def employee_audit(key: str, limit: int = Query(20, le=200)) -> list[dict]
 @router.get("/{key}/llm-stats")
 async def employee_llm_stats(key: str, hours: int = Query(24, ge=1, le=720)) -> dict:
     return await llm_call_repo.stats(employee_key=key, hours=hours)
+
+
+# ── 定时任务管理 ───────────────────────────────────────────────────────────────
+
+import uuid as _uuid
+
+
+@router.get("/{key}/scheduled-tasks")
+async def list_scheduled_tasks(key: str) -> list[dict]:
+    raw = await registry.get_raw(key)
+    if not raw:
+        raise HTTPException(404, f"employee '{key}' not found")
+    return (raw.get("behavior") or {}).get("scheduled_tasks", [])
+
+
+@router.post("/{key}/scheduled-tasks")
+async def create_scheduled_task(key: str, task: dict = Body(...)) -> dict:
+    raw = await registry.get_raw(key)
+    if not raw:
+        raise HTTPException(404, f"employee '{key}' not found")
+    behavior = dict(raw.get("behavior") or {})
+    tasks = list(behavior.get("scheduled_tasks", []))
+    task.setdefault("id", str(_uuid.uuid4())[:8])
+    task.setdefault("enabled", True)
+    tasks.append(task)
+    behavior["scheduled_tasks"] = tasks
+    await registry.update(key, {"behavior": behavior}, actor="api")
+    return task
+
+
+@router.patch("/{key}/scheduled-tasks/{task_id}")
+async def update_scheduled_task(key: str, task_id: str, patch: dict = Body(...)) -> dict:
+    raw = await registry.get_raw(key)
+    if not raw:
+        raise HTTPException(404, f"employee '{key}' not found")
+    behavior = dict(raw.get("behavior") or {})
+    tasks = list(behavior.get("scheduled_tasks", []))
+    idx = next((i for i, t in enumerate(tasks) if t.get("id") == task_id), None)
+    if idx is None:
+        raise HTTPException(404, f"scheduled task '{task_id}' not found")
+    tasks[idx] = {**tasks[idx], **patch}
+    behavior["scheduled_tasks"] = tasks
+    await registry.update(key, {"behavior": behavior}, actor="api")
+    return tasks[idx]
+
+
+@router.delete("/{key}/scheduled-tasks/{task_id}")
+async def delete_scheduled_task(key: str, task_id: str) -> dict:
+    raw = await registry.get_raw(key)
+    if not raw:
+        raise HTTPException(404, f"employee '{key}' not found")
+    behavior = dict(raw.get("behavior") or {})
+    tasks = [t for t in behavior.get("scheduled_tasks", []) if t.get("id") != task_id]
+    behavior["scheduled_tasks"] = tasks
+    await registry.update(key, {"behavior": behavior}, actor="api")
+    return {"ok": True}
+
+
+@router.post("/{key}/scheduled-tasks/{task_id}/run")
+async def run_scheduled_task_now(key: str, task_id: str) -> dict:
+    """立即执行一次 — 通过 agent 端口转发到 scheduler。"""
+    import httpx
+    raw = await registry.get_raw(key)
+    if not raw:
+        raise HTTPException(404, f"employee '{key}' not found")
+    port = raw.get("agent_port")
+    if not port:
+        raise HTTPException(400, "agent_port not configured")
+    try:
+        async with httpx.AsyncClient(timeout=60) as client:
+            resp = await client.post(f"http://localhost:{port}/scheduler/run/{task_id}")
+            return resp.json()
+    except Exception as e:
+        raise HTTPException(502, f"agent unreachable: {e}")
+
+
+# ── P4.3 跨员工事件路由 ───────────────────────────────────────────────────────
+
+@scheduler_router.post("/events")
+async def publish_scheduler_event(event: dict = Body(...)) -> dict:
+    """任务完成后发布事件，backend 查找所有订阅该事件的员工任务并转发。
+
+    event 格式：
+        {"event_type": "task_completed", "employee": "data_engineer",
+         "task_id": "etl_daily", "status": "success"}
+
+    DAG 深度限制：最多 3 跳（通过 event.hop 计数），超出时拒绝，防止循环依赖。
+    """
+    import httpx
+
+    hop = event.get("_hop", 0)
+    if hop >= 3:
+        return {"ok": False, "error": "DAG depth limit (3 hops) exceeded"}
+
+    event_type = event.get("event_type", "")
+    if not event_type:
+        return {"ok": False, "error": "event_type required"}
+
+    # 遍历所有活跃员工，找到订阅了该事件的任务
+    all_employees = await employee_repo.list_all(active_only=True)
+    forwarded: list[dict] = []
+
+    for emp in all_employees:
+        port = emp.agent_port
+        if not port:
+            continue
+        behavior = emp.behavior or {}
+        tasks = behavior.get("scheduled_tasks", [])
+
+        for task in tasks:
+            if not task.get("enabled"):
+                continue
+            trigger = task.get("trigger", {})
+            if trigger.get("type") != "event":
+                continue
+            if trigger.get("event_type") != event_type:
+                continue
+            # 检查 filter 条件
+            flt = trigger.get("filter", {})
+            if any(event.get(k) != v for k, v in flt.items()):
+                continue
+
+            # 转发事件到对应 agent（注入 hop 计数）
+            forwarded_event = {**event, "_hop": hop + 1}
+            try:
+                async with httpx.AsyncClient(timeout=10) as client:
+                    resp = await client.post(
+                        f"http://localhost:{port}/scheduler/event",
+                        json=forwarded_event,
+                    )
+                forwarded.append({
+                    "employee": emp.key,
+                    "task": task.get("name"),
+                    "status": resp.status_code,
+                })
+            except Exception as e:
+                forwarded.append({
+                    "employee": emp.key,
+                    "task": task.get("name"),
+                    "error": str(e),
+                })
+
+    return {"ok": True, "forwarded": forwarded}
+
+
+@scheduler_router.get("/event-subscribers")
+async def list_event_subscribers() -> list[dict]:
+    """查询所有员工中订阅了事件触发的任务。"""
+    all_employees = await employee_repo.list_all(active_only=True)
+    result = []
+    for emp in all_employees:
+        behavior = emp.behavior or {}
+        for task in behavior.get("scheduled_tasks", []):
+            trigger = task.get("trigger", {})
+            if trigger.get("type") == "event":
+                result.append({
+                    "employee": emp.key,
+                    "task_id": task.get("id"),
+                    "task_name": task.get("name"),
+                    "event_type": trigger.get("event_type"),
+                    "filter": trigger.get("filter", {}),
+                })
+    return result

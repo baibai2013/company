@@ -3,7 +3,6 @@
     <header class="dash-header">
       <h1>🏗️ 机器狗公司 · 控制台</h1>
       <div class="header-actions">
-        <el-button @click="$router.push('/employees')" size="small">👥 员工管理</el-button>
         <el-button type="primary" @click="showCreateDialog = true" size="small">+ 新建任务</el-button>
         <el-button @click="refresh" size="small" :loading="loading">刷新</el-button>
       </div>
@@ -27,7 +26,8 @@
           <main class="chat-main">
             <template v-if="selectedConv">
               <div class="conv-header">
-                <span class="conv-avatar">{{ convAvatar(selectedConv) }}</span>
+                <img v-if="convAvatarUrl(selectedConv)" :src="convAvatarUrl(selectedConv)!" class="conv-avatar-img" />
+                <span v-else class="conv-avatar">{{ convAvatar(selectedConv) }}</span>
                 <div>
                   <div class="conv-name">{{ convName(selectedConv) }}</div>
                   <div class="conv-sub">{{ convSub(selectedConv) }}</div>
@@ -36,6 +36,7 @@
               <ChatPanel
                 :messages="currentMessages"
                 :sending="chatSending"
+                :employees="employeeStore.employees"
                 @send="onSendMsg"
               />
             </template>
@@ -49,27 +50,7 @@
 
       <!-- ── 员工 tab ── -->
       <el-tab-pane label="员工" name="team">
-        <div class="team-layout">
-          <div class="team-grid">
-            <div
-              v-for="emp in TEAM_LIST"
-              :key="emp.key"
-              class="emp-card"
-              :class="{ active: isActive(emp.key) }"
-            >
-              <div class="emp-avatar">{{ emp.emoji }}</div>
-              <div class="emp-body">
-                <div class="emp-name">{{ emp.name }}</div>
-                <div class="emp-phase" :style="{ color: phaseColor(emp.key) }">
-                  {{ phaseLabel(emp.key) }}
-                </div>
-                <div v-if="empTask(emp.key)" class="emp-task">{{ empTask(emp.key) }}</div>
-                <div v-if="empUpdated(emp.key)" class="emp-time">{{ empUpdated(emp.key) }}</div>
-              </div>
-              <div class="emp-dot" :style="{ background: phaseColor(emp.key) }"></div>
-            </div>
-          </div>
-        </div>
+        <EmployeesView />
       </el-tab-pane>
 
       <!-- ── 任务 tab ── -->
@@ -135,19 +116,23 @@
 
 <script setup lang="ts">
 import { ref, computed, watch, onMounted, onUnmounted } from 'vue'
+import { useRoute } from 'vue-router'
 import { ElMessage } from 'element-plus'
 import ConversationList from '@/components/project/ConversationList.vue'
 import TaskTable from '@/components/project/TaskTable.vue'
 import ChatPanel from '@/components/project/ChatPanel.vue'
+import EmployeesView from '@/views/EmployeesView.vue'
 import { useTaskStore } from '@/stores/tasks'
-import { useEmployeeStore, PHASE_COLOR, PHASE_LABEL } from '@/stores/employees'
+import { useEmployeeStore, PHASE_LABEL } from '@/stores/employees'
 import { chatApi, tasksApi, type ChatMessage } from '@/api/client'
 
+const route = useRoute()
 const taskStore = useTaskStore()
 const employeeStore = useEmployeeStore()
 
 const loading = ref(false)
-const activeTab = ref('chat')
+const activeTab = ref((route.query.tab as string) || 'chat')
+watch(() => route.query.tab, (tab) => { if (tab) activeTab.value = tab as string })
 const showCreateDialog = ref(false)
 const creating = ref(false)
 const chatSending = ref(false)
@@ -166,40 +151,6 @@ const form = ref({
   parent_id: null as string | null,
 })
 
-const TEAM_LIST = [
-  { key: 'product_manager', emoji: '🎯', name: '产品经理' },
-  { key: 'project_manager', emoji: '📋', name: '项目经理' },
-  { key: 'tech_lead',       emoji: '🔧', name: '技术负责人' },
-  { key: 'mechanical',      emoji: '⚙️',  name: '机械工程师' },
-  { key: 'hardware',        emoji: '🔌', name: '硬件工程师' },
-  { key: 'firmware',        emoji: '💾', name: '固件工程师' },
-  { key: 'algorithm',       emoji: '🧠', name: '算法工程师' },
-  { key: 'testing',         emoji: '🧪', name: '测试工程师' },
-  { key: 'cost',            emoji: '💰', name: '成本工程师' },
-]
-
-function phaseColor(key: string) {
-  const s = employeeStore.statusMap[key]
-  return PHASE_COLOR[s?.phase ?? 'idle']
-}
-function phaseLabel(key: string) {
-  const s = employeeStore.statusMap[key]
-  return PHASE_LABEL[s?.phase ?? 'idle']
-}
-function empTask(key: string) {
-  return employeeStore.statusMap[key]?.task ?? ''
-}
-function isActive(key: string) {
-  const phase = employeeStore.statusMap[key]?.phase
-  return phase && !['idle', 'done', undefined].includes(phase)
-}
-function empUpdated(key: string) {
-  const ts = employeeStore.statusMap[key]?.updated_at
-  if (!ts) return ''
-  const diff = Math.floor((Date.now() - ts) / 1000)
-  if (diff < 60) return `${diff}s 前`
-  return `${Math.floor(diff / 60)}min 前`
-}
 
 const EMPLOYEE_NAMES: Record<string, string> = {
   mechanical: '机械工程师', hardware: '硬件工程师', firmware: '固件工程师',
@@ -219,16 +170,28 @@ const currentMessages = computed(() =>
       : []
 )
 
+function convAvatarUrl(key: string): string | null {
+  if (key === 'group') return null
+  const emp = employeeStore.employees.find(e => e.key === key)
+  return emp?.avatar_url ?? null
+}
 function convAvatar(key: string) {
-  return key === 'group' ? '🏢' : EMPLOYEE_AVATARS[key] ?? '👤'
+  if (key === 'group') return '🏢'
+  const emp = employeeStore.employees.find(e => e.key === key)
+  return emp?.emoji ?? EMPLOYEE_AVATARS[key] ?? '👤'
 }
 function convName(key: string) {
-  return key === 'group' ? '公司频道' : EMPLOYEE_NAMES[key] ?? key
+  if (key === 'group') return '公司频道'
+  const emp = employeeStore.employees.find(e => e.key === key)
+  return emp?.name ?? EMPLOYEE_NAMES[key] ?? key
 }
 function convSub(key: string) {
   if (key === 'group') return '全体成员群组'
   const emp = employeeStore.employees.find(e => e.key === key)
-  return emp?.status === 'online' ? '在线' : '离线'
+  if (!emp?.agent_status?.listening) return '离线'
+  const status = employeeStore.statusMap[key]
+  if (status && status.phase !== 'idle') return `${PHASE_LABEL[status.phase] ?? status.phase} · ${status.message || status.task || ''}`
+  return '在线 · 空闲'
 }
 
 async function fetchCurrentConv(key: string) {
@@ -426,7 +389,8 @@ onUnmounted(() => {
   padding: 14px 20px; flex-shrink: 0;
   background: #14161f; border-bottom: 1px solid #252a3a;
 }
-.conv-avatar { font-size: 26px; }
+.conv-avatar     { font-size: 26px; }
+.conv-avatar-img { width: 38px; height: 38px; border-radius: 50%; object-fit: cover; flex-shrink: 0; }
 .conv-name { font-size: 15px; font-weight: 700; color: #dce8ff; }
 .conv-sub { font-size: 12px; color: #5a6480; margin-top: 2px; }
 
@@ -437,39 +401,6 @@ onUnmounted(() => {
 .empty-icon { font-size: 48px; opacity: 0.35; }
 .empty-chat p { font-size: 14px; }
 
-/* ── Team layout ── */
-.team-layout { flex: 1; overflow-y: auto; padding: 20px; background: #0f1117; }
-.team-grid {
-  display: grid;
-  grid-template-columns: repeat(auto-fill, minmax(260px, 1fr));
-  gap: 14px;
-}
-.emp-card {
-  position: relative;
-  display: flex; align-items: flex-start; gap: 14px;
-  padding: 16px; border-radius: 10px;
-  background: #14161f; border: 1px solid #252a3a;
-  transition: border-color .2s, box-shadow .2s;
-}
-.emp-card.active {
-  border-color: #334070;
-  box-shadow: 0 0 12px rgba(100, 150, 255, .15);
-}
-.emp-avatar { font-size: 28px; flex-shrink: 0; line-height: 1; margin-top: 2px; }
-.emp-body { flex: 1; min-width: 0; }
-.emp-name { font-size: 14px; font-weight: 700; color: #dce8ff; margin-bottom: 4px; }
-.emp-phase { font-size: 12px; font-weight: 600; margin-bottom: 6px; }
-.emp-task {
-  font-size: 11px; color: #6a7a9a;
-  white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
-  margin-bottom: 4px;
-}
-.emp-time { font-size: 10px; color: #404870; }
-.emp-dot {
-  position: absolute; top: 14px; right: 14px;
-  width: 8px; height: 8px; border-radius: 50%;
-  transition: background .3s;
-}
 
 /* ── Tasks layout ── */
 .tasks-layout { flex: 1; overflow: hidden; padding: 16px; background: #0f1117; }

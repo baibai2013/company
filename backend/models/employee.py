@@ -29,6 +29,8 @@ class Employee(Base):
     llm_calls:         Mapped[dict | None] = mapped_column(JSONB)
     behavior:          Mapped[dict | None] = mapped_column(JSONB)
 
+    avatar_url:        Mapped[str | None]  = mapped_column(Text)   # base64 data URL or external URL
+
     version:           Mapped[int]         = mapped_column(Integer, default=1)
     created_at:        Mapped[datetime]    = mapped_column(DateTime(timezone=True), default=_utcnow)
     updated_at:        Mapped[datetime]    = mapped_column(

@@ -1,7 +1,7 @@
 <template>
   <div class="new-view" v-loading="creating">
     <header class="page-header">
-      <el-button @click="$router.back()" size="small">← 返回</el-button>
+      <el-button @click="$router.push('/?tab=team')" size="small">← 返回</el-button>
       <h1>+ 添加员工</h1>
       <div class="step-tag">第 {{ step }} / 4 步</div>
     </header>

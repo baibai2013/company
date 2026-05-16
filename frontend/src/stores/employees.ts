@@ -1,6 +1,6 @@
 import { defineStore } from 'pinia'
 import { ref } from 'vue'
-import { employeesApi, type Employee } from '@/api/client'
+import { employeeAdminApi, type EmployeeRecord } from '@/api/client'
 
 export interface EmployeeStatus {
   employee: string
@@ -32,11 +32,11 @@ export const PHASE_LABEL: Record<string, string> = {
 }
 
 export const useEmployeeStore = defineStore('employees', () => {
-  const employees = ref<Employee[]>([])
+  const employees = ref<EmployeeRecord[]>([])
   const statusMap = ref<Record<string, EmployeeStatus>>({})
 
   async function fetchEmployees() {
-    employees.value = await employeesApi.list()
+    employees.value = await employeeAdminApi.list()
   }
 
   function applyStatusEvent(raw: Omit<EmployeeStatus, 'updated_at'>) {

@@ -32,12 +32,8 @@ LOG_DIR.mkdir(parents=True, exist_ok=True)
 VENV_PY = ROOT / ".venv" / "bin" / "python"
 PYTHON = str(VENV_PY) if VENV_PY.exists() else "python"
 
-# Legacy per-employee main.py existed for these (so we keep using it).
-# Newly added employees use the generic entry point automatically.
-_LEGACY_AGENT_KEYS = {
-    "tech_lead", "mechanical", "hardware", "firmware", "algorithm",
-    "product_manager", "testing", "cost", "project_manager", "sysadmin",
-}
+# Legacy per-employee main.py 已废弃 — 全部走 generic entry point。
+_LEGACY_AGENT_KEYS: set[str] = set()
 
 
 @dataclass
@@ -150,7 +146,7 @@ def start_agent(employee: str) -> dict:
         env_extra = {}
     else:
         cmd = [PYTHON, "-m", "agents_v2.generic.main"]
-        env_extra = {"EMPLOYEE_KEY": employee}
+        env_extra = {"EMPLOYEE_KEY": employee, "AGENT_PORT": str(cfg.agent_port)}
 
     log_path = _log_file(employee, "agent")
     f = open(log_path, "a")

@@ -23,7 +23,10 @@
       >
         <div class="card-head">
           <div class="card-title">
-            <span class="card-emoji">{{ emp.emoji || '👤' }}</span>
+            <div class="card-avatar">
+              <img v-if="emp.avatar_url" :src="emp.avatar_url" class="avatar-img" />
+              <span v-else class="card-emoji">{{ emp.emoji || '👤' }}</span>
+            </div>
             <div>
               <div class="card-name">{{ emp.name }}</div>
               <div class="card-key">{{ emp.key }}</div>
@@ -64,6 +67,12 @@
         </div>
       </el-card>
     </div>
+
+    <EmployeeDetailDialog
+      v-model="dialogVisible"
+      :employee-key="selectedKey"
+      @refresh="refresh"
+    />
   </div>
 </template>
 
@@ -72,10 +81,13 @@ import { ref, computed, onMounted } from 'vue'
 import { useRouter } from 'vue-router'
 import { ElMessage } from 'element-plus'
 import { employeeAdminApi, type EmployeeRecord } from '@/api/client'
+import EmployeeDetailDialog from '@/components/project/EmployeeDetailDialog.vue'
 
 const router = useRouter()
 const loading = ref(false)
 const employees = ref<EmployeeRecord[]>([])
+const dialogVisible = ref(false)
+const selectedKey = ref('')
 
 const activeCount = computed(() => employees.value.filter(e => e.active).length)
 const runningAgents = computed(() => employees.value.filter(e => e.agent_status?.listening).length)
@@ -103,7 +115,8 @@ function shortModel(model: string | null | undefined, calltype: string): string 
 }
 
 function openDetail(key: string) {
-  router.push(`/employees/${key}`)
+  selectedKey.value = key
+  dialogVisible.value = true
 }
 
 onMounted(refresh)
@@ -113,7 +126,7 @@ onMounted(refresh)
 /* Page-specific layout only — Element Plus dark theme is global (assets/main.css). */
 
 .emp-view {
-  height: 100vh; overflow-y: auto;
+  height: 100%; overflow-y: auto;
   background: var(--el-bg-color-page);
   color: var(--el-text-color-primary);
   padding: 24px 32px;
@@ -147,7 +160,9 @@ onMounted(refresh)
 
 .card-head  { display: flex; justify-content: space-between; align-items: flex-start; margin-bottom: 8px; }
 .card-title { display: flex; align-items: flex-start; gap: 12px; }
-.card-emoji { font-size: 28px; line-height: 1; margin-top: 2px; }
+.card-avatar { width: 36px; height: 36px; flex-shrink: 0; display: flex; align-items: center; justify-content: center; }
+.avatar-img  { width: 36px; height: 36px; border-radius: 50%; object-fit: cover; }
+.card-emoji  { font-size: 28px; line-height: 1; }
 .card-name  { font-size: 16px; font-weight: 700; color: var(--el-text-color-primary); }
 .card-key   { font-size: 11px; color: var(--el-text-color-placeholder); font-family: ui-monospace, monospace; margin-top: 2px; }
 
