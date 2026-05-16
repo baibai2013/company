@@ -3,6 +3,8 @@ CC — 飞书机器人对接 Claude Code CLI 桥接服务入口。
 
 Usage:
   python -m feishu.cc_bridge.main
+
+# 进度卡路径去重验证：本次提交用于测试 _file_change_block(with_path=False) 在进度卡中只显示一次文件路径。
 """
 import asyncio
 import base64
@@ -22,7 +24,7 @@ import lark_oapi as lark
 from lark_oapi.api.im.v1.model.p2_im_message_receive_v1 import P2ImMessageReceiveV1
 
 from feishu.cc_bridge.message_handler import handle_message, init_whitelist
-from feishu.sender import download_image
+from feishu.sender import download_image, reply_rich_card, send_rich_card
 
 logging.basicConfig(
     level=logging.INFO,
@@ -57,6 +59,9 @@ def _release_singleton() -> None:
 # ── 配置 ─────────────────────────────────────────────────────────────────────
 APP_ID = os.getenv("CC_BRIDGE_APP_ID", "cli_aa89f97f83f89be6")
 APP_SECRET = os.getenv("CC_BRIDGE_APP_SECRET", "COozkvL5KVAtlwNGStqDig6uykU2kLgj")
+
+# ── 待处理图片（等用户补充问题）────────────────────────────────────────────────
+_pending_images: dict[str, bytes] = {}  # chat_id → image bytes
 
 # ── 去重 ─────────────────────────────────────────────────────────────────────
 _processed: set[str] = set()
@@ -102,9 +107,123 @@ def _get_loop() -> asyncio.AbstractEventLoop:
     return _loop
 
 
+# ── 引用上下文提取 ────────────────────────────────────────────────────────────
+
+def _extract_card_text(content) -> str:
+    """从 interactive 卡片 JSON 中提取文字。
+
+    兼容：
+    - API 简化格式：{"title": "...", "elements": [[{"tag":"text","text":"..."}, ...], ...]}
+    - v1 卡片：{"header":..., "elements": [{"tag":"div","text":{"tag":"lark_md","content":"..."}}]}
+    - v2 卡片：{"schema":"2.0", "header":..., "body": {"elements": [{"tag":"markdown","content":"..."}, {"tag":"code_block","language":"...","text":"..."}]}}
+    """
+    parts: list[str] = []
+    if isinstance(content, dict):
+        title = content.get("header", {}).get("title", {}).get("content", "") \
+            or content.get("title", "")
+        if title:
+            parts.append(f"**{title}**")
+        # v2 schema：elements 在 body 里
+        elements = content.get("body", {}).get("elements") or content.get("elements", [])
+    elif isinstance(content, list):
+        elements = content
+    else:
+        return ""
+    for elem in elements:
+        if isinstance(elem, list):
+            # API 简化格式：一段是 list，元素 {tag:text,text:""}
+            line_parts = []
+            for sub in elem:
+                if not isinstance(sub, dict):
+                    continue
+                tag = sub.get("tag")
+                if tag == "text":
+                    line_parts.append(sub.get("text", ""))
+                elif tag == "a":
+                    line_parts.append(sub.get("text", "") or sub.get("href", ""))
+            if line_parts:
+                parts.append("".join(line_parts))
+            continue
+        if not isinstance(elem, dict):
+            continue
+        tag = elem.get("tag")
+        if tag == "div":
+            t = elem.get("text", {})
+            if isinstance(t, dict) and t.get("tag") == "lark_md":
+                c = t.get("content", "")
+                if c:
+                    parts.append(c)
+        elif tag == "markdown":
+            c = elem.get("content", "")
+            if c:
+                parts.append(c)
+        elif tag == "code_block":
+            lang = (elem.get("language") or "").lower()
+            text = elem.get("text", "")
+            if text:
+                parts.append(f"```{lang}\n{text}\n```")
+    return "\n".join(parts)[:2000]
+
+
+def _fetch_parent_text(parent_id: str) -> str:
+    """获取父消息文本用于引用上下文。
+
+    优先查本地自发卡片缓存（飞书 GetMessage 对 interactive 只返回 title，
+    拿不到正文）；命中失败再降级到 API。
+    """
+    if not parent_id:
+        return ""
+
+    from feishu.cc_bridge.message_handler import lookup_card
+    cached = lookup_card(parent_id)
+    if cached:
+        log.info("fetch_parent_text: source=cache id=%s len=%d", parent_id, len(cached))
+        return cached[:2000]
+
+    try:
+        from lark_oapi.api.im.v1 import GetMessageRequest
+        req = GetMessageRequest.builder().message_id(parent_id).build()
+        resp = _client.im.v1.message.get(req)
+        if not resp.success() or not resp.data or not resp.data.items:
+            log.warning("fetch_parent_text failed: id=%s code=%s", parent_id, resp.code)
+            return ""
+        m = resp.data.items[0]
+        mtype = getattr(m, "msg_type", None) or getattr(m, "message_type", None)
+        raw = m.body.content if getattr(m, "body", None) else "{}"
+        try:
+            content = json.loads(raw) if isinstance(raw, str) else raw
+        except Exception:
+            content = {}
+        log.info("fetch_parent_text: source=api id=%s mtype=%s", parent_id, mtype)
+        if mtype == "text":
+            if isinstance(content, dict):
+                return content.get("text", "").strip()
+        elif mtype == "post":
+            texts = []
+            data = content if isinstance(content, dict) else {}
+            for para in data.get("content", []):
+                for elem in para:
+                    if isinstance(elem, dict) and elem.get("tag") == "text":
+                        texts.append(elem.get("text", ""))
+            return "".join(texts).strip()[:2000]
+        elif mtype == "interactive":
+            return _extract_card_text(content)
+        return ""
+    except Exception as exc:
+        log.warning("fetch_parent_text error: %s", exc)
+        return ""
+
+
 # ── 消息事件处理 ─────────────────────────────────────────────────────────────
 def on_message(data: P2ImMessageReceiveV1) -> None:
     """飞书 WebSocket 消息回调（同步上下文）。"""
+    try:
+        _on_message_inner(data)
+    except Exception:
+        log.exception("on_message 未捕获异常")
+
+
+def _on_message_inner(data: P2ImMessageReceiveV1) -> None:
     msg = data.event.message if data.event else None
     if not msg:
         return
@@ -124,7 +243,7 @@ def on_message(data: P2ImMessageReceiveV1) -> None:
     chat_id = msg.chat_id
     msg_type = msg.message_type
 
-    log.info("收到消息: type=%s chat_id=%s sender=%s", msg_type, chat_id, sender_id)
+    log.info("📨[poll]收到消息: type=%s chat_id=%s sender=%s", msg_type, chat_id, sender_id)
 
     # 提取文本
     text = ""
@@ -138,7 +257,7 @@ def on_message(data: P2ImMessageReceiveV1) -> None:
             return
 
     elif msg_type == "image":
-        # 纯图片消息
+        # 纯图片消息：先存图，提示用户补充问题
         try:
             content = json.loads(msg.content)
             image_key = content.get("image_key", "")
@@ -146,18 +265,21 @@ def on_message(data: P2ImMessageReceiveV1) -> None:
                 b64, _ = download_image(_client, message_id, image_key)
                 if b64:
                     image_bytes = base64.b64decode(b64)
-                    text = "请分析这张图片"
         except Exception as exc:
             log.warning("图片处理失败: %s", exc)
             return
+        if image_bytes:
+            _pending_images[chat_id] = image_bytes
+            reply_rich_card(_client, message_id, "📷 已收到图片", "请问您有什么问题？", "blue")
+            return
 
     elif msg_type == "post":
-        # 富文本消息（可能包含图片+文字）
+        # 富文本消息（可能包含图片+文字+引用块）
         try:
             content = json.loads(msg.content)
-            # post 格式: {"title": "", "content": [[{type, text/image_key}]]}
             paragraphs = content.get("content", [])
             texts = []
+            quote_parts: list[str] = []
             for para in paragraphs:
                 for elem in para:
                     if elem.get("tag") == "text":
@@ -168,17 +290,45 @@ def on_message(data: P2ImMessageReceiveV1) -> None:
                             b64, _ = download_image(_client, message_id, image_key)
                             if b64:
                                 image_bytes = base64.b64decode(b64)
+                    elif elem.get("tag") == "quote":
+                        # quote 元素：content 字符串 或 嵌套 elements
+                        q = elem.get("content", "") or elem.get("text", "")
+                        if not q and isinstance(elem.get("elements"), list):
+                            q = "".join(
+                                e.get("text", "") for e in elem["elements"]
+                                if isinstance(e, dict) and e.get("tag") == "text"
+                            )
+                        if q:
+                            quote_parts.append(str(q).strip())
             text = "".join(texts).strip()
             if not text and image_bytes:
-                text = "请分析这张图片"
+                # post 有图无文字：同纯图片处理，等用户补充问题
+                _pending_images[chat_id] = image_bytes
+                reply_rich_card(_client, message_id, "📷 已收到图片", "请问您有什么问题？", "blue")
+                return
+            if quote_parts:
+                ctx = "\n".join(quote_parts)
+                text = f"[引用内容]\n{ctx}\n---\n{text}" if text else ctx
         except Exception as exc:
             log.warning("富文本处理失败: %s", exc)
             return
     else:
         return
 
+    # 回复型引用：parent_id 有值且尚无引用上下文时，拉取父消息
+    parent_id = getattr(msg, "parent_id", None) or ""
+    if parent_id and not text.startswith("[引用内容]"):
+        parent_text = _fetch_parent_text(parent_id)
+        if parent_text:
+            text = f"[引用内容]\n{parent_text}\n---\n{text}" if text else parent_text
+
     if not text and not image_bytes:
         return
+
+    # 有文字时，检查是否有待处理的图片并附上
+    if text and not image_bytes and chat_id in _pending_images:
+        image_bytes = _pending_images.pop(chat_id)
+        log.info("附加待处理图片: chat_id=%s", chat_id)
 
     # 提交到异步事件循环执行
     loop = _get_loop()

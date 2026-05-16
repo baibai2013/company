@@ -364,19 +364,13 @@ def send_feishu_message(content: str, title: str = "通知", feishu_chat_id: str
             .build()
         )
         # 用 send_card 并检查返回码（send_rich_card 内部静默失败，需要直接调 API）
-        import json as _json
         from lark_oapi.api.im.v1 import CreateMessageRequest, CreateMessageRequestBody
-        from feishu.sender import markdown_to_elements
+        from feishu.sender import build_card_json
 
-        card = {
-            "config": {"wide_screen_mode": True},
-            "header": {"title": {"tag": "plain_text", "content": title}, "template": "blue"},
-            "elements": markdown_to_elements(content),
-        }
         body = (
             CreateMessageRequestBody.builder()
             .receive_id(chat_id).msg_type("interactive")
-            .content(_json.dumps(card)).build()
+            .content(build_card_json(title, content, "blue")).build()
         )
         req = CreateMessageRequest.builder().receive_id_type("chat_id").request_body(body).build()
         resp = client.im.v1.message.create(req)

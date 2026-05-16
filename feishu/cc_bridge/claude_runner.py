@@ -18,7 +18,7 @@ log = logging.getLogger("cc_bridge.runner")
 
 DEFAULT_CWD = "/Users/liyijiang/work/company"
 ALLOWED_CWD_PREFIX = "/Users/liyijiang/work/"
-CLAUDE_BIN = "/usr/local/bin/claude"
+CLAUDE_BIN = "/opt/homebrew/bin/claude"
 MAX_TIMEOUT = 600  # 10 分钟
 
 # 工具图标映射
@@ -111,6 +111,7 @@ class ClaudeRunner:
         on_tool_start: callable = None,
         on_tool_result: callable = None,
         on_text: callable = None,
+        on_thinking: callable = None,
     ) -> tuple[str, list[str]]:
         """
         执行 Claude Code CLI，流式返回结果。
@@ -118,7 +119,11 @@ class ClaudeRunner:
         on_chunk(text, tool_log, current_tool, force): 中间状态回调。
         返回 (最终文本, 工具调用日志列表)。
         """
-        cmd = [CLAUDE_BIN, "-p", "--output-format", "stream-json", "--verbose"]
+        # 4.7 用 --effort 控制 thinking（adaptive 模式），不接受 --max-thinking-tokens
+        # --include-partial-messages 启用 stream_event 增量事件
+        cmd = [CLAUDE_BIN, "-p", "--output-format", "stream-json", "--verbose",
+               "--include-partial-messages", "--effort", "high",
+               "--model", "claude-opus-4-7"]
 
         if self.session_id:
             cmd.extend(["--resume", self.session_id])
@@ -142,9 +147,10 @@ class ClaudeRunner:
             limit=_limit,
         )
 
-        accumulated = []
-        tool_log: list[str] = []       # 已完成的工具调用（含图标）
-        current_tool: str | None = None  # 当前进行中的工具
+        accumulated: list[str] = []        # 所有 text block 增量累加
+        thinking_buf: list[str] = []       # 当前 thinking block 增量累加（每块清零）
+        tool_log: list[str] = []           # 已完成的工具调用（含图标）
+        current_tool: str | None = None    # 当前进行中的工具
         result_text = ""
         new_session_id = None
 
@@ -170,16 +176,41 @@ class ClaudeRunner:
                     if event.get("session_id"):
                         new_session_id = event["session_id"]
 
-                    if event.get("type") == "assistant":
+                    # 流式增量：thinking / text 实时推送
+                    if event.get("type") == "stream_event":
+                        e = event.get("event", {})
+                        et = e.get("type")
+                        if et == "content_block_start":
+                            cb = e.get("content_block", {})
+                            if cb.get("type") == "thinking":
+                                # 4.7 thinking 加密（redacted），只有 signature_delta 没明文，
+                                # 给个占位让飞书进度卡能看到"思考中"
+                                thinking_buf.clear()
+                                if on_thinking:
+                                    await on_thinking("（模型思考中…）")
+                        elif et == "content_block_delta":
+                            delta = e.get("delta", {})
+                            dt = delta.get("type")
+                            if dt == "text_delta":
+                                t = delta.get("text", "")
+                                if t:
+                                    accumulated.append(t)
+                                    if on_text:
+                                        await on_text("".join(accumulated))
+                            elif dt == "thinking_delta":
+                                t = delta.get("thinking", "")
+                                if t:
+                                    thinking_buf.append(t)
+                                    if on_thinking:
+                                        await on_thinking("".join(thinking_buf))
+
+                    # 完整 snapshot：仅取 tool_use（input 已完整），text/thinking 由 stream_event 处理避免重复
+                    elif event.get("type") == "assistant":
                         msg = event.get("message", {})
                         for block in msg.get("content", []):
                             if not isinstance(block, dict):
                                 continue
-                            if block.get("type") == "text":
-                                accumulated.append(block["text"])
-                                if on_text:
-                                    await on_text("".join(accumulated))
-                            elif block.get("type") == "tool_use":
+                            if block.get("type") == "tool_use":
                                 if current_tool:
                                     tool_log.append(f"✅ {current_tool}")
                                 tool_id = block.get("id", "")

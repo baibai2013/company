@@ -249,10 +249,14 @@ for k in registry.list_keys_sync_cached(active_only=True):
 fi
 
 # ── 8. CC Bridge（飞书 ↔ Claude Code CLI）────────────────────────────────────
+# 用 jurigged 启动以支持代码热更新（改函数体保存即生效）。
+# macOS 后台进程下 FSEvents 不投递事件，必须用 --poll 强制轮询。
 if [[ $NO_FEISHU -eq 0 ]]; then
   echo ""
-  info "启动 CC Bridge (飞书 ↔ Claude Code CLI)..."
-  nohup .venv/bin/python -m feishu.cc_bridge.main > "$LOG_DIR/cc_bridge.log" 2>&1 &
+  info "启动 CC Bridge (飞书 ↔ Claude Code CLI, jurigged 热更新)..."
+  PYTHONUNBUFFERED=1 nohup .venv/bin/jurigged -v --poll 0.5 \
+    -w feishu/cc_bridge -w feishu/sender.py \
+    -m feishu.cc_bridge.main > "$LOG_DIR/cc_bridge.log" 2>&1 &
   echo "cc_bridge $!" >> "$PID_FILE"
   ok "CC Bridge PID=$!  (logs/cc_bridge.log)"
 fi

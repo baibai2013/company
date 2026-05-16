@@ -62,19 +62,11 @@ def send_text(client: lark.Client, chat_id: str, text: str) -> None:
 
 
 def send_card(client: lark.Client, chat_id: str, title: str, content: str, color: str = "blue") -> None:
-    card = {
-        "config": {"wide_screen_mode": True},
-        "header": {
-            "title": {"tag": "plain_text", "content": title},
-            "template": color,
-        },
-        "elements": [{"tag": "div", "text": {"tag": "lark_md", "content": content[:2000]}}],
-    }
     body = (
         CreateMessageRequestBody.builder()
         .receive_id(chat_id)
         .msg_type("interactive")
-        .content(json.dumps(card))
+        .content(build_card_json(title, content[:2000], color, parse=False))
         .build()
     )
     req = (
@@ -89,6 +81,39 @@ def send_card(client: lark.Client, chat_id: str, title: str, content: str, color
 
 
 _TABLE_SEP_RE = re.compile(r'^[\s|:\-]+$')
+_FENCED_RE = re.compile(r'^```([A-Za-z0-9_+\-#.]*)\s*$')
+
+# 飞书 code_block 支持的语言白名单（小写）→ 飞书 language 字段值
+# 来自飞书消息卡片 2.0 文档，未识别的回退 PLAIN_TEXT
+_LANG_MAP = {
+    "py": "PYTHON", "python": "PYTHON",
+    "js": "JAVASCRIPT", "javascript": "JAVASCRIPT", "node": "JAVASCRIPT",
+    "ts": "TYPESCRIPT", "typescript": "TYPESCRIPT",
+    "tsx": "TYPESCRIPT", "jsx": "JAVASCRIPT",
+    "java": "JAVA", "kotlin": "KOTLIN", "kt": "KOTLIN",
+    "go": "GO", "golang": "GO",
+    "rs": "RUST", "rust": "RUST",
+    "c": "C", "h": "C",
+    "cpp": "CPP", "c++": "CPP", "cxx": "CPP", "hpp": "CPP",
+    "cs": "CSHARP", "csharp": "CSHARP",
+    "swift": "SWIFT",
+    "rb": "RUBY", "ruby": "RUBY",
+    "php": "PHP",
+    "sh": "BASH", "bash": "BASH", "zsh": "BASH", "shell": "SHELL",
+    "sql": "SQL",
+    "json": "JSON", "yaml": "YAML", "yml": "YAML",
+    "xml": "XML", "html": "HTML", "css": "CSS",
+    "md": "MARKDOWN", "markdown": "MARKDOWN",
+    "diff": "DIFF", "patch": "DIFF",
+    "scala": "SCALA", "groovy": "GROOVY",
+    "perl": "PERL", "lua": "LUA", "r": "R",
+    "objectivec": "OBJECTIVEC", "objc": "OBJECTIVEC",
+    "dart": "DART",
+    "dockerfile": "DOCKERFILE",
+    "makefile": "MAKEFILE",
+    "ini": "INI", "toml": "INI",
+    "powershell": "POWERSHELL", "ps1": "POWERSHELL",
+}
 
 
 def _is_table_row(line: str) -> bool:
@@ -100,95 +125,173 @@ def _is_table_sep(line: str) -> bool:
 
 
 def _parse_md_table(lines: list[str]) -> dict:
-    """lines[0]=header row, lines[1]=separator, lines[2:]=data rows."""
+    """v2 table element: header_style 是对象, columns 不带 tag, 单元格用 markdown."""
     def cells(line: str) -> list[str]:
         return [c.strip() for c in line.strip().strip('|').split('|')]
 
     headers = cells(lines[0])
     n = len(headers)
     columns = [
-        {"tag": "table_column", "name": f"c{i}", "display_name": h or f"Col{i+1}", "width": "auto"}
+        {
+            "name": f"c{i}",
+            "display_name": h or f"Col{i+1}",
+            "data_type": "markdown",
+            "width": "auto",
+            "horizontal_align": "left",
+            "vertical_align": "top",
+        }
         for i, h in enumerate(headers)
     ]
-    rows = []
+    rows: list[dict] = []
     for line in lines[2:]:
         cs = (cells(line) + [''] * n)[:n]
-        rows.append({f"c{i}": {"tag": "plain_text", "content": v} for i, v in enumerate(cs)})
+        rows.append({f"c{i}": v for i, v in enumerate(cs)})
     return {
         "tag": "table",
         "page_size": 10,
         "row_height": "low",
-        "header_style": "grey",
+        "header_style": {
+            "text_align": "left",
+            "text_size": "normal_v2",
+            "background_style": "grey",
+            "text_color": "default",
+            "bold": True,
+            "lines": 1,
+        },
         "columns": columns,
         "rows": rows,
     }
 
 
+def _normalize_lang(raw: str) -> str:
+    return _LANG_MAP.get(raw.strip().lower(), "PLAIN_TEXT")
+
+
+_INLINE_CODE_RE = re.compile(r'`([^`\n]+)`')
+_HEADING_RE = re.compile(r'^(#{1,6})\s+(.+?)\s*#*\s*$', re.MULTILINE)
+
+
 def _sanitize_md(text: str) -> str:
-    """Convert lark_md-unsupported syntax to supported equivalents."""
-    # lark_md 不支持 HTML 标签，转义 < 避免 Feishu API 报 11310
+    """v2 markdown 兼容 lark_md，并按视觉偏好降级：
+    - HTML-like 标签转义防解析失败（11310）。
+    - `# 标题` ~ `###### 标题` → `**标题**`，避免飞书 v2 标题字号过大。
+    - 单行 inline code `xxx` → 纯文本，避免色块抢视觉（fenced ``` 块在外层
+      切分阶段已被剥离，这里只会作用于普通段落里的反引号）。
+    """
     text = re.sub(r'<(/?\w[\w\s="\'.\-:]*?)>', r'&lt;\1&gt;', text)
-    lines = []
-    for line in text.split('\n'):
-        if line.startswith('> '):
-            lines.append(line[2:])
-        elif line == '>':
-            lines.append('')
-        elif re.match(r'^#{1,6}\s+', line):
-            content = re.sub(r'^#{1,6}\s+', '', line)
-            lines.append(f'**{content}**')
-        else:
-            lines.append(line)
-    return '\n'.join(lines)
+    text = _HEADING_RE.sub(lambda m: f'**{m.group(2)}**', text)
+    text = _INLINE_CODE_RE.sub(lambda m: m.group(1), text)
+    return text
+
+
+def _md_element(content: str) -> dict:
+    return {"tag": "markdown", "content": content}
+
+
+def _code_block_element(language: str, code: str) -> dict:
+    return {"tag": "code_block", "language": language, "text": code}
 
 
 def markdown_to_elements(text: str) -> list:
-    """Convert markdown to Feishu card elements: tables → native table, rest → lark_md div."""
-    text = _sanitize_md(text)
+    """文本 → v2 卡片 elements。
+
+    切分顺序：fenced ```lang``` 代码块独占一段 → code_block 元素；其它段再识别
+    md 表格 → table 元素；剩下作为 markdown 元素。
+    """
     elements: list[dict] = []
     lines = text.split('\n')
-    buf: list[str] = []
+    plain_buf: list[str] = []
 
-    def flush():
-        content = '\n'.join(buf).strip()
-        if content:
-            elements.append({"tag": "div", "text": {"tag": "lark_md", "content": content}})
-        buf.clear()
+    def flush_plain():
+        if not plain_buf:
+            return
+        plain_text = _sanitize_md('\n'.join(plain_buf)).strip('\n')
+        plain_buf.clear()
+        if not plain_text.strip():
+            return
+        # 在 plain 段内识别 markdown 表格
+        sub_lines = plain_text.split('\n')
+        sub_buf: list[str] = []
+
+        def flush_sub():
+            content = '\n'.join(sub_buf).strip()
+            sub_buf.clear()
+            if content:
+                elements.append(_md_element(content))
+
+        j = 0
+        while j < len(sub_lines):
+            ln = sub_lines[j]
+            if _is_table_row(ln) and j + 1 < len(sub_lines) and _is_table_sep(sub_lines[j + 1]):
+                flush_sub()
+                table_lines = [ln, sub_lines[j + 1]]
+                j += 2
+                while j < len(sub_lines) and _is_table_row(sub_lines[j]) and not _is_table_sep(sub_lines[j]):
+                    table_lines.append(sub_lines[j])
+                    j += 1
+                elements.append(_parse_md_table(table_lines))
+            else:
+                sub_buf.append(ln)
+                j += 1
+        flush_sub()
 
     i = 0
     while i < len(lines):
-        line = lines[i]
-        if _is_table_row(line) and i + 1 < len(lines) and _is_table_sep(lines[i + 1]):
-            flush()
-            table_lines = [line, lines[i + 1]]
-            i += 2
-            while i < len(lines) and _is_table_row(lines[i]) and not _is_table_sep(lines[i]):
-                table_lines.append(lines[i])
+        m = _FENCED_RE.match(lines[i])
+        if m:
+            # 飞书 v2 schema 实测拒 code_block tag（200621），统一退回 markdown 围栏。
+            # 试过把 diff 拆行用 lark_md `<font>` 上色拿红绿，但失去等宽 + 多空格折叠
+            # 后视觉上"都不像代码块了"，比无色更难读，已弃用——保等宽，认无色。
+            raw_lang = (m.group(1) or "").strip()
+            i += 1
+            code_lines: list[str] = []
+            while i < len(lines) and not lines[i].startswith('```'):
+                code_lines.append(lines[i])
                 i += 1
-            elements.append(_parse_md_table(table_lines))
+            if i < len(lines):
+                i += 1  # 跳过结束 ```
+            flush_plain()
+            fenced = f"```{raw_lang}\n" + '\n'.join(code_lines) + "\n```"
+            elements.append(_md_element(fenced))
         else:
-            buf.append(line)
+            plain_buf.append(lines[i])
             i += 1
 
-    flush()
-    return elements or [{"tag": "div", "text": {"tag": "lark_md", "content": text[:2000]}}]
+    flush_plain()
+    if not elements:
+        elements.append(_md_element(_sanitize_md(text[:2000])))
+    return elements
 
 
-def send_rich_card(client: lark.Client, chat_id: str, title: str, content: str, color: str = "blue") -> None:
-    """Send a Feishu card where markdown tables become native table elements."""
+def build_card_json(title: str, content: str, color: str = "blue", parse: bool = True) -> str:
+    """v2 schema 卡片 JSON（用于 create / reply / patch）。
+
+    parse=True：调 markdown_to_elements 把 fenced 代码块、表格转成原生元素（语法高亮）；
+    parse=False：直接整段塞进单个 markdown 元素，适合短文本或不希望解析的场景。
+    """
+    elements = markdown_to_elements(content) if parse else [_md_element(_sanitize_md(content))]
     card = {
-        "config": {"wide_screen_mode": True},
+        "schema": "2.0",
+        "config": {
+            "streaming_mode": False,
+            "width_mode": "fill",
+        },
         "header": {
             "title": {"tag": "plain_text", "content": title},
             "template": color,
         },
-        "elements": markdown_to_elements(content),
+        "body": {"elements": elements},
     }
+    return json.dumps(card, ensure_ascii=False)
+
+
+def send_rich_card(client: lark.Client, chat_id: str, title: str, content: str, color: str = "blue") -> None:
+    """v2 卡片，fenced 代码块原生高亮、表格走 native table."""
     body = (
         CreateMessageRequestBody.builder()
         .receive_id(chat_id)
         .msg_type("interactive")
-        .content(json.dumps(card))
+        .content(build_card_json(title, content, color))
         .build()
     )
     req = (
@@ -264,18 +367,10 @@ def add_reaction(client: lark.Client, message_id: str, emoji_type: str = "THUMBS
 
 def reply_rich_card(client: lark.Client, message_id: str, title: str, content: str, color: str = "blue") -> None:
     """以卡片形式回复指定消息（出现在原消息 thread 下）。"""
-    card = {
-        "config": {"wide_screen_mode": True},
-        "header": {
-            "title": {"tag": "plain_text", "content": title},
-            "template": color,
-        },
-        "elements": markdown_to_elements(content),
-    }
     body = (
         ReplyMessageRequestBody.builder()
         .msg_type("interactive")
-        .content(json.dumps(card))
+        .content(build_card_json(title, content, color))
         .build()
     )
     req = (
