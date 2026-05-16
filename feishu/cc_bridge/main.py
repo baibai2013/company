@@ -346,7 +346,8 @@ def _on_message_inner(data: P2ImMessageReceiveV1) -> None:
                 _pending_images[pending_key] = image_bytes
                 reply_rich_card(_client, message_id, "📷 已收到图片", "请问您有什么问题？", "blue")
                 return
-            if quote_parts:
+            # 命令（/cmd）不挂引用上下文，避免 message_handler 的 startswith("/") 判定被 [引用内容] 前缀绕过
+            if quote_parts and not text.startswith("/"):
                 ctx = "\n".join(quote_parts)
                 text = f"[引用内容]\n{ctx}\n---\n{text}" if text else ctx
         except Exception as exc:
@@ -356,8 +357,9 @@ def _on_message_inner(data: P2ImMessageReceiveV1) -> None:
         return
 
     # 回复型引用：parent_id 有值且尚无引用上下文时，拉取父消息
+    # 命令（/cmd）跳过：保持以 "/" 开头让 message_handler 走命令分支
     parent_id = getattr(msg, "parent_id", None) or ""
-    if parent_id and not text.startswith("[引用内容]"):
+    if parent_id and not text.startswith("[引用内容]") and not text.startswith("/"):
         parent_text = _fetch_parent_text(parent_id)
         if parent_text:
             text = f"[引用内容]\n{parent_text}\n---\n{text}" if text else parent_text

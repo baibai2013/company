@@ -72,6 +72,7 @@ class ThreadRouter:
         self._global_sema: asyncio.Semaphore | None = None
         self._mutex: asyncio.Lock | None = None
         self._loaded = False
+        self._reaper_task: asyncio.Task | None = None
 
     def _ensure_async_primitives(self):
         # 在 event loop 里第一次访问时再创建，避免主线程 import 时报 no running loop
@@ -82,6 +83,13 @@ class ThreadRouter:
         if not self._loaded:
             self._load()
             self._loaded = True
+        # 首次在 loop 内调用时启动 idle 子进程回收后台任务
+        if self._reaper_task is None:
+            try:
+                loop = asyncio.get_running_loop()
+            except RuntimeError:
+                return  # 不在 loop 内（例如 sync 测试），跳过
+            self._reaper_task = loop.create_task(self._reaper_loop())
 
     @property
     def global_sema(self) -> asyncio.Semaphore:
@@ -149,6 +157,8 @@ class ThreadRouter:
     def reset_current(self, chat_id: str, sender_id: str) -> Thread | None:
         """/new：清空指针。下条不引用的消息会建新话题。返回原指针指向的话题（仅展示）。"""
         key = self._current.pop((chat_id, sender_id), None)
+        if key:
+            self._save()
         return self._threads.get(key) if key else None
 
     def list_threads(self, chat_id: str) -> list[Thread]:
@@ -182,6 +192,52 @@ class ThreadRouter:
             for sk, tk in list(self._current.items()):
                 if tk == k:
                     self._current.pop(sk, None)
+
+    # ── 闲置子进程回收 ─────────────────────────────────────────────────────
+
+    @staticmethod
+    def _should_reap(thread: Thread, now: float) -> bool:
+        """判定是否需要 kill 该 thread 的 claude 子进程。"""
+        if thread.lock.locked():
+            return False  # 正在跑任务，不能回收
+        if now - thread.last_active < IDLE_TIMEOUT:
+            return False  # 还没到闲置阈值
+        runner = thread.runner
+        if runner is None:
+            return False  # 还没创建 runner，无须回收
+        proc = getattr(runner, "_process", None)
+        if proc is None or proc.returncode is not None:
+            return False  # 子进程已经退出
+        return True
+
+    async def _reap_idle(self) -> int:
+        """遍历所有话题，回收闲置子进程；返回实际 kill 的个数。"""
+        now = time.time()
+        reaped = 0
+        for t in list(self._threads.values()):
+            if not self._should_reap(t, now):
+                continue
+            try:
+                if await t.runner.stop():
+                    reaped += 1
+                    log.info(
+                        "reaped idle runner: key=%s title=%r idle=%ds",
+                        t.key, t.title, int(now - t.last_active),
+                    )
+            except Exception as exc:
+                log.warning("reap stop failed: key=%s err=%s", t.key, exc)
+        return reaped
+
+    async def _reaper_loop(self, interval: float = 60.0) -> None:
+        """每 interval 秒 tick 一次，永不退出（被 cancel 时优雅返回）。"""
+        while True:
+            try:
+                await asyncio.sleep(interval)
+                await self._reap_idle()
+            except asyncio.CancelledError:
+                return
+            except Exception as exc:
+                log.warning("reaper iteration failed: %s", exc)
 
     # ── 持久化 ──────────────────────────────────────────────────────────────
 

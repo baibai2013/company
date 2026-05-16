@@ -8,6 +8,7 @@ import asyncio
 import difflib
 import logging
 import os
+import re
 import time
 from collections import OrderedDict
 from pathlib import Path
@@ -81,6 +82,21 @@ def init_whitelist():
 
 # ── 卡片工具 ──────────────────────────────────────────────────────────────────
 
+# 抓"请升级至最新版本客户端"等卡片渲染问题的根因：把每张卡片的 JSON 落盘
+# 0=完全关闭（默认，生产用）；1=只在 create / reply / patch 失败时记；2=每次都记完整 JSON
+_CARD_LOG = int(os.getenv("CC_BRIDGE_LOG_CARD_JSON", "2"))
+_CARD_LOG_MAX = 4000
+
+
+def _log_card(action: str, target: str, card_json: str, ok: bool = True):
+    if _CARD_LOG <= 0:
+        return
+    if _CARD_LOG == 1 and ok:
+        return
+    snippet = card_json if len(card_json) <= _CARD_LOG_MAX else card_json[:_CARD_LOG_MAX] + "…(truncated)"
+    log.info("CARD[%s] target=%s ok=%s json=%s", action, target, ok, snippet)
+
+
 def _build_card_json(title: str, content: str, color: str) -> str:
     """v2 卡片：fenced code block 走原生 code_block，markdown 表格走原生 table."""
     return build_card_json(title, content, color)
@@ -90,15 +106,18 @@ def _create_card(
     client: lark.Client, chat_id: str, title: str, content: str, color: str = "grey",
     thread_key: str | None = None,
 ) -> str | None:
+    card_json = _build_card_json(title, content, color)
     body = (
         CreateMessageRequestBody.builder()
         .receive_id(chat_id).msg_type("interactive")
-        .content(_build_card_json(title, content, color))
+        .content(card_json)
         .build()
     )
     req = CreateMessageRequest.builder().receive_id_type("chat_id").request_body(body).build()
     resp = client.im.v1.message.create(req)
-    if resp.success() and resp.data and resp.data.message_id:
+    ok = bool(resp.success() and resp.data and resp.data.message_id)
+    _log_card("create", chat_id, card_json, ok=ok)
+    if ok:
         mid = resp.data.message_id
         _remember_card(mid, title, content)
         if thread_key:
@@ -113,15 +132,18 @@ def _reply_card(
     thread_key: str | None = None,
 ) -> str | None:
     """以卡片形式回复用户消息，返回新卡片的 message_id 供后续 patch。"""
+    card_json = _build_card_json(title, content, color)
     body = (
         ReplyMessageRequestBody.builder()
         .msg_type("interactive")
-        .content(_build_card_json(title, content, color))
+        .content(card_json)
         .build()
     )
     req = ReplyMessageRequest.builder().message_id(parent_id).request_body(body).build()
     resp = client.im.v1.message.reply(req)
-    if resp.success() and resp.data and resp.data.message_id:
+    ok = bool(resp.success() and resp.data and resp.data.message_id)
+    _log_card("reply", parent_id, card_json, ok=ok)
+    if ok:
         mid = resp.data.message_id
         _remember_card(mid, title, content)
         if thread_key:
@@ -132,10 +154,13 @@ def _reply_card(
 
 
 def _patch_card(client: lark.Client, message_id: str, title: str, content: str, color: str):
-    body = PatchMessageRequestBody.builder().content(_build_card_json(title, content, color)).build()
+    card_json = _build_card_json(title, content, color)
+    body = PatchMessageRequestBody.builder().content(card_json).build()
     req = PatchMessageRequest.builder().message_id(message_id).request_body(body).build()
     resp = client.im.v1.message.patch(req)
-    if not resp.success():
+    ok = resp.success()
+    _log_card("patch", message_id, card_json, ok=ok)
+    if not ok:
         log.warning("patch_card failed: %s %s", resp.code, resp.msg)
         return
     _remember_card(message_id, title, content)
@@ -182,10 +207,131 @@ def _step_line(name: str, input_dict: dict, cwd: str) -> str:
     elif name in ("WebFetch", "WebSearch"):
         t = input_dict.get("url") or input_dict.get("query", "")
         return f"{icon} {t[:80]}"
-    elif name == "TodoWrite":
-        return f"{icon} 更新任务列表"
     else:
         return f"{icon} {name}"
+
+
+# ── Todo 列表渲染 ────────────────────────────────────────────────────────────
+# 把 TaskCreate / TaskUpdate / TodoWrite 聚合成一个持续刷新的 todo 块，
+# 不让它们以"🔧 TaskUpdate"散行的形式淹没进度卡。
+# task_list 是 OrderedDict[task_id, {"subject": str, "status": str}]。
+#
+# TaskCreate 的真实 taskId 由 Claude 主 harness 分配，无法在 on_tool_start 时拿到。
+# 解决：on_tool_start 时把 input 暂存在 pending_creates[tool_use_id]，
+# 等 on_tool_result 拿到 "Task #N created successfully" 文本，解析 N 再写进 task_list。
+# 不这样做，--resume 续上的会话里 ID 从 5 起跳，本地从 1 数会错位制造孤儿条目。
+
+_TASK_CREATE_RE = re.compile(r"Task\s+#(\d+)\s+created\s+successfully", re.IGNORECASE)
+
+
+def _apply_task_update(task_list, name: str, input_dict: dict) -> bool:
+    """处理 TaskUpdate / TodoWrite。返回 True 表示需要刷新进度卡。"""
+    if name == "TodoWrite":
+        # 旧 API：一次性给整张 todos 列表，全量替换
+        task_list.clear()
+        for i, item in enumerate(input_dict.get("todos", []) or []):
+            tid = f"_tw_{i}"
+            task_list[tid] = {
+                "subject": item.get("content") or item.get("subject") or "(无标题)",
+                "status": item.get("status", "pending"),
+            }
+        return True
+
+    if name == "TaskUpdate":
+        tid = str(input_dict.get("taskId", "")).strip()
+        if not tid:
+            return False
+        new_status = input_dict.get("status")
+        if new_status == "deleted":
+            return task_list.pop(tid, None) is not None
+        new_subject = input_dict.get("subject")
+        cur = task_list.get(tid)
+        # B6：精确判断是否真有变更，避免无意义的进度卡 patch
+        changed = False
+        if cur is None:
+            # TaskUpdate 抢跑在 TaskCreate 的 result 之前（不太可能但容错）：先建占位
+            cur = {"subject": new_subject or f"Task #{tid}", "status": "pending"}
+            task_list[tid] = cur
+            changed = True
+        if new_subject and cur.get("subject") != new_subject:
+            cur["subject"] = new_subject
+            changed = True
+        if new_status and cur.get("status") != new_status:
+            cur["status"] = new_status
+            changed = True
+        return changed
+
+    return False
+
+
+def _resolve_task_create(task_list, pending_creates: dict, tool_use_id: str, result_text: str) -> bool:
+    """on_tool_result 时调：从结果文本里抠出真实 taskId，把暂存条目落到 task_list 里。
+
+    若 task_list[tid] 已存在（极少数：TaskUpdate 抢跑在 TaskCreate result 之前），
+    采用 merge 而非覆盖，避免抢跑分支已设的 status/subject 被 TaskCreate 的初始
+    pending 状态覆盖（B4 修复：保持单调前进）。
+    """
+    info = pending_creates.pop(tool_use_id, None)
+    if info is None:
+        return False
+    m = _TASK_CREATE_RE.search(result_text or "")
+    if not m:
+        # 解析失败（非典型结果）：用 tool_use_id 作 key 兜底，至少 subject 能被看到
+        log.warning("TaskCreate 结果未匹配 ID 模式：%.200s", result_text)
+        task_list[tool_use_id] = info
+        return True
+    tid = m.group(1)
+    existing = task_list.get(tid)
+    if existing is None:
+        task_list[tid] = info
+    else:
+        # 已有条目（TaskUpdate 抢跑）：合并，但已有的 status/subject 优先保留
+        for k, v in info.items():
+            existing.setdefault(k, v)
+    return True
+
+
+# todo 块单次最多展示 30 条，超出按"未完成优先 + 最近完成"折叠
+TODO_BLOCK_LIMIT = 30
+
+
+def _normalize_subject(subject: str | None) -> str:
+    """把换行/制表符压成单行；过长截断 60 字符。"""
+    s = (subject or "").replace("\n", " ").replace("\r", " ").replace("\t", " ").strip()
+    if not s:
+        return "(无标题)"
+    return s[:60] + "…" if len(s) > 60 else s
+
+
+def _build_todo_block(task_list) -> str | None:
+    """生成 todo 列表 markdown。空字典返回 None；超过 TODO_BLOCK_LIMIT 折叠。"""
+    if not task_list:
+        return None
+    items = list(task_list.items())
+    total = len(items)
+    hidden = 0
+    if total > TODO_BLOCK_LIMIT:
+        # 排序 key：未完成（pending/in_progress）优先 → 同组按原顺序末尾
+        # 实现：按 _STATUS_RANK 升序稳定排序，截前 N 条
+        rank = {"in_progress": 0, "pending": 1, "completed": 2}
+        items.sort(key=lambda kv: rank.get(kv[1].get("status", "pending"), 1))
+        hidden = total - TODO_BLOCK_LIMIT
+        items = items[:TODO_BLOCK_LIMIT]
+
+    lines = ["📋 任务列表"]
+    for _tid, info in items:
+        subject = _normalize_subject(info.get("subject"))
+        status = info.get("status", "pending")
+        # lark_md <font color> 由 sender._sanitize_md 白名单放行
+        if status == "completed":
+            lines.append(f"- [✓] <font color='green'>~~{subject}~~</font>")
+        elif status == "in_progress":
+            lines.append(f"- [~] <font color='blue'>{subject}</font>")
+        else:
+            lines.append(f"- [ ] <font color='grey'>{subject}</font>")
+    if hidden > 0:
+        lines.append(f"_…还有 {hidden} 条已折叠（按未完成优先展示）_")
+    return "\n".join(lines)
 
 
 def _norm_lines(s: str) -> list[str]:
@@ -298,6 +444,10 @@ async def handle_message(
             )
 
         steps: list[str] = []           # 进度卡步骤列表
+        # Task* / TodoWrite 聚合成单一 todo 块，不进 steps
+        task_list: OrderedDict[str, dict] = OrderedDict()
+        # TaskCreate 的 input 先暂存这里，等 on_tool_result 拿到真实 taskId 再合入 task_list
+        pending_creates: dict[str, dict] = {}
         last_patch = [0.0]
         last_text = [""]                # 最后一次完整文本，用于结果卡
         spinner_idx = [0]               # 思考中动画当前帧索引
@@ -305,37 +455,75 @@ async def handle_message(
         def _do_patch():
             if not progress_id:
                 return
-            if not steps:
+            todo_block = _build_todo_block(task_list)
+            if not steps and not todo_block:
                 _patch_card(client, progress_id, "⏳ 执行中", "处理中…", "grey")
                 return
             # 进度卡按字符数从尾部往前累，超出 MAX_CARD_LEN 就停并加省略提示。
+            # todo_block 在"必保留"集合：先扣它的预算，剩余给 steps。
             sep = "\n\n"
+            reserved = (len(todo_block) + len(sep)) if todo_block else 0
+            cap = max(0, MAX_CARD_LEN - reserved)
             picked: list[str] = []
             total = 0
             for s in reversed(steps):
                 cost = len(s) + (len(sep) if picked else 0)
-                if total + cost > MAX_CARD_LEN:
+                if total + cost > cap:
                     picked.append("…（前文省略）")
                     break
                 picked.append(s)
                 total += cost
-            content = sep.join(reversed(picked))
+            parts: list[str] = []
+            if todo_block:
+                parts.append(todo_block)
+            if picked:
+                parts.append(sep.join(reversed(picked)))
+            content = sep.join(parts)
             _patch_card(client, progress_id, "⏳ 执行中", content, "grey")
 
+        def _maybe_patch():
+            now = time.time()
+            if now - last_patch[0] >= 1.5:
+                last_patch[0] = now
+                _do_patch()
+
+        def _maybe_patch_todo():
+            """task_list 变化时用更短节流，保证状态切换的视觉反馈（B5）。"""
+            now = time.time()
+            if now - last_patch[0] >= 0.4:
+                last_patch[0] = now
+                _do_patch()
+
         async def on_tool_start(tool_use_id: str, name: str, input_dict: dict):
+            # TaskCreate：暂存等 on_tool_result 拿到真实 ID
+            if name == "TaskCreate":
+                pending_creates[tool_use_id] = {
+                    "subject": input_dict.get("subject") or "(无标题)",
+                    "status": "pending",
+                }
+                return
+            # TaskUpdate / TodoWrite：直接更新 todo 块
+            if name in ("TaskUpdate", "TodoWrite"):
+                if _apply_task_update(task_list, name, input_dict):
+                    _maybe_patch_todo()
+                return
+            # TaskList / TaskGet：纯查询，不显示
+            if name in ("TaskList", "TaskGet"):
+                return
+
             line = _step_line(name, input_dict, thread.cwd)
             # 进度卡的 diff 不带路径（_step_line 已经给过），与路径行紧贴，避免被 \n\n 拆开
             prog_block = _file_change_block(name, input_dict, thread.cwd, with_path=False)
             if prog_block:
                 line = f"{line}\n{prog_block}"
             steps.append(line)
-            now = time.time()
-            if now - last_patch[0] >= 1.5:
-                last_patch[0] = now
-                _do_patch()
+            _maybe_patch()
 
-        async def on_tool_result(_id: str, _text: str):
-            pass
+        async def on_tool_result(tool_use_id: str, text: str):
+            # 只关心 TaskCreate 的结果：从中抠真实 taskId 写回
+            if tool_use_id in pending_creates:
+                if _resolve_task_create(task_list, pending_creates, tool_use_id, text):
+                    _maybe_patch_todo()
 
         async def on_thinking(_text: str):
             # 4.7 thinking 是 redacted（无明文），text 仅占位用；
@@ -475,9 +663,16 @@ async def _handle_command(
         if not threads:
             _send("🧵 话题列表", "（暂无话题）", "blue")
             return
+        threads.sort(key=lambda x: -x.last_active)
+        # 默认只展示 20 个，/threads all 全量；防止飞书卡片正文超长
+        show_all = arg.strip().lower() == "all"
+        THREADS_LIMIT = 20
+        total = len(threads)
+        shown = threads if show_all else threads[:THREADS_LIMIT]
+
         lines = ["| | 标题 | 目录 | 上次活跃 |", "|---|---|---|---|"]
         now = time.time()
-        for t in sorted(threads, key=lambda x: -x.last_active):
+        for t in shown:
             mark = "▸" if cur and t.key == cur.key else " "
             idle = now - t.last_active
             if idle < 60:
@@ -489,6 +684,12 @@ async def _handle_command(
             cwd_short = Path(t.cwd).name or t.cwd
             title = t.title.replace("|", "/") or "（空）"
             lines.append(f"| {mark} | {title} | {cwd_short} | {idle_s}前 |")
+
+        hidden = total - len(shown)
+        if hidden > 0:
+            lines.append("")
+            lines.append(f"_还有 {hidden} 个，使用 `/threads all` 查看全部_")
+
         _send("🧵 话题列表", "\n".join(lines), "blue")
         return
 

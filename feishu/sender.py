@@ -171,16 +171,29 @@ _INLINE_CODE_RE = re.compile(r'`([^`\n]+)`')
 _HEADING_RE = re.compile(r'^(#{1,6})\s+(.+?)\s*#*\s*$', re.MULTILINE)
 
 
+_LARK_MD_TAG_RE = re.compile(r"</?(?:font|at|a|md-)\b[^>]*>", re.IGNORECASE)
+
+
 def _sanitize_md(text: str) -> str:
     """v2 markdown 兼容 lark_md，并按视觉偏好降级：
-    - HTML-like 标签转义防解析失败（11310）。
+    - HTML-like 标签转义防解析失败（11310）；但 lark_md 原生白名单（<font> <at> <a> 等）保留。
     - `# 标题` ~ `###### 标题` → `**标题**`，避免飞书 v2 标题字号过大。
     - 单行 inline code `xxx` → 纯文本，避免色块抢视觉（fenced ``` 块在外层
       切分阶段已被剥离，这里只会作用于普通段落里的反引号）。
     """
+    # 先把白名单标签搬到占位符，避免被通用转义吃掉
+    placeholders: list[str] = []
+
+    def _stash(m: re.Match) -> str:
+        placeholders.append(m.group(0))
+        return f"\x00LM{len(placeholders) - 1}\x00"
+
+    text = _LARK_MD_TAG_RE.sub(_stash, text)
     text = re.sub(r'<(/?\w[\w\s="\'.\-:]*?)>', r'&lt;\1&gt;', text)
     text = _HEADING_RE.sub(lambda m: f'**{m.group(2)}**', text)
     text = _INLINE_CODE_RE.sub(lambda m: m.group(1), text)
+    for i, raw in enumerate(placeholders):
+        text = text.replace(f"\x00LM{i}\x00", raw)
     return text
 
 
