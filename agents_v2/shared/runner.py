@@ -7,9 +7,12 @@ import base64
 import io
 import json
 import logging
+import re as _re
 import time as _time
 from contextvars import ContextVar
 from typing import TypedDict
+
+_SENTENCE_ENDS = _re.compile(r"[。？！.?!]")
 
 import redis.asyncio as aioredis
 
@@ -105,11 +108,29 @@ async def run_with_events(
 
     result_data: dict = {"route": "WORK", "plan": "", "result": "", "cc": []}
     _t0 = _time.perf_counter()
+    _first_sent = False
+    _stream_buffer = ""
 
     async with aioredis.from_url(REDIS_URL) as r:
 
         async def _pub(payload: dict) -> None:
             await r.publish("task_events", json.dumps(payload, ensure_ascii=False))
+
+        async def _pub_first_sentence(sentence: str) -> None:
+            """向 task_first_sentence 频道发布首句（仅 CHAT 路由，供飞书单聊展示打字中状态）。"""
+            nonlocal _first_sent
+            if _first_sent:
+                return
+            _first_sent = True
+            try:
+                await r.publish("task_first_sentence", json.dumps({
+                    "task_id": task_id,
+                    "employee": employee,
+                    "sentence": sentence.strip(),
+                    "chat_id": ctx.get("chat_id", ""),
+                }, ensure_ascii=False))
+            except Exception:
+                pass
 
         await _pub({
             "type": "employee_status",
@@ -120,31 +141,55 @@ async def run_with_events(
             "task_id": task_id,
         })
 
-        # astream(stream_mode="updates") yields {node_name: partial_state} per node
-        async for chunk in agent.astream(
+        # astream_events(v2) 同时支持节点级更新和 token 级流，用于首句快速推送
+        async for event in agent.astream_events(
             {"task_input": task_input, "route": "", "plan": "", "execution_result": "", "messages": []},
             config=config,
-            stream_mode="updates",
+            version="v2",
         ):
-            for node_name, node_out in (chunk.items() if isinstance(chunk, dict) else {}.items()):
-                if node_name in PHASE_LABELS:
-                    await _pub({
-                        "type": "employee_status",
-                        "employee": employee,
-                        "phase": node_name,
-                        "message": PHASE_LABELS[node_name],
-                        "task": text[:80],
-                        "task_id": task_id,
-                    })
-                if isinstance(node_out, dict):
-                    if node_out.get("execution_result"):
-                        result_data["result"] = node_out["execution_result"]
-                    if node_out.get("route"):
-                        result_data["route"] = node_out["route"]
-                    if node_out.get("plan"):
-                        result_data["plan"] = node_out["plan"]
-                    if node_out.get("cc"):
-                        result_data["cc"] = node_out["cc"]
+            kind = event.get("event", "")
+            name = event.get("name", "")
+            meta = event.get("metadata", {})
+            node = meta.get("langgraph_node", name)
+
+            # 节点开始：推送进度（等价于原 stream_mode="updates" 逻辑）
+            if kind == "on_chain_start" and node in PHASE_LABELS:
+                await _pub({
+                    "type": "employee_status",
+                    "employee": employee,
+                    "phase": node,
+                    "message": PHASE_LABELS[node],
+                    "task": text[:80],
+                    "task_id": task_id,
+                })
+
+            # token 级流：截取首句（仅 CHAT 路由的 chat 节点）
+            if kind == "on_chat_model_stream" and node == "chat":
+                chunk = event.get("data", {}).get("chunk")
+                content = getattr(chunk, "content", None) if chunk else None
+                if isinstance(content, str) and content:
+                    _stream_buffer += content
+                    if not _first_sent and result_data["route"] == "CHAT" and len(_stream_buffer) >= 10:
+                        m = _SENTENCE_ENDS.search(_stream_buffer)
+                        if m:
+                            await _pub_first_sentence(_stream_buffer[: m.start() + 1])
+
+            # 节点结束：更新 result_data
+            if kind == "on_chain_end" and node:
+                out = event.get("data", {}).get("output", {})
+                if isinstance(out, dict):
+                    if out.get("execution_result"):
+                        result_data["result"] = out["execution_result"]
+                    if out.get("route"):
+                        result_data["route"] = out["route"]
+                    if out.get("plan"):
+                        result_data["plan"] = out["plan"]
+                    if out.get("cc"):
+                        result_data["cc"] = out["cc"]
+
+        # 兜底：全程无句号时取前 60 字
+        if not _first_sent and _stream_buffer and result_data["route"] == "CHAT":
+            await _pub_first_sentence(_stream_buffer[:60])
 
         _elapsed = _time.perf_counter() - _t0
         _input_text = text if isinstance(text, str) else str(text)

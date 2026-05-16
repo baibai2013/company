@@ -16,10 +16,13 @@ registry。新员工无需复制目录、无需写 graph.py / main.py / agent_ca
 """
 from __future__ import annotations
 
+import hashlib as _hashlib
 import json
 import os
+import subprocess as _subprocess
 import sys
 import tempfile
+import time as _time_module
 from contextlib import asynccontextmanager
 from pathlib import Path
 
@@ -30,11 +33,46 @@ from agents_v2.shared.a2a_server import create_a2a_app
 from agents_v2.shared.db import async_checkpointer_ctx
 from agents_v2.shared.scheduler import AgentScheduler
 from agents_v2.shared.smart_graph import build_smart_agent
-from agents_v2.shared.tools import resolve_tools
+from agents_v2.shared.tools import resolve_tools, auto_registered_tools
 from backend.services import registry
 
 _app_ref: FastAPI | None = None
 _employee_key: str = ""
+
+# ── 版本信息（3.7）─────────────────────────────────────────────────────────────
+_PROCESS_START_TIME = _time_module.time()
+_GIT_INFO: dict = {}
+_LOADED_CONFIG_HASH: str = ""
+_CONFIG_LOADED_AT: float = 0.0
+
+
+def _git_info() -> dict:
+    """获取 git commit / branch，失败时返回 unknown。进程启动时执行一次。"""
+    try:
+        cwd = str(Path(__file__).parent.parent.parent)
+        commit = _subprocess.check_output(
+            ["git", "rev-parse", "--short", "HEAD"],
+            stderr=_subprocess.DEVNULL, timeout=3, cwd=cwd,
+        ).decode().strip()
+        branch = _subprocess.check_output(
+            ["git", "rev-parse", "--abbrev-ref", "HEAD"],
+            stderr=_subprocess.DEVNULL, timeout=3, cwd=cwd,
+        ).decode().strip()
+    except Exception:
+        commit, branch = "unknown", "unknown"
+    return {"git_commit": commit, "git_branch": branch}
+
+
+def _config_hash(cfg) -> str:
+    """计算 EffectiveConfig 的 MD5 短哈希（12位），用于检测配置是否变化。"""
+    if cfg is None:
+        return "none"
+    try:
+        data = {k: v for k, v in cfg.__dict__.items() if not k.startswith("_")}
+        payload = json.dumps(data, default=str, sort_keys=True, ensure_ascii=False)
+        return _hashlib.md5(payload.encode()).hexdigest()[:12]
+    except Exception:
+        return "error"
 
 
 def _load() -> tuple[str, dict]:
@@ -87,14 +125,19 @@ async def lifespan(inner_app: FastAPI):
         except Exception:
             cc_prompt = ""
 
-    # 解析工具：behavior.tools 的 + 所有员工默认获得的工具
+    # 解析工具：behavior.tools + auto_register=True 的工具（3.5）
     tool_names = list((cfg.behavior or {}).get("tools", [])) if cfg else []
-    # 默认工具：定时任务管理 + 消息发送（让 agent 能主动推送并感知发送结果）
-    for t in ("schedule_task", "cancel_scheduled_task", "list_scheduled_tasks",
-              "send_feishu_message", "send_group_chat_message", "recall_history"):
+    for t in auto_registered_tools():
         if t not in tool_names:
             tool_names.append(t)
     tools = resolve_tools(tool_names) if tool_names else None
+
+    # 初始化版本信息（3.7）
+    global _GIT_INFO, _LOADED_CONFIG_HASH, _CONFIG_LOADED_AT
+    if not _GIT_INFO:
+        _GIT_INFO = _git_info()
+    _LOADED_CONFIG_HASH = _config_hash(cfg)
+    _CONFIG_LOADED_AT = _time_module.time()
 
     async with async_checkpointer_ctx() as cp:
         inner_app.state.agent = build_smart_agent(_employee_key, cp, cc_prompt=cc_prompt, tools=tools)
@@ -113,10 +156,14 @@ async def lifespan(inner_app: FastAPI):
         # 确保 PG NOTIFY listener 在 lifespan 里就跑起来（不等第一条消息）
         registry.start_listener()
 
-        # 注册配置变更 hook：新增/删除任务时自动 reload scheduler
+        # 注册配置变更 hook：reload scheduler + 更新 config hash（3.7）
         async def _on_config_change(changed_key: str | None):
+            global _LOADED_CONFIG_HASH, _CONFIG_LOADED_AT
             if changed_key is None or changed_key == _employee_key:
                 await inner_app.state.scheduler.reload()
+                new_cfg = registry.get_effective_sync(_employee_key)
+                _LOADED_CONFIG_HASH = _config_hash(new_cfg)
+                _CONFIG_LOADED_AT = _time_module.time()
 
         registry.register_change_hook(_on_config_change)
 
@@ -228,6 +275,28 @@ async def scheduler_run_now(task_id: str):
     if result is None:
         return {"ok": False, "error": f"task {task_id} not found"}
     return {"ok": True, "result": result[:1000]}
+
+
+@app.get("/version")
+def version_info() -> dict:
+    """返回 agent 进程的版本与配置状态（运维可见性）。"""
+    import datetime as _dt
+    current_cfg = registry.get_effective_sync(_employee_key)
+    current_hash = _config_hash(current_cfg)
+    needs_reload = bool(_LOADED_CONFIG_HASH and current_hash != _LOADED_CONFIG_HASH)
+    return {
+        "employee_key": _employee_key,
+        "agent_port": getattr(current_cfg, "agent_port", None) if current_cfg else None,
+        **_GIT_INFO,
+        "config_hash": current_hash,
+        "loaded_config_hash": _LOADED_CONFIG_HASH,
+        "config_loaded_at_iso": (
+            _dt.datetime.fromtimestamp(_CONFIG_LOADED_AT).isoformat()
+            if _CONFIG_LOADED_AT else None
+        ),
+        "uptime_seconds": round(_time_module.time() - _PROCESS_START_TIME, 1),
+        "needs_reload": needs_reload,
+    }
 
 
 @app.post("/scheduler/event")

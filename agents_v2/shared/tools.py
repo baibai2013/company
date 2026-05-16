@@ -27,7 +27,8 @@ class ToolType(Enum):
 class ToolMeta:
     tool: object
     type: ToolType
-    hint: str           # 中文短描述，用于 _tools_hint
+    hint: str                    # 中文短描述，用于 _tools_hint
+    auto_register: bool = False  # True = 自动注入所有员工，无需在 behavior.tools 配置
 
 COMPANY_DIR = Path(__file__).parent.parent.parent
 
@@ -452,13 +453,18 @@ TOOL_META: dict[str, ToolMeta] = {
     "read_file":               ToolMeta(read_file,               ToolType.QUERY,  "读取文件"),
     "write_file":              ToolMeta(write_file,              ToolType.ACTION, "写入文件"),
     "get_metrics":             ToolMeta(get_metrics,             ToolType.QUERY,  "获取系统指标"),
-    "schedule_task":           ToolMeta(schedule_task,           ToolType.ACTION, "创建定时任务/提醒"),
-    "cancel_scheduled_task":   ToolMeta(cancel_scheduled_task,   ToolType.ACTION, "取消任务"),
-    "list_scheduled_tasks":    ToolMeta(list_scheduled_tasks,    ToolType.HYBRID, "查看任务列表"),
-    "send_feishu_message":     ToolMeta(send_feishu_message,     ToolType.ACTION, "发送飞书消息"),
-    "send_group_chat_message": ToolMeta(send_group_chat_message, ToolType.ACTION, "发送看板群聊消息"),
-    "recall_history":          ToolMeta(recall_history,          ToolType.QUERY,  "检索历史对话"),
+    "schedule_task":           ToolMeta(schedule_task,           ToolType.ACTION, "创建定时任务/提醒",  auto_register=True),
+    "cancel_scheduled_task":   ToolMeta(cancel_scheduled_task,   ToolType.ACTION, "取消任务",          auto_register=True),
+    "list_scheduled_tasks":    ToolMeta(list_scheduled_tasks,    ToolType.HYBRID, "查看任务列表",       auto_register=True),
+    "send_feishu_message":     ToolMeta(send_feishu_message,     ToolType.ACTION, "发送飞书消息",       auto_register=True),
+    "send_group_chat_message": ToolMeta(send_group_chat_message, ToolType.ACTION, "发送看板群聊消息",   auto_register=True),
+    "recall_history":          ToolMeta(recall_history,          ToolType.QUERY,  "检索历史对话",       auto_register=True),
 }
+
+
+def auto_registered_tools() -> list[str]:
+    """返回所有 auto_register=True 的工具名列表（按注册顺序）。"""
+    return [name for name, meta in TOOL_META.items() if meta.auto_register]
 
 # 向后兼容
 TOOL_REGISTRY: dict[str, object] = {k: v.tool for k, v in TOOL_META.items()}

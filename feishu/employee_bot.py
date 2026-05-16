@@ -181,9 +181,43 @@ async def _handle(employee: str, task: str, chat_id: str, client: lark.Client,
     else:
         thread_id = message_id or f"{chat_id}_{id(task)}"
         source = "feishu_group"
+
+    async def _listen_first_sentence() -> None:
+        """P2P 单聊专用：监听 Redis task_first_sentence 频道，提前展示打字中卡片。"""
+        if chat_type != "p2p":
+            return
+        try:
+            import redis.asyncio as _r
+            import time as _t_mod
+            async with _r.from_url("redis://localhost:6379/0") as rr:
+                pubsub = rr.pubsub()
+                await pubsub.subscribe("task_first_sentence")
+                deadline = _t_mod.monotonic() + 8.0
+                async for msg in pubsub.listen():
+                    if _t_mod.monotonic() > deadline:
+                        break
+                    if msg["type"] != "message":
+                        continue
+                    try:
+                        payload = json.loads(msg["data"])
+                    except Exception:
+                        continue
+                    if payload.get("task_id") != thread_id:
+                        continue
+                    sentence = payload.get("sentence", "")
+                    if sentence:
+                        _send_card(f"{emoji} 打字中…", f"{sentence}…", "grey")
+                    break
+        except asyncio.CancelledError:
+            pass
+        except Exception as exc:
+            log.debug("first_sentence listener failed: %s", exc)
+
+    _listener = asyncio.create_task(_listen_first_sentence())
     data = await handle_dispatch(employee, task_with_ctx, task_id=thread_id, chat_id=chat_id,
                                  image_base64=image_base64, image_media_type=image_media_type,
                                  session_config={"source": source})
+    _listener.cancel()
     route  = data.get("route", "WORK")
     plan   = data.get("plan", "")
     result = data.get("result", "(无输出)")
