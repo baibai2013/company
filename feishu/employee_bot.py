@@ -173,8 +173,12 @@ async def _handle(employee: str, task: str, chat_id: str, client: lark.Client,
     else:
         task_with_ctx = task
 
-    # 每条消息独立 thread，避免历史累积超长
-    thread_id = message_id or f"{chat_id}_{id(task)}"
+    # P2P 单聊：用 chat_id 做 thread，同一对话共享 LangGraph 历史
+    # 群聊：每条消息独立 thread，避免历史累积超长
+    if chat_type == "p2p":
+        thread_id = f"feishu_p2p_{chat_id}"
+    else:
+        thread_id = message_id or f"{chat_id}_{id(task)}"
     data = await handle_dispatch(employee, task_with_ctx, task_id=thread_id, chat_id=chat_id,
                                  image_base64=image_base64, image_media_type=image_media_type)
     route  = data.get("route", "WORK")

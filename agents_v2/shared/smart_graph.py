@@ -11,7 +11,7 @@
 """
 from typing import Annotated, Any, Literal, TypedDict
 
-from langchain_core.messages import HumanMessage, SystemMessage
+from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
 from langgraph.graph import END, START, StateGraph
 from langgraph.graph.message import add_messages
 
@@ -21,8 +21,8 @@ from agents_v2.shared.claude_client import make_langchain_llm
 
 _DEFAULT_ROUTE_PROMPT = """判断下面这条消息是「闲聊」还是「工作任务」。
 
-闲聊：问候、状态询问、随便聊聊、简单确认（如"在吗""怎么样""最近忙吗"）。
-工作任务：包含具体设计/开发/分析/建模/验证/输出/报告/计划等技术或业务要求。
+闲聊：问候、状态询问、随便聊聊、简单确认（如"在吗""怎么样""最近忙吗"）、询问对话历史或之前说过的内容（如"我刚才说的xxx是什么""你还记得..."）。
+工作任务：包含具体设计/开发/分析/建模/验证/输出/报告/计划等技术或业务要求，需要调用工具或产出具体结果。
 
 只回复一个词：CHAT 或 WORK，不要有其他内容。"""
 
@@ -135,11 +135,14 @@ def _chat_node(state: SmartState, employee_key: str) -> dict:
     suffix = _global_prompt(employee_key, "chat_suffix", _DEFAULT_CHAT_SUFFIX)
     query = _text_only(state["task_input"])
     llm = _llm_for(employee_key, "chat", default_model="claude-sonnet-4-6")
+    history = (state.get("messages") or [])[-20:]  # 最多 20 条历史，避免超 context
+    human_msg = _human_msg(state["task_input"])
     resp = llm.invoke([
         SystemMessage(_system_prompt_for(employee_key, suffix, query=query)),
-        _human_msg(state["task_input"]),
+        *history,
+        human_msg,
     ])
-    return {"execution_result": resp.content}
+    return {"execution_result": resp.content, "messages": [human_msg, resp]}
 
 
 def _plan_node(state: SmartState, employee_key: str) -> dict:
@@ -155,11 +158,14 @@ def _plan_node(state: SmartState, employee_key: str) -> dict:
 def _execute_node(state: SmartState, employee_key: str) -> dict:
     query = _text_only(state["task_input"])
     llm = _llm_for(employee_key, "execute", default_model="claude-opus-4-6")
+    history = (state.get("messages") or [])[-20:]
+    human_msg = _human_msg(state["task_input"], prefix=f"执行方案：{state['plan']}\n\n原始需求（如有图请一并分析）：\n")
     resp = llm.invoke([
         SystemMessage(_system_prompt_for(employee_key, query=query)),
-        _human_msg(state["task_input"], prefix=f"执行方案：{state['plan']}\n\n原始需求（如有图请一并分析）：\n"),
+        *history,
+        human_msg,
     ])
-    return {"execution_result": resp.content}
+    return {"execution_result": resp.content, "messages": [human_msg, resp]}
 
 
 def _tools_hint(tools: list) -> str:
@@ -188,9 +194,12 @@ def _react_node(state: SmartState, employee_key: str, tools: list, max_rounds: i
     tool_map = {t.name: t for t in tools}
 
     plan_prefix = f"执行方案：{state['plan']}\n\n" if state.get("plan") else ""
+    history = (state.get("messages") or [])[-20:]
+    human_msg = _human_msg(state["task_input"], prefix=f"{plan_prefix}原始需求：\n")
     messages = [
         SystemMessage(_system_prompt_for(employee_key, _tools_hint(tools), query=query)),
-        _human_msg(state["task_input"], prefix=f"{plan_prefix}原始需求：\n"),
+        *history,
+        human_msg,
     ]
 
     for _ in range(max_rounds):
@@ -214,7 +223,9 @@ def _react_node(state: SmartState, employee_key: str, tools: list, max_rounds: i
     if not final:
         summary = llm.invoke(messages)
         final = summary.content or "操作完成"
-    return {"execution_result": final}
+    # 把本轮对话写入历史（不含 tool messages）
+    exchange = [m for m in messages[len(history) + 1:] if isinstance(m, (HumanMessage, AIMessage))]
+    return {"execution_result": final, "messages": exchange}
 
 
 def _react_chat_node(state: SmartState, employee_key: str, tools: list) -> dict:
@@ -225,10 +236,13 @@ def _react_chat_node(state: SmartState, employee_key: str, tools: list) -> dict:
     query = _text_only(state["task_input"])
     llm = _llm_for(employee_key, "chat", default_model="claude-sonnet-4-6").bind_tools(tools)
     tool_map = {t.name: t for t in tools}
+    history = (state.get("messages") or [])[-20:]
+    human_msg = _human_msg(state["task_input"])
 
     messages = [
         SystemMessage(_system_prompt_for(employee_key, suffix + _tools_hint(tools), query=query)),
-        _human_msg(state["task_input"]),
+        *history,
+        human_msg,
     ]
 
     for _ in range(4):
@@ -246,7 +260,9 @@ def _react_chat_node(state: SmartState, employee_key: str, tools: list) -> dict:
          if isinstance(m, AIMessage) and not m.tool_calls and m.content),
         None,
     )
-    return {"execution_result": final or ""}
+    # 把本轮对话（不含 system / tool messages）写入历史
+    exchange = [m for m in messages[len(history) + 1:] if isinstance(m, (HumanMessage, AIMessage))]
+    return {"execution_result": final or "", "messages": exchange}
 
 
 def _valid_employees() -> set[str]:
