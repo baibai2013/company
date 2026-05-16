@@ -110,6 +110,7 @@ class ClaudeRunner:
         on_chunk: callable = None,
         on_tool_start: callable = None,
         on_tool_result: callable = None,
+        on_text: callable = None,
     ) -> tuple[str, list[str]]:
         """
         执行 Claude Code CLI，流式返回结果。
@@ -176,6 +177,9 @@ class ClaudeRunner:
                                 continue
                             if block.get("type") == "text":
                                 accumulated.append(block["text"])
+                                if on_text:
+                                    preview = "".join(accumulated)[:50]
+                                    await on_text(preview)
                             elif block.get("type") == "tool_use":
                                 if current_tool:
                                     tool_log.append(f"✅ {current_tool}")

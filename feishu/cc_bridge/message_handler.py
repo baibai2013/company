@@ -209,6 +209,17 @@ async def handle_message(
         async def on_tool_result(_id: str, _text: str):
             pass
 
+        async def on_text(preview: str):
+            line = f"💬 {preview}…"
+            if steps and steps[-1].startswith("💬"):
+                steps[-1] = line  # 更新上一行，避免刷屏
+            else:
+                steps.append(line)
+            now = time.time()
+            if now - last_patch[0] >= 1.5:
+                last_patch[0] = now
+                _do_patch()
+
         # 准备图片
         image_paths = []
         if image_bytes:
@@ -220,6 +231,7 @@ async def handle_message(
                 image_paths=image_paths,
                 on_tool_start=on_tool_start,
                 on_tool_result=on_tool_result,
+                on_text=on_text,
             )
         except Exception as exc:
             log.exception("Claude runner 异常")
