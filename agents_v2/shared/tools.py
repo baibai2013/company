@@ -394,6 +394,42 @@ def send_group_chat_message(content: str) -> str:
         return f"群聊发送失败: {e}"
 
 
+@tool
+def recall_history(offset: int = 20, count: int = 20) -> str:
+    """检索当前对话的更早历史（滑动窗口）。
+
+    当前上下文中找不到用户之前说的信息时调用。
+    offset: 跳过最近多少条消息（默认 20，即从第 21 条开始往前取）
+    count: 要取多少条（默认 20）
+    """
+    from agents_v2.shared import runner
+    from langchain_core.messages import HumanMessage, AIMessage
+
+    thread_id = runner.current_thread_id.get("")
+    if not thread_id:
+        return "无法获取对话历史"
+
+    msgs = runner._thread_history.get(thread_id, [])
+    total = len(msgs)
+    if total == 0:
+        return "暂无历史记录（本次对话尚未缓存）"
+
+    start = max(0, total - offset - count)
+    end = max(0, total - offset)
+    batch = msgs[start:end]
+    if not batch:
+        return f"没有更早的历史了（共 {total} 条消息）"
+
+    result = [f"（第 {start + 1}–{end} 条，共 {total} 条）"]
+    for m in batch:
+        if isinstance(m, HumanMessage):
+            content = m.content if isinstance(m.content, str) else ""
+            result.append(f"[用户]: {content[:300]}")
+        elif isinstance(m, AIMessage) and not getattr(m, "tool_calls", None):
+            result.append(f"[AI]: {str(m.content)[:300]}")
+    return "\n".join(result)
+
+
 # ── 注册表 ───────────────────────────────────────────────────────────────────
 
 TOOL_REGISTRY: dict[str, object] = {
@@ -406,6 +442,7 @@ TOOL_REGISTRY: dict[str, object] = {
     "list_scheduled_tasks": list_scheduled_tasks,
     "send_feishu_message": send_feishu_message,
     "send_group_chat_message": send_group_chat_message,
+    "recall_history": recall_history,
 }
 
 

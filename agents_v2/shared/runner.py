@@ -2,16 +2,28 @@
 Shared runner: astream_events + Redis progress publishing.
 All employees call run_with_events() instead of ainvoke().
 """
+import asyncio
 import base64
 import io
 import json
+import logging
 import time as _time
 from contextvars import ContextVar
 
 import redis.asyncio as aioredis
 
+log = logging.getLogger(__name__)
+
 # 当前 Feishu 对话的 chat_id（P2P 或群）—— 供工具在调用期间读取
 current_feishu_chat_id: ContextVar[str] = ContextVar("feishu_chat_id", default="")
+
+# 当前对话的 LangGraph thread_id —— 供 recall_history 工具读取
+current_thread_id: ContextVar[str] = ContextVar("thread_id", default="")
+
+# 进程内消息缓存：thread_id → 完整 messages 列表（每次 run_with_events 完成后更新）
+_thread_history: dict[str, list] = {}
+# 已触发摘要时的消息数：thread_id → count（防止重复摘要）
+_summarized_at: dict[str, int] = {}
 
 
 def _resize_image_b64(b64: str, max_side: int = 1568) -> str:
@@ -58,8 +70,10 @@ async def run_with_events(
     image_base64 = ctx.get("image_base64", "")
     image_media_type = ctx.get("image_media_type", "image/jpeg")
 
-    # 把当前对话的 chat_id 注入 ContextVar，工具（send_feishu_message / schedule_task）可读取
+    # 注入 ContextVar：chat_id 供发消息工具用，thread_id 供 recall_history 工具用
     _chat_token = current_feishu_chat_id.set(ctx.get("chat_id", ""))
+    _thread = config.get("configurable", {}).get("thread_id", task_id)
+    _thread_token = current_thread_id.set(_thread)
 
     # 压缩图片到 Claude 推荐的最大尺寸（避免超 token 限制）
     if image_base64:
@@ -131,5 +145,48 @@ async def run_with_events(
             "tokens_out_approx": len(result_data.get("result", "")) // 4,
         })
 
+    # stream 完成后缓存完整 messages，并在满足条件时后台触发自动摘要
+    try:
+        state = await agent.aget_state(config)
+        msgs = (state.values or {}).get("messages", [])
+        _thread_history[_thread] = msgs
+        last_sum = _summarized_at.get(_thread, 0)
+        if len(msgs) >= 100 and len(msgs) - last_sum >= 50:
+            asyncio.create_task(_auto_summarize(employee, _thread, msgs))
+    except Exception:
+        pass
+
     current_feishu_chat_id.reset(_chat_token)
+    current_thread_id.reset(_thread_token)
     return result_data
+
+
+async def _auto_summarize(employee: str, thread_id: str, msgs: list) -> None:
+    """后台：对 -40 之前的旧消息生成摘要，写入长期记忆。"""
+    from langchain_core.messages import HumanMessage, AIMessage, SystemMessage
+    from agents_v2.shared.claude_client import make_langchain_llm
+    from backend.repos import memory_repo
+
+    old_msgs = msgs[:-40]   # 只摘要 -40 之前的，保留最近 40 条为原始上下文
+    lines = [
+        f"{'用户' if isinstance(m, HumanMessage) else 'AI'}: {str(m.content)[:300]}"
+        for m in old_msgs
+        if isinstance(m, (HumanMessage, AIMessage)) and not getattr(m, "tool_calls", None)
+    ]
+    if not lines:
+        return
+
+    text = "\n".join(lines[-60:])   # 最多压缩 60 行
+    try:
+        llm = make_langchain_llm("claude-haiku-4-5-20251001")
+        resp = llm.invoke([
+            SystemMessage("压缩以下对话为100字以内摘要，保留关键事实（IP、配置、决策等）。"),
+            HumanMessage(text),
+        ])
+        summary = resp.content.strip()
+        if summary:
+            await memory_repo.save(employee, summary, session_id=thread_id)
+            _summarized_at[thread_id] = len(msgs)
+            log.info("auto_summarize: employee=%s thread=%s msgs=%d", employee, thread_id[:20], len(msgs))
+    except Exception as e:
+        log.debug("auto_summarize failed: %s", e)

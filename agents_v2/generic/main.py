@@ -91,7 +91,7 @@ async def lifespan(inner_app: FastAPI):
     tool_names = list((cfg.behavior or {}).get("tools", [])) if cfg else []
     # 默认工具：定时任务管理 + 消息发送（让 agent 能主动推送并感知发送结果）
     for t in ("schedule_task", "cancel_scheduled_task", "list_scheduled_tasks",
-              "send_feishu_message", "send_group_chat_message"):
+              "send_feishu_message", "send_group_chat_message", "recall_history"):
         if t not in tool_names:
             tool_names.append(t)
     tools = resolve_tools(tool_names) if tool_names else None

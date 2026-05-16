@@ -46,6 +46,17 @@ class SmartState(TypedDict):
 
 # ── Helpers ──────────────────────────────────────────────────────────────────
 
+def _get_history(state: "SmartState", cap: int = 40) -> list:
+    """动态滑动窗口：
+    - 总消息数 < 100：取最近 min(total, cap) 条原始消息
+    - 总消息数 ≥ 100：取最近 20 条（依赖长期记忆摘要注入 system prompt 补充远程上下文）
+    """
+    msgs = state.get("messages") or []
+    if len(msgs) >= 100:
+        return msgs[-20:]
+    return msgs[-cap:]
+
+
 def _text_only(task_input: Any) -> str:
     if isinstance(task_input, list):
         parts = [b.get("text", "") for b in task_input if b.get("type") == "text"]
@@ -135,7 +146,7 @@ def _chat_node(state: SmartState, employee_key: str) -> dict:
     suffix = _global_prompt(employee_key, "chat_suffix", _DEFAULT_CHAT_SUFFIX)
     query = _text_only(state["task_input"])
     llm = _llm_for(employee_key, "chat", default_model="claude-sonnet-4-6")
-    history = (state.get("messages") or [])[-20:]  # 最多 20 条历史，避免超 context
+    history = _get_history(state)
     human_msg = _human_msg(state["task_input"])
     resp = llm.invoke([
         SystemMessage(_system_prompt_for(employee_key, suffix, query=query)),
@@ -158,7 +169,7 @@ def _plan_node(state: SmartState, employee_key: str) -> dict:
 def _execute_node(state: SmartState, employee_key: str) -> dict:
     query = _text_only(state["task_input"])
     llm = _llm_for(employee_key, "execute", default_model="claude-opus-4-6")
-    history = (state.get("messages") or [])[-20:]
+    history = _get_history(state)
     human_msg = _human_msg(state["task_input"], prefix=f"执行方案：{state['plan']}\n\n原始需求（如有图请一并分析）：\n")
     resp = llm.invoke([
         SystemMessage(_system_prompt_for(employee_key, query=query)),
@@ -194,7 +205,7 @@ def _react_node(state: SmartState, employee_key: str, tools: list, max_rounds: i
     tool_map = {t.name: t for t in tools}
 
     plan_prefix = f"执行方案：{state['plan']}\n\n" if state.get("plan") else ""
-    history = (state.get("messages") or [])[-20:]
+    history = _get_history(state)
     human_msg = _human_msg(state["task_input"], prefix=f"{plan_prefix}原始需求：\n")
     messages = [
         SystemMessage(_system_prompt_for(employee_key, _tools_hint(tools), query=query)),
@@ -223,8 +234,12 @@ def _react_node(state: SmartState, employee_key: str, tools: list, max_rounds: i
     if not final:
         summary = llm.invoke(messages)
         final = summary.content or "操作完成"
-    # 把本轮对话写入历史（不含 tool messages）
-    exchange = [m for m in messages[len(history) + 1:] if isinstance(m, (HumanMessage, AIMessage))]
+    # 把本轮对话写入历史：只保留无 tool_calls 的 AI 回复，避免孤立的 tool_use 块
+    exchange = [
+        m for m in messages[len(history) + 1:]
+        if isinstance(m, HumanMessage)
+        or (isinstance(m, AIMessage) and not getattr(m, "tool_calls", None))
+    ]
     return {"execution_result": final, "messages": exchange}
 
 
@@ -236,7 +251,7 @@ def _react_chat_node(state: SmartState, employee_key: str, tools: list) -> dict:
     query = _text_only(state["task_input"])
     llm = _llm_for(employee_key, "chat", default_model="claude-sonnet-4-6").bind_tools(tools)
     tool_map = {t.name: t for t in tools}
-    history = (state.get("messages") or [])[-20:]
+    history = _get_history(state)
     human_msg = _human_msg(state["task_input"])
 
     messages = [
@@ -260,8 +275,12 @@ def _react_chat_node(state: SmartState, employee_key: str, tools: list) -> dict:
          if isinstance(m, AIMessage) and not m.tool_calls and m.content),
         None,
     )
-    # 把本轮对话（不含 system / tool messages）写入历史
-    exchange = [m for m in messages[len(history) + 1:] if isinstance(m, (HumanMessage, AIMessage))]
+    # 把本轮对话写入历史：只保留无 tool_calls 的 AI 回复，避免历史里出现孤立的 tool_use 块
+    exchange = [
+        m for m in messages[len(history) + 1:]
+        if isinstance(m, HumanMessage)
+        or (isinstance(m, AIMessage) and not getattr(m, "tool_calls", None))
+    ]
     return {"execution_result": final or "", "messages": exchange}
 
 
