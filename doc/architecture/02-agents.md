@@ -289,3 +289,47 @@ config = {"configurable": {"thread_id": thread_id}}
 | testing | 🧪 | 狐妖小红娘 | 9006 | 测试和质量保证 |
 | cost | 💰 | 兔子精 | 9007 | 成本分析和供应链 |
 | sysadmin | 🖥️ | 零 | 9009 | 系统运维和开发 |
+
+---
+
+## 执行后端：双轨制（langchain ↔ claude code CLI）
+
+每个员工的 LangGraph 图里 **WORK 路径**（execute 节点）有两套实现，通过
+`employees.behavior.exec_backend` 字段切换；CHAT/route/plan/cc 节点始终用 langchain。
+
+| 后端 | 适用 | 详情 |
+|---|---|---|
+| `cc`（默认 + 推荐） | 复杂工程任务、需要完整 skill / MCP 能力 | 调 claude code CLI 子进程，吃 Bash/Read/Write/Edit/Glob/Grep/TodoWrite + skills + MCP servers；员工 cwd 用 sandbox-exec 强制隔离；通过 MCP server 暴露项目特有 6 个工具 |
+| `langchain` | 极简任务 + 应急 fallback | langchain Opus + 10 个 Python @tool；冷启快但能力受限；CCExecutorFailed 时自动回退此路径 |
+
+**优先级**：env `EMPLOYEE_EXEC_BACKEND` > DB `behavior.exec_backend` > 默认 `langchain`。生产 10 员工已全部 `cc`。
+
+**员工 cwd**（DB `employees.cwd` 字段）：
+- sysadmin / tech_lead → `/Users/liyijiang/work/company`（主仓库全权）
+- 其他 8 员工 → `/Users/liyijiang/work/company/employees/<key>/`（隔离）
+- 首次启动自动 `mkdir -p` + 写 `CLAUDE.md` + `.gitignore`
+
+**沙箱**（`infra/sandbox/employee.sb`）：
+- 默认 `(deny default)`，仅允许写 `${CWD}` + `~/.Trash` + `/tmp` + `~/.claude`
+- 文件读全开（claude 要 grep 全项目）
+- 网络全开（Anthropic API + MCP）
+- env `EMPLOYEE_SANDBOX=0` 一键禁用调试
+
+**MCP server**（`mcp_servers/company_tools/`）：
+- 暴露 7 个项目工具：`schedule_task` / `cancel_scheduled_task` / `list_scheduled_tasks` /
+  `send_feishu_message` / `send_group_chat_message` / `recall_history` /
+  `delegate_to_employee`
+- claude code 通过 stdio 调用，每次内联 `--mcp-config`，env 注入 chat_id/thread_id/凭证
+
+**跨员工协作**：员工 A 想改员工 B 负责的目录文件 → 调 `delegate_to_employee(B, task)` → backend 异步 fire-and-forget 触发 B 的 a2a tasks/send → B 在飞书原对话独立完成。归属表 `path_ownership(path_pattern, employee_key, priority)` 决定路径归谁。
+
+**关键文件**：
+- `agents_v2/shared/cc_executor.py` — claude code 子进程薄封装
+- `agents_v2/shared/sandbox.py` — sandbox-exec 启动器
+- `agents_v2/shared/mcp_config.py` — MCP 配置生成
+- `agents_v2/shared/employee_workspace.py` — cwd + CLAUDE.md 初始化
+- `agents_v2/shared/ownership.py` — 路径归属解析
+- `mcp_servers/company_tools/server.py` — MCP server 主入口
+- `infra/sandbox/employee.sb` — sandbox profile 模板
+
+详细方案：`doc/design/employee-claude-code-backend.md`

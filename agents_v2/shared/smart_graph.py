@@ -238,6 +238,8 @@ def _plan_node(state: SmartState, employee_key: str) -> dict:
 
 
 def _execute_node(state: SmartState, employee_key: str) -> dict:
+    # legacy fallback only — 主路径走 _cc_work_node（claude code CLI 后端），
+    # 此节点保留作 CCExecutorFailed 时的应急回退（保留代码 1 周观察期）
     query = _text_only(state["task_input"])
     llm = _llm_for(employee_key, "execute", default_model="claude-opus-4-7")
     history = _get_history(state)
@@ -276,7 +278,11 @@ def _is_all_action(tool_calls: list, tools: list) -> bool:
 
 
 def _react_node(state: SmartState, employee_key: str, tools: list, max_rounds: int = 8) -> dict:
-    """ReAct 工具调用循环 — 带工具的 execute node。"""
+    """ReAct 工具调用循环 — 带工具的 execute node。
+
+    legacy fallback only — 主路径走 _cc_work_node（claude code CLI 后端），
+    此节点保留作 CCExecutorFailed 时的应急回退（保留代码 1 周观察期）。
+    """
     from langchain_core.messages import AIMessage, ToolMessage as TM
 
     query = _text_only(state["task_input"])
