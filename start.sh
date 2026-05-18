@@ -144,21 +144,15 @@ echo ""
 info "启动 Backend API (port 8000)..."
 start_py "backend" 8000 -m uvicorn backend.main:app --host 0.0.0.0 --port 8000 --reload --reload-dir backend
 
-# ── 3. TechLead Supervisor (:9000) ────────────────────────────────────────────
-echo ""
-info "启动 TechLead Supervisor (port 9000)..."
-start_py "tech_lead" 9000 -m agents_v2.tech_lead.main
-
-# ── 4. 员工 Agents — 从 DB registry 读列表 ────────────────────────────────────
+# ── 3. 员工 Agents — 从 DB registry 读列表（含 tech_lead）────────────────────
 echo ""
 info "启动员工 Agents（来自 employee 表）..."
 
-# Fetch active employees + ports from registry; tech_lead already started above.
+# 所有 active 员工统一从 registry 拿 agent_port；tech_lead 没有独立目录，会走 generic.main
 EMPLOYEE_LIST=$(cd "$COMPANY_DIR" && .venv/bin/python -c "
 from backend.services import registry
 registry.warmup_sync()
 for k in registry.list_keys_sync_cached(active_only=True):
-    if k == 'tech_lead': continue
     cfg = registry.get_effective_sync(k)
     if cfg and cfg.agent_port:
         print(f'{k}:{cfg.agent_port}')
@@ -176,7 +170,7 @@ while IFS= read -r entry; do
   fi
 done <<< "$EMPLOYEE_LIST"
 
-# ── 5. Frontend (port 5173) ───────────────────────────────────────────────────
+# ── 4. Frontend (port 5173) ───────────────────────────────────────────────────
 if [[ $NO_FRONTEND -eq 0 ]]; then
   echo ""
   info "启动前端 dev server (port 5173)..."
@@ -203,7 +197,7 @@ else
   warn "跳过前端（--no-frontend）"
 fi
 
-# ── 6. Feishu Bot ─────────────────────────────────────────────────────────────
+# ── 5. Feishu Bot ─────────────────────────────────────────────────────────────
 if [[ $NO_FEISHU -eq 0 ]]; then
   echo ""
   info "启动飞书机器人..."
@@ -222,7 +216,7 @@ else
   warn "跳过飞书机器人（--no-feishu）"
 fi
 
-# ── 7. 员工独立 Bot — 从 DB registry 读列表 ──────────────────────────────────
+# ── 6. 员工独立 Bot — 从 DB registry 读列表 ──────────────────────────────────
 if [[ $NO_FEISHU -eq 0 ]]; then
   echo ""
   info "检查员工独立 Bot（来自 employee 表）..."
@@ -248,7 +242,7 @@ for k in registry.list_keys_sync_cached(active_only=True):
   [[ $started_bots -eq 0 ]] && warn "无员工配置飞书 App ID，跳过"
 fi
 
-# ── 8. CC Bridge（飞书 ↔ Claude Code CLI）────────────────────────────────────
+# ── 7. CC Bridge（飞书 ↔ Claude Code CLI）────────────────────────────────────
 # 用 jurigged 启动以支持代码热更新（改函数体保存即生效）。
 # macOS 后台进程下 FSEvents 不投递事件，必须用 --poll 强制轮询。
 if [[ $NO_FEISHU -eq 0 ]]; then
@@ -261,14 +255,14 @@ if [[ $NO_FEISHU -eq 0 ]]; then
   ok "CC Bridge PID=$!  (logs/cc_bridge.log)"
 fi
 
-# ── 9. GroupOrchestrator ──────────────────────────────────────────────────────
+# ── 8. GroupOrchestrator ──────────────────────────────────────────────────────
 echo ""
 info "启动 GroupOrchestrator（群聊调度器）..."
 nohup .venv/bin/python -m group_chat.orchestrator > "$LOG_DIR/orchestrator.log" 2>&1 &
 echo "orchestrator $!" >> "$PID_FILE"
 ok "GroupOrchestrator (logs/orchestrator.log)"
 
-# ── 9. 热更新守护进程 ─────────────────────────────────────────────────────────
+# ── 9. 热更新守护进程 ────────────────────────────────────────────────────────
 echo ""
 info "启动热更新守护进程..."
 nohup .venv/bin/python scripts/hot_reload.py > "$LOG_DIR/hot_reload.log" 2>&1 &
@@ -303,7 +297,7 @@ echo ""
 echo "  🖥️  前端看板:        http://localhost:5173"
 echo "  🔧  Backend API:    http://localhost:8000/health"
 echo "  🏗️  TechLead:       http://localhost:9000/.well-known/agent.json"
-echo "  👷  员工 Agents:    :9001 ~ :9008"
+echo "  👷  其他员工 Agents: :9001 ~ :9008"
 [[ $NO_DOCKER -eq 0 ]] && echo "  💬  Mattermost:     http://localhost:8065"
 [[ $NO_DOCKER -eq 0 ]] && echo "  📦  Gitea:          http://localhost:3000"
 [[ $NO_DOCKER -eq 0 ]] && echo "  🔁  n8n:            http://localhost:5678"
