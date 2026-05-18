@@ -29,8 +29,31 @@ _LOCAL_CMDS = {
 }
 
 # 飞书等价命令重定向：用户输入 → 实际执行
+# 包含 Claude Code 原生命令名 + shell 习惯别名，统一映射到 Bridge 主命令
 _REDIRECT_CMDS = {
+    # 清空上下文 / 开新话题
     "/clear": "/new",
+    "/reset": "/new",
+    # 终止当前任务
+    "/kill": "/stop",
+    "/abort": "/stop",
+    "/cancel": "/stop",
+    # 工作目录
+    "/cd": "/cwd",
+    "/pwd": "/cwd",
+    # 状态
+    "/info": "/status",
+    # 话题列表（借 Claude Code 的 /resume 名义）
+    "/resume": "/threads",
+    "/list": "/threads",
+    "/ls": "/threads",
+    # 帮助
+    "/?": "/help",
+    "/h": "/help",
+    # 别名：日志/记忆缩写
+    "/mem": "/memory",
+    "/perm": "/permissions",
+    "/perms": "/permissions",
 }
 
 # 飞书不支持的命令（TUI 专属）
@@ -61,19 +84,19 @@ def get_unsupported(cmd: str) -> str | None:
 # ── /help ─────────────────────────────────────────────────────────────────────
 
 _HELP_BRIEF = """**📌 Bridge 命令**
-- `/new` 新话题（清空上下文）
-- `/stop` 中止当前任务
-- `/cwd <path>` 切换工作目录
-- `/status` 当前状态
-- `/threads` 话题列表
+- `/new` 新话题（清空上下文）— 别名 `/clear` `/reset`
+- `/stop` 中止当前任务 — 别名 `/kill` `/abort` `/cancel`
+- `/cwd <path>` 切换工作目录 — 别名 `/cd` `/pwd`
+- `/status` 当前状态 — 别名 `/info`
+- `/threads` 话题列表 — 别名 `/resume` `/list` `/ls`
 
 **🔍 查看类**
 - `/mcp` `/agents` `/hooks` `/memory list` `/release-notes`
 
 **⚙️ 配置类**
 - `/model [name]` 查看/切换模型
-- `/permissions list|allow|deny|remove <rule>`
-- `/memory show|remove <name>`
+- `/permissions list|allow|deny|remove <rule>` — 别名 `/perm` `/perms`
+- `/memory show|remove <name>` — 别名 `/mem`
 
 **🚀 实用 skill（透传给 Claude）**
 - `/goal <text>` 设会话目标，目标不达成 Claude 不停
@@ -89,7 +112,7 @@ _HELP_BRIEF = """**📌 Bridge 命令**
 
 其他任意 `/xxx` 也会透传，Claude 自动识别 skill。
 
-**❓ 更多**：`/help all`"""
+**❓ 更多**：`/help all`（`/?` `/h` 等价）"""
 
 
 _HELP_FULL = _HELP_BRIEF + """

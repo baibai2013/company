@@ -657,15 +657,11 @@ async def _handle_command(
             await asyncio.to_thread(send_rich_card, client, chat_id, title, content, color)
 
     # ── 重定向：/clear → /new 等等 ──
+    # 保留 arg，让 `/cd /tmp` 等价于 `/cwd /tmp`、`/perm allow X` 等价于 `/permissions allow X`
     target = cc_commands.get_redirect(cmd)
     if target:
-        await _send(
-            f"↪️ 已转 `{target}`",
-            f"`{cmd}` 在飞书等价于 `{target}`，正在执行…",
-            "grey",
-        )
+        log.info("命令重定向: %s → %s arg=%r", cmd, target, arg)
         cmd = target
-        arg = ""  # 重定向后 arg 不复用，避免歧义
 
     # ── 不支持的 TUI 命令 ──
     msg = cc_commands.get_unsupported(cmd)
