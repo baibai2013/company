@@ -178,18 +178,58 @@ async def run_with_events(
                         if m:
                             await _pub_first_sentence(_stream_buffer[: m.start() + 1])
 
-            # 节点结束：更新 result_data
+            # 节点结束：更新 result_data + 立刻把路由/方案推给 bot 做进度卡
             if kind == "on_chain_end" and node:
                 out = event.get("data", {}).get("output", {})
                 if isinstance(out, dict):
-                    if out.get("execution_result"):
-                        result_data["result"] = out["execution_result"]
+                    if out.get("execution_result") is not None:
+                        # bind_tools / 多模态 LLM 的 content 可能是 list[dict]，必须统一为 str
+                        # 否则下游 markdown 渲染（split('\n')）会炸
+                        er = out["execution_result"]
+                        if isinstance(er, list):
+                            parts = []
+                            for b in er:
+                                if isinstance(b, dict) and b.get("type") == "text":
+                                    parts.append(b.get("text", ""))
+                                elif isinstance(b, str):
+                                    parts.append(b)
+                            er = "\n".join(p for p in parts if p) or str(out["execution_result"])
+                        elif not isinstance(er, str):
+                            er = str(er)
+                        result_data["result"] = er
                     if out.get("route"):
                         result_data["route"] = out["route"]
+                        if node == "route":
+                            await _pub({
+                                "type": "route_decided",
+                                "employee": employee,
+                                "task_id": task_id,
+                                "route": out["route"],
+                            })
                     if out.get("plan"):
                         result_data["plan"] = out["plan"]
+                        if node == "plan":
+                            await _pub({
+                                "type": "plan_drafted",
+                                "employee": employee,
+                                "task_id": task_id,
+                                "plan": out["plan"][:200],
+                            })
                     if out.get("cc"):
                         result_data["cc"] = out["cc"]
+
+            # 工具实际调用：langchain BaseTool.invoke 会发 on_tool_start，
+            # data.input 是已 parse 好的完整 args（比 on_chat_model_end 拿 tool_calls 更可靠）
+            if kind == "on_tool_start":
+                inp = event.get("data", {}).get("input") or {}
+                tool_name = event.get("name") or "?"
+                await _pub({
+                    "type": "tool_use",
+                    "employee": employee,
+                    "task_id": task_id,
+                    "tool_name": tool_name,
+                    "tool_args": inp if isinstance(inp, dict) else {"_raw": str(inp)[:200]},
+                })
 
         # 兜底：全程无句号时取前 60 字
         if not _first_sent and _stream_buffer and result_data["route"] == "CHAT":

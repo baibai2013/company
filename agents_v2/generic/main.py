@@ -116,14 +116,16 @@ def _write_card(card: dict) -> Path:
 @asynccontextmanager
 async def lifespan(inner_app: FastAPI):
     cfg = registry.get_effective_sync(_employee_key)
-    cc_prompt = ""
-    # CC behavior: only PM/product_manager have CC prompt today; check behavior flag.
-    if cfg and (cfg.behavior or {}).get("auto_cc_specialists"):
-        try:
-            mod = __import__(f"agents_v2.{_employee_key}.prompts", fromlist=["CC_PROMPT"])
-            cc_prompt = getattr(mod, "CC_PROMPT", "") or ""
-        except Exception:
-            cc_prompt = ""
+    # cc 全员启用：默认走 _DEFAULT_CC_PROMPT，员工 prompts.CC_PROMPT 若存在则覆盖
+    from agents_v2.shared.smart_graph import _DEFAULT_CC_PROMPT
+    cc_prompt = _DEFAULT_CC_PROMPT
+    try:
+        mod = __import__(f"agents_v2.{_employee_key}.prompts", fromlist=["CC_PROMPT"])
+        custom = getattr(mod, "CC_PROMPT", "") or ""
+        if custom:
+            cc_prompt = custom
+    except Exception:
+        pass
 
     # 解析工具：behavior.tools + auto_register=True 的工具（3.5）
     tool_names = list((cfg.behavior or {}).get("tools", [])) if cfg else []

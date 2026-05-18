@@ -1,6 +1,7 @@
 """
 Feishu message sending helpers — extracted from system/feishu_bot.py.
 """
+import asyncio
 import json
 import logging
 import os
@@ -18,6 +19,8 @@ from lark_oapi.api.im.v1 import (
     Emoji,
     GetMessageResourceRequest,
     ListMessageRequest,
+    PatchMessageRequest,
+    PatchMessageRequestBody,
     ReplyMessageRequest,
     ReplyMessageRequestBody,
 )
@@ -516,3 +519,55 @@ def download_image(client: lark.Client, message_id: str, image_key: str) -> tupl
     data = resp.file.read()
     media_type = "image/png" if data[:4] == b"\x89PNG" else "image/jpeg"
     return base64.b64encode(data).decode(), media_type
+
+
+# ── 异步双卡片 helper（进度卡 patch 模式）────────────────────────────────────
+# lark SDK 的 create / reply / patch 是同步阻塞，必须用 asyncio.to_thread 包；
+# 否则会卡住 employee_bot 的 event loop（cc_bridge 修过同样的坑）。
+
+async def acreate_rich_card(
+    client: lark.Client, chat_id: str, title: str, content: str, color: str = "grey",
+) -> str | None:
+    """异步创建卡片，返回 message_id 用于后续 patch；失败返回 None。"""
+    card_json = build_card_json(title, content, color)
+    body = (
+        CreateMessageRequestBody.builder()
+        .receive_id(chat_id).msg_type("interactive").content(card_json).build()
+    )
+    req = CreateMessageRequest.builder().receive_id_type("chat_id").request_body(body).build()
+    resp = await asyncio.to_thread(client.im.v1.message.create, req)
+    if resp.success() and resp.data and resp.data.message_id:
+        return resp.data.message_id
+    log.error("acreate_rich_card failed: %s %s", resp.code, resp.msg)
+    return None
+
+
+async def areply_rich_card(
+    client: lark.Client, parent_id: str, title: str, content: str, color: str = "grey",
+) -> str | None:
+    """异步以卡片回复某条消息，返回新卡片 message_id；失败返回 None。"""
+    card_json = build_card_json(title, content, color)
+    body = (
+        ReplyMessageRequestBody.builder()
+        .msg_type("interactive").content(card_json).build()
+    )
+    req = ReplyMessageRequest.builder().message_id(parent_id).request_body(body).build()
+    resp = await asyncio.to_thread(client.im.v1.message.reply, req)
+    if resp.success() and resp.data and resp.data.message_id:
+        return resp.data.message_id
+    log.error("areply_rich_card failed: %s %s", resp.code, resp.msg)
+    return None
+
+
+async def apatch_rich_card(
+    client: lark.Client, message_id: str, title: str, content: str, color: str = "grey",
+) -> bool:
+    """异步用新内容整体替换卡片。message_id 必须是 acreate/areply 返回的。"""
+    card_json = build_card_json(title, content, color)
+    body = PatchMessageRequestBody.builder().content(card_json).build()
+    req = PatchMessageRequest.builder().message_id(message_id).request_body(body).build()
+    resp = await asyncio.to_thread(client.im.v1.message.patch, req)
+    if not resp.success():
+        log.warning("apatch_rich_card failed: %s %s", resp.code, resp.msg)
+        return False
+    return True

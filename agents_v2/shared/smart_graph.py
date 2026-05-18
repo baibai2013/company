@@ -22,14 +22,45 @@ from agents_v2.shared.claude_client import make_langchain_llm
 
 _DEFAULT_ROUTE_PROMPT = """判断下面这条消息是「闲聊」还是「工作任务」。
 
-闲聊：问候、状态询问、随便聊聊、简单确认（如"在吗""怎么样""最近忙吗"）、询问对话历史或之前说过的内容（如"我刚才说的xxx是什么""你还记得..."）。
-工作任务：包含具体设计/开发/分析/建模/验证/输出/报告/计划等技术或业务要求，需要调用工具或产出具体结果。
+闲聊（CHAT）：纯打招呼、感谢、确认、表达情绪、回忆历史。例如：
+  - 你好 / 在吗 / 怎么样 / 最近忙吗 / 早 / 晚安
+  - 谢谢 / 收到 / 好的 / 没问题
+  - 我刚才说的 xx 是什么 / 你还记得吗 / 之前那个
+
+工作任务（WORK）：任何要「做事」或「查事」的请求。只要消息里出现下列动作意图，就一律判 WORK：
+  - 查看 / 检查 / 排查 / 查找 / 看看 / 看一下 / 找一下
+  - 分析 / 统计 / 对比 / 评估 / 计算 / 汇总
+  - 读取 / 修改 / 写入 / 编辑 / 删除 / 创建
+  - 部署 / 运行 / 启动 / 停止 / 重启 / 测试
+  - 输出 / 生成 / 给出方案 / 给我 / 报告 / 记录
+  - 任何需要查询实时数据（日志、进程、文件、端口、系统状态、配置、数据库）才能回答的问题
+
+拿不准时一律判 WORK。
 
 只回复一个词：CHAT 或 WORK，不要有其他内容。"""
 
 _DEFAULT_CHAT_SUFFIX = "\n\n性格：务实简洁，回复不超过 150 字，用中文，自然对话，不列大纲不输出 JSON。"
 
 _DEFAULT_PLAN_SUFFIX = "\n请制定执行步骤（100字以内）。只写步骤，不要直接给出答案或结论；若需查询实时数据（如定时任务、文件、系统状态等），步骤中须注明要调用哪个工具。"
+
+_DEFAULT_CC_PROMPT = """根据用户原消息和当前员工的回复，判断是否需要邀请其他专家补充专业意见。
+
+可选员工 key（不要邀请当前员工自己）：
+- tech_lead       技术负责人
+- mechanical      机械工程师
+- hardware        硬件工程师
+- firmware        固件工程师
+- algorithm       算法工程师
+- product_manager 产品经理
+- project_manager 项目经理
+- testing         测试工程师
+- cost            成本工程师
+- sysadmin        系统工程师
+
+输出 JSON 数组，最多 3 个相关性最高的专家 key。如果不需要其他人补充（普通闲聊、纯展示信息、用户已得到完整答案），返回空数组 []。
+
+只输出 JSON 数组，不要任何其他文字。
+例如：["mechanical", "firmware"] 或 []"""
 
 # Backwards-compat aliases (some imports reference these)
 _ROUTE_PROMPT = _DEFAULT_ROUTE_PROMPT
@@ -171,7 +202,7 @@ def _route_node(state: SmartState, employee_key: str) -> dict:
     text = _text_only(state["task_input"])
     if not text:
         return {"route": "WORK"}
-    llm = _llm_for(employee_key, "route", default_model="claude-haiku-4-5-20251001")
+    llm = _llm_for(employee_key, "route", default_model="claude-sonnet-4-6")
     prompt = _global_prompt(employee_key, "route_prompt", _DEFAULT_ROUTE_PROMPT)
     resp = llm.invoke([SystemMessage(prompt), HumanMessage(text)])
     route = "CHAT" if "CHAT" in resp.content.upper() else "WORK"
@@ -194,7 +225,7 @@ def _chat_node(state: SmartState, employee_key: str) -> dict:
 
 def _plan_node(state: SmartState, employee_key: str) -> dict:
     query = _text_only(state["task_input"])
-    llm = _llm_for(employee_key, "plan", default_model="claude-opus-4-6")
+    llm = _llm_for(employee_key, "plan", default_model="claude-opus-4-7")
     resp = llm.invoke([
         SystemMessage(_system_prompt_for(employee_key, _DEFAULT_PLAN_SUFFIX, query=query)),
         _human_msg(state["task_input"]),
@@ -204,7 +235,7 @@ def _plan_node(state: SmartState, employee_key: str) -> dict:
 
 def _execute_node(state: SmartState, employee_key: str) -> dict:
     query = _text_only(state["task_input"])
-    llm = _llm_for(employee_key, "execute", default_model="claude-opus-4-6")
+    llm = _llm_for(employee_key, "execute", default_model="claude-opus-4-7")
     history = _get_history(state)
     human_msg = _human_msg(state["task_input"], prefix=f"执行方案：{state['plan']}\n\n原始需求（如有图请一并分析）：\n")
     resp = llm.invoke([
@@ -245,7 +276,7 @@ def _react_node(state: SmartState, employee_key: str, tools: list, max_rounds: i
     from langchain_core.messages import AIMessage, ToolMessage as TM
 
     query = _text_only(state["task_input"])
-    llm = _llm_for(employee_key, "execute", default_model="claude-opus-4-6").bind_tools(tools)
+    llm = _llm_for(employee_key, "execute", default_model="claude-opus-4-7").bind_tools(tools)
     tool_map = {t.name: t for t in tools}
 
     plan_prefix = f"执行方案：{state['plan']}\n\n" if state.get("plan") else ""
@@ -360,7 +391,7 @@ def _cc_node(state: SmartState, employee_key: str, cc_prompt: str) -> dict:
     """PM-only: decide which specialists should add a follow-up."""
     import json as _json
     import re as _re
-    llm = _llm_for(employee_key, "cc", default_model="claude-haiku-4-5-20251001")
+    llm = _llm_for(employee_key, "cc", default_model="claude-sonnet-4-6")
     context = f"原始消息：{_text_only(state['task_input'])}\n\n产品经理回复：{state['execution_result']}"
     resp = llm.invoke([SystemMessage(cc_prompt), HumanMessage(context)])
     try:
@@ -403,7 +434,8 @@ def build_smart_agent(employee_key_or_prompt, checkpointer, cc_prompt: str = "",
     g.add_node("route", partial(_route_node, employee_key=employee_key))
     g.add_node("plan",  partial(_plan_node,  employee_key=employee_key))
 
-    # 有工具时用 ReAct 循环，无工具时用纯 LLM
+    # CHAT 路径：有工具时也走 ReAct（闲聊也可调工具，如"看看进程""现在几点"等轻量查询）
+    # 标签端已对应改为"简短回复（必要时调工具）"，避免和实际行为打脸
     if tools:
         g.add_node("chat",    partial(_react_chat_node, employee_key=employee_key, tools=tools))
         g.add_node("execute", partial(_react_node,      employee_key=employee_key, tools=tools))

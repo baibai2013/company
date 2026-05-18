@@ -19,10 +19,12 @@ import os
 import re
 import sys
 import threading
+import time
 from pathlib import Path
 
 import httpx
 import redis
+import redis.asyncio as aioredis
 from dotenv import load_dotenv
 
 load_dotenv(Path(__file__).parent.parent / "infra" / ".env")
@@ -38,7 +40,20 @@ from group_chat.prompts import (
     format_history,
 )
 from feishu.personas import get_persona_prompt
-from feishu.sender import add_reaction, download_image, fetch_recent_image, fetch_recent_text, reply_message, reply_rich_card, send_card, send_rich_card, send_text
+from feishu.sender import (
+    acreate_rich_card,
+    add_reaction,
+    apatch_rich_card,
+    areply_rich_card,
+    download_image,
+    fetch_recent_image,
+    fetch_recent_text,
+    reply_message,
+    reply_rich_card,
+    send_card,
+    send_rich_card,
+    send_text,
+)
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s  %(levelname)s  %(message)s")
 log = logging.getLogger("feishu.employee_bot")
@@ -137,6 +152,148 @@ _REPLY_EMOJI = {
 }
 
 
+# ── 进度卡渲染（cc_bridge 风格累积步骤流）─────────────────────────────────────
+
+_PHASE_LABEL = {
+    "start":   "📥 已收到任务",
+    "route":   "🧭 正在分析消息…",
+    "chat":    "💬 直接回复中…",
+    "plan":    "📐 正在制定方案…",
+    "execute": "⚙️ 正在执行任务…",
+    "done":    "✅ 任务完成",
+}
+
+_ROUTE_LABEL = {
+    "CHAT": "💬 CHAT — 简短回复（必要时调工具）",
+    "WORK": "🛠 WORK — 完整方案 + 执行",
+}
+
+_TOOL_ICONS = {
+    "run_command": "💻", "read_file": "📖", "write_file": "✏️",
+    "get_metrics": "📊", "search_web": "🔎", "recall_history": "🧠",
+    "feishu_send": "💬", "create_task": "📋", "update_task": "📝",
+    "list_tasks": "📋", "get_task": "📋",
+    "list_scheduled_tasks": "⏰", "create_scheduled_task": "⏰",
+    "delete_scheduled_task": "⏰", "update_scheduled_task": "⏰",
+    "send_message": "💬", "save_memory": "🧠", "search_memory": "🧠",
+}
+
+# 兜底参数提取：不在专属处理里的工具，按这些 key 优先级展示首个非空字符串值
+_GENERIC_PARAM_KEYS = (
+    "command", "cmd", "path", "file_path", "filename", "filepath",
+    "query", "q", "keyword", "url",
+    "subject", "title", "description", "name", "key", "id",
+    "text", "content", "message", "prompt",
+)
+
+_MAX_STEPS_SHOWN = 15
+
+
+def _step_line(name: str, args: dict) -> str:
+    """单步展示：cc_bridge 风格，每步独立一行，带工具的关键参数。"""
+    icon = _TOOL_ICONS.get(name, "🔧")
+    args = args or {}
+
+    # 已知工具的精准展示
+    if name == "run_command":
+        cmd = (args.get("command") or args.get("cmd") or "").replace("\n", " ").strip()
+        short = (cmd[:80] + "…") if len(cmd) > 80 else cmd
+        return f"{icon} {short}" if short else f"{icon} {name}"
+    if name in ("read_file", "write_file"):
+        path = args.get("path") or args.get("file_path") or ""
+        return f"{icon} {path}" if path else f"{icon} {name}"
+    if name == "get_metrics":
+        return f"{icon} 系统指标"
+    if name == "search_web" or name == "search_memory":
+        q = (args.get("query") or args.get("q") or "").strip()
+        return f"{icon} {q[:60]}" if q else f"{icon} {name}"
+    if name in ("create_task", "update_task", "list_tasks", "get_task"):
+        subj = args.get("subject") or args.get("description") or args.get("id") or ""
+        return f"{icon} {str(subj)[:60]}" if subj else f"{icon} {name}"
+    if name in ("create_scheduled_task", "update_scheduled_task",
+                "delete_scheduled_task", "list_scheduled_tasks"):
+        s = args.get("name") or args.get("cron") or args.get("id") or ""
+        verb = {"create_scheduled_task": "新建", "update_scheduled_task": "更新",
+                "delete_scheduled_task": "删除", "list_scheduled_tasks": "列出"}[name]
+        return f"{icon} {verb} {s}".rstrip()
+    if name == "send_message":
+        chat = args.get("chat_id") or args.get("to") or ""
+        text = args.get("text") or args.get("content") or ""
+        return f"{icon} → {chat[:20]}: {str(text)[:50]}" if text else f"{icon} {name}"
+    if name == "save_memory":
+        text = args.get("content") or args.get("text") or ""
+        return f"{icon} {str(text)[:60]}" if text else f"{icon} {name}"
+
+    # 未知工具兜底：按通用 key 优先级找首个非空字符串值
+    for k in _GENERIC_PARAM_KEYS:
+        v = args.get(k)
+        if isinstance(v, str) and v.strip():
+            short = v.strip().replace("\n", " ")
+            return f"{icon} {name}: {short[:60]}"
+    # 实在没参数信息也展示工具名（至少能看到调用过）
+    return f"{icon} {name}"
+
+
+def _render_progress(state: dict) -> tuple[str, str, str]:
+    """渲染进度卡：路由 → 方案首句 → 工具调用累积流 → 阶段 → 已用秒数。
+
+    始终灰色"处理中"——进度卡只展示过程，结果卡才有"完成"语义（cc_bridge 风格）。
+    """
+    name = state["employee_name"]
+    emoji = state["employee_emoji"]
+    finished = state.get("finished", False)
+    elapsed = state.get("elapsed", 0.0)
+
+    title = f"{emoji} {name} · 处理中"
+    color = "grey"
+
+    lines = [f"**任务**：{state['task']}"]
+
+    route = state.get("route")
+    if route:
+        lines.append(f"**路由**：{_ROUTE_LABEL.get(route, route)}")
+    else:
+        lines.append("**路由**：（判断中…）")
+
+    # 方案首句：plan 通常是多步描述，截首句给个全局感
+    plan_first = state.get("plan_first")
+    if plan_first:
+        lines.append(f"📐 {plan_first}")
+
+    # 工具调用累积流：每步独立一行（cc_bridge 风格）
+    steps = state.get("steps") or []
+    if steps:
+        shown = steps[-_MAX_STEPS_SHOWN:]
+        hidden = len(steps) - len(shown)
+        if hidden > 0:
+            lines.append(f"_…前 {hidden} 步已折叠_")
+        lines.extend(shown)
+
+    phase = state.get("phase", "start")
+    if finished:
+        lines.append(f"**阶段**：{_PHASE_LABEL['done']}")
+    else:
+        lines.append(f"**阶段**：{_PHASE_LABEL.get(phase, phase)}")
+    lines.append(f"**已用**：{elapsed:.1f}s")
+
+    return title, "\n\n".join(lines), color
+
+
+def _stringify_content(c) -> str:
+    """LLM content 可能是 list[dict]，统一转 str 喂飞书 markdown 渲染（防御性兜底，与 runner 端一致）。"""
+    if isinstance(c, str):
+        return c
+    if isinstance(c, list):
+        parts = []
+        for b in c:
+            if isinstance(b, dict) and b.get("type") == "text":
+                parts.append(b.get("text", ""))
+            elif isinstance(b, str):
+                parts.append(b)
+        return "\n".join(p for p in parts if p) or str(c)
+    return str(c) if c is not None else ""
+
+
 async def _handle(employee: str, task: str, chat_id: str, client: lark.Client,
                   image_base64: str = "", image_media_type: str = "image/jpeg",
                   message_id: str = "", chat_type: str = "p2p") -> None:
@@ -145,23 +302,13 @@ async def _handle(employee: str, task: str, chat_id: str, client: lark.Client,
     # 在原消息上贴表情表示收到
     if message_id:
         add_reaction(client, message_id, "OK")
-    else:
-        send_text(client, chat_id, f"{emoji} {name} 收到，处理中…")
 
-    def _send_card(title: str, content: str, color: str = "blue") -> None:
+    def _send_card_sync(title: str, content: str, color: str = "blue") -> None:
+        """旧式单卡（CC 链路 / fallback 用）。"""
         if message_id:
             reply_rich_card(client, message_id, title, content, color)
         else:
             send_rich_card(client, chat_id, title, content, color)
-
-    # 即时告知用户正在处理
-    if image_base64 and not task:
-        quick_hint = "收到图片，让我分析一下。"
-    elif image_base64:
-        quick_hint = "收到，让我看看图片和你的问题。"
-    else:
-        quick_hint = "收到，处理中…"
-    _send_card("⏳ 处理中", quick_hint, "grey")
 
     # 大群：拉近期聊天记录注入上下文，让 agent 了解来龙去脉
     if chat_type == "group":
@@ -182,19 +329,52 @@ async def _handle(employee: str, task: str, chat_id: str, client: lark.Client,
         thread_id = message_id or f"{chat_id}_{id(task)}"
         source = "feishu_group"
 
-    async def _listen_first_sentence() -> None:
-        """P2P 单聊专用：监听 Redis task_first_sentence 频道，提前展示打字中卡片。"""
-        if chat_type != "p2p":
+    # ── 进度卡（cc_bridge 风格：累积步骤流）──
+    progress_state: dict = {
+        "employee_name": name,
+        "employee_emoji": emoji,
+        "task": (task[:80] + "…") if task and len(task) > 80 else (task or "（图片消息）"),
+        "phase": "start",
+        "route": None,
+        "plan_first": "",   # plan 首句，整体一行
+        "steps": [],        # 工具调用步骤累积流
+        "started_at": time.monotonic(),
+        "elapsed": 0.0,
+        "finished": False,
+    }
+
+    title, content, color = _render_progress(progress_state)
+    if message_id:
+        progress_msg_id = await areply_rich_card(client, message_id, title, content, color)
+    else:
+        progress_msg_id = await acreate_rich_card(client, chat_id, title, content, color)
+
+    # patch 限流：节点级事件多时避免飞书侧限流，最少 0.4s 间隔
+    last_patch_at = [0.0]
+    patch_lock = asyncio.Lock()
+
+    async def _patch_progress(force: bool = False) -> None:
+        if not progress_msg_id:
             return
+        async with patch_lock:
+            now = time.monotonic()
+            if not force and now - last_patch_at[0] < 0.4:
+                return
+            last_patch_at[0] = now
+            progress_state["elapsed"] = now - progress_state["started_at"]
+            t, c, col = _render_progress(progress_state)
+            await apatch_rich_card(client, progress_msg_id, t, c, col)
+
+    # ── 订阅 task_events ──
+    stop_evt = asyncio.Event()
+
+    async def _listen_events() -> None:
         try:
-            import redis.asyncio as _r
-            import time as _t_mod
-            async with _r.from_url("redis://localhost:6379/0") as rr:
+            async with aioredis.from_url("redis://localhost:6379/0") as rr:
                 pubsub = rr.pubsub()
-                await pubsub.subscribe("task_first_sentence")
-                deadline = _t_mod.monotonic() + 8.0
+                await pubsub.subscribe("task_events")
                 async for msg in pubsub.listen():
-                    if _t_mod.monotonic() > deadline:
+                    if stop_evt.is_set():
                         break
                     if msg["type"] != "message":
                         continue
@@ -204,38 +384,71 @@ async def _handle(employee: str, task: str, chat_id: str, client: lark.Client,
                         continue
                     if payload.get("task_id") != thread_id:
                         continue
-                    sentence = payload.get("sentence", "")
-                    if sentence:
-                        _send_card(f"{emoji} 打字中…", f"{sentence}…", "grey")
-                    break
+                    typ = payload.get("type")
+                    if typ == "employee_status":
+                        ph = payload.get("phase")
+                        if ph and ph != "done":
+                            progress_state["phase"] = ph
+                            await _patch_progress()
+                    elif typ == "route_decided":
+                        progress_state["route"] = payload.get("route")
+                        await _patch_progress(force=True)
+                    elif typ == "plan_drafted":
+                        # 取 plan 第一行 / 首句，整体一行展示，避开多行噪音
+                        plan_text = (payload.get("plan", "") or "").strip()
+                        first = plan_text.split("\n", 1)[0].strip() if plan_text else ""
+                        progress_state["plan_first"] = (first[:80] + "…") if len(first) > 80 else first
+                        await _patch_progress(force=True)
+                    elif typ == "tool_use":
+                        line = _step_line(
+                            payload.get("tool_name") or "?",
+                            payload.get("tool_args") or {},
+                        )
+                        # 跟上一行完全相同（同工具同参数）才去重，否则保留以体现真实流程
+                        if not progress_state["steps"] or progress_state["steps"][-1] != line:
+                            progress_state["steps"].append(line)
+                        await _patch_progress()
         except asyncio.CancelledError:
             pass
         except Exception as exc:
-            log.debug("first_sentence listener failed: %s", exc)
+            log.debug("task_events listener failed: %s", exc)
 
-    _listener = asyncio.create_task(_listen_first_sentence())
-    data = await handle_dispatch(employee, task_with_ctx, task_id=thread_id, chat_id=chat_id,
-                                 image_base64=image_base64, image_media_type=image_media_type,
-                                 session_config={"source": source})
-    _listener.cancel()
+    listener = asyncio.create_task(_listen_events())
+
+    # ── 跑 dispatch ──
+    try:
+        data = await handle_dispatch(employee, task_with_ctx, task_id=thread_id, chat_id=chat_id,
+                                     image_base64=image_base64, image_media_type=image_media_type,
+                                     session_config={"source": source})
+    except Exception as exc:
+        stop_evt.set()
+        listener.cancel()
+        progress_state["finished"] = True
+        progress_state["phase"] = "done"
+        await _patch_progress(force=True)
+        _send_card_sync("❌ 执行出错", f"```\n{exc}\n```", "red")
+        return
+
+    stop_evt.set()
+    listener.cancel()
+
+    # 终态 patch（确保 elapsed 准确，phase 标 done）
+    progress_state["finished"] = True
+    progress_state["phase"] = "done"
+    await _patch_progress(force=True)
+
     route  = data.get("route", "WORK")
     plan   = data.get("plan", "")
-    result = data.get("result", "(无输出)")
-    # PM 单聊走 CC；项目经理群聊/单聊均可发起头脑风暴 CC
-    cc = data.get("cc", []) if (
-        (employee == "product_manager" and chat_type == "p2p")
-        or employee == "project_manager"
-    ) else []
+    # 防御兜底：runner 已经 stringify 一次，这里再保险（旧 dispatch 路径可能未走 runner）
+    result = _stringify_content(data.get("result", "(无输出)")) or "(无输出)"
+    # cc 全员启用：任何员工回复后，data["cc"] 里有专家就展开补充意见
+    cc = data.get("cc", []) or []
 
+    # ── 结果卡 ──
     if route == "CHAT":
-        _send_card(f"{emoji} 回复", result[:2000], "blue")
+        _send_card_sync(f"{emoji} {name} 回复", result[:2000], "blue")
     else:
-        task_preview = task[:80] + ("…" if len(task) > 80 else "")
-        if plan:
-            _send_card("💭 执行方案",
-                       f"**任务：** {task_preview}\n\n{plan[:800]}",
-                       "yellow")
-        _send_card("✅ 完成", result[:2000], "blue")
+        _send_card_sync(f"{emoji} {name} · 完成", result[:2000], "blue")
 
     # CC：依次让专家补充专业意见（PM 单聊 / 项目经理头脑风暴）
     if cc:
