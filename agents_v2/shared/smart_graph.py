@@ -9,8 +9,6 @@
 配置：所有 LLM 调用的模型、温度、prompts 均从 registry 读取。
 节点在每次执行时实时读 config，所以 DB 修改后下次调用立刻生效。
 """
-import hashlib as _hashlib
-import time as _time
 from typing import Annotated, Any, Literal, TypedDict
 
 from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
@@ -18,32 +16,6 @@ from langgraph.graph import END, START, StateGraph
 from langgraph.graph.message import add_messages
 
 from agents_v2.shared.claude_client import make_langchain_llm
-
-# ── 路由缓存 ─────────────────────────────────────────────────────────────────
-# 相同文本的路由结果缓存 TTL=10 分钟，最多 200 条，LRU 淘汰
-
-_ROUTE_CACHE: dict[str, tuple[str, float]] = {}   # md5 → (route, expire_ts)
-_ROUTE_CACHE_TTL = 600      # 秒，10 分钟
-_ROUTE_CACHE_MAX = 200
-
-
-def _route_cache_get(text: str) -> str | None:
-    """返回缓存的路由结果，未命中或已过期返回 None。"""
-    key = _hashlib.md5(text.strip().lower().encode()).hexdigest()
-    entry = _ROUTE_CACHE.get(key)
-    if entry and _time.monotonic() < entry[1]:
-        return entry[0]
-    return None
-
-
-def _route_cache_set(text: str, route: str) -> None:
-    """写入缓存，超出上限时 LRU 淘汰最旧 10 条。"""
-    key = _hashlib.md5(text.strip().lower().encode()).hexdigest()
-    _ROUTE_CACHE[key] = (route, _time.monotonic() + _ROUTE_CACHE_TTL)
-    if len(_ROUTE_CACHE) > _ROUTE_CACHE_MAX:
-        to_drop = sorted(_ROUTE_CACHE, key=lambda k: _ROUTE_CACHE[k][1])[:10]
-        for k in to_drop:
-            _ROUTE_CACHE.pop(k, None)
 
 
 # Fallback prompts — used when registry doesn't supply a global override.
@@ -199,17 +171,10 @@ def _route_node(state: SmartState, employee_key: str) -> dict:
     text = _text_only(state["task_input"])
     if not text:
         return {"route": "WORK"}
-
-    # 缓存命中：跳过 LLM
-    cached = _route_cache_get(text)
-    if cached:
-        return {"route": cached}
-
     llm = _llm_for(employee_key, "route", default_model="claude-haiku-4-5-20251001")
     prompt = _global_prompt(employee_key, "route_prompt", _DEFAULT_ROUTE_PROMPT)
     resp = llm.invoke([SystemMessage(prompt), HumanMessage(text)])
     route = "CHAT" if "CHAT" in resp.content.upper() else "WORK"
-    _route_cache_set(text, route)
     return {"route": route}
 
 
