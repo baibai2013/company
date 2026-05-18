@@ -1,0 +1,66 @@
+;; 员工 claude code 子进程沙箱 profile（macOS sandbox-exec / sbpl 语法）
+;;
+;; 渲染前由 agents_v2/shared/sandbox.py 替换占位符 ${CWD} 为员工实际工作目录。
+;; 设计原则：
+;;   - 文件读取：默认全部允许（claude code 要读 ~/.claude / node_modules / git 仓 / 项目根）
+;;   - 文件写入：默认拒绝，仅允许 ${CWD}/* + ~/.Trash + /tmp + /private/tmp + claude 自身配置
+;;   - 网络：放开（Anthropic API 必须）
+;;   - 进程：允许 fork/exec/signal（claude 调 Bash 工具会跑子进程）
+;;
+;; 调试：写盘失败时查 Console.app 搜 "sandbox" 看具体被拒规则。
+
+(version 1)
+(deny default)
+
+;; ── 进程基础 ──────────────────────────────────────────────────────────────────
+(allow process-fork)
+(allow process-exec*)
+(allow signal)
+
+;; ── IPC / Mach 基础（macOS 必备） ─────────────────────────────────────────────
+(allow mach-lookup)
+(allow mach-priv-host-port)
+(allow ipc-posix-shm)
+(allow ipc-posix-sem)
+(allow system-socket)
+(allow system-fsctl)
+(allow sysctl-read)
+
+;; ── 网络放开（Anthropic API、MCP 子进程通信、curl backend） ───────────────────
+(allow network*)
+
+;; ── 文件读取：默认全开 ────────────────────────────────────────────────────────
+(allow file-read*)
+(allow file-read-metadata)
+
+;; ── 文件写入：白名单 ──────────────────────────────────────────────────────────
+;; 员工自己的 cwd（绝对路径，由启动器替换 ${CWD}）
+(allow file-write*
+    (subpath "${CWD}"))
+
+;; macOS 回收站（员工删文件按"丢回收站"约定，不直接删）
+(allow file-write* (subpath "${HOME}/.Trash"))
+
+;; 临时目录
+(allow file-write*
+    (subpath "/tmp")
+    (subpath "/private/tmp")
+    (subpath "/var/folders"))
+
+;; claude code 自身要写的目录（session、project memory、settings 等）
+(allow file-write* (subpath "${HOME}/.claude"))
+
+;; npm / homebrew 元数据（claude 是 npm 全局包，运行时可能写 cache）
+(allow file-write*
+    (subpath "${HOME}/.npm")
+    (subpath "${HOME}/.cache"))
+
+;; 标准输出/错误（pipe）
+(allow file-write-data
+    (path "/dev/null")
+    (path "/dev/stdout")
+    (path "/dev/stderr"))
+
+;; ── 其他必须的细节 ────────────────────────────────────────────────────────────
+(allow lsopen)             ;; macOS Launch Services 查询
+(allow iokit-open)
