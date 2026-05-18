@@ -85,6 +85,7 @@ def to_dict(emp: Employee) -> dict[str, Any]:
         "llm_calls": emp.llm_calls,
         "behavior": emp.behavior,
         "avatar_url": emp.avatar_url,
+        "cwd": emp.cwd,
         "version": emp.version,
         "created_at": emp.created_at.isoformat() if emp.created_at else None,
         "updated_at": emp.updated_at.isoformat() if emp.updated_at else None,

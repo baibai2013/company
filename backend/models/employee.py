@@ -30,6 +30,7 @@ class Employee(Base):
     behavior:          Mapped[dict | None] = mapped_column(JSONB)
 
     avatar_url:        Mapped[str | None]  = mapped_column(Text)   # base64 data URL or external URL
+    cwd:               Mapped[str | None]  = mapped_column(Text)   # 员工工作目录绝对路径，claude code 子进程 cwd
 
     version:           Mapped[int]         = mapped_column(Integer, default=1)
     created_at:        Mapped[datetime]    = mapped_column(DateTime(timezone=True), default=_utcnow)

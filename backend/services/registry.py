@@ -57,6 +57,7 @@ class EffectiveConfig:
     llm_calls: dict           # 7 call types, model always non-null
     behavior: dict
     global_prompts: dict      # for nodes that need shared prompts
+    cwd: str                  # 员工 claude code 子进程工作目录绝对路径
 
 
 # ── Loading / merging ─────────────────────────────────────────────────────────
@@ -71,6 +72,17 @@ def _merge_llm_calls(employee_calls: dict | None, default_models: dict) -> dict:
             emp["model"] = default_models.get(call_type)
         out[call_type] = emp
     return out
+
+
+_COMPANY_ROOT = "/Users/liyijiang/work/company"
+# sysadmin / tech_lead 默认全权访问主仓库；其他员工默认在 employees/<key>/ 子目录隔离
+_FULL_ACCESS_KEYS = {"sysadmin", "tech_lead"}
+
+
+def _default_cwd(key: str) -> str:
+    if key in _FULL_ACCESS_KEYS:
+        return _COMPANY_ROOT
+    return f"{_COMPANY_ROOT}/employees/{key}"
 
 
 def _to_effective(emp: dict, glob: dict) -> EffectiveConfig:
@@ -88,6 +100,7 @@ def _to_effective(emp: dict, glob: dict) -> EffectiveConfig:
         llm_calls=_merge_llm_calls(emp.get("llm_calls"), glob.get("default_models") or {}),
         behavior=emp.get("behavior") or {},
         global_prompts=glob.get("global_prompts") or {},
+        cwd=emp.get("cwd") or _default_cwd(emp["key"]),
     )
 
 

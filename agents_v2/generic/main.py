@@ -116,6 +116,19 @@ def _write_card(card: dict) -> Path:
 @asynccontextmanager
 async def lifespan(inner_app: FastAPI):
     cfg = registry.get_effective_sync(_employee_key)
+
+    # 阶段 1：员工工作目录初始化（首次创建写 CLAUDE.md + .gitignore）
+    if cfg:
+        from agents_v2.shared.employee_workspace import ensure_workspace
+        cwd_path = ensure_workspace(
+            key=_employee_key,
+            cwd=cfg.cwd,
+            name=cfg.name,
+            emoji=cfg.emoji,
+            role_desc=cfg.role_desc,
+        )
+        inner_app.state.employee_cwd = str(cwd_path)
+
     # cc 全员启用：默认走 _DEFAULT_CC_PROMPT，员工 prompts.CC_PROMPT 若存在则覆盖
     from agents_v2.shared.smart_graph import _DEFAULT_CC_PROMPT
     cc_prompt = _DEFAULT_CC_PROMPT
