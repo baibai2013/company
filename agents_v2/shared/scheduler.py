@@ -158,7 +158,10 @@ class AgentScheduler:
         log.info("[%s] scheduler stopped", self.key)
 
     async def reload(self):
-        """配置变更时差量更新：新增启动，删除取消，正在等待的任务不重置。"""
+        """配置变更时差量更新：删除取消、新增启动、关键字段变化（cron/trigger/prompt/output_to）取消重建。
+
+        重建走 skip_catchup=True 路径，避免配置改动被误判为"漏执行"立刻补跑。
+        """
         try:
             import httpx
             async with httpx.AsyncClient(timeout=10) as client:
@@ -169,6 +172,7 @@ class AgentScheduler:
             return
 
         new_map = {t["id"]: t for t in new_tasks if t.get("id") and t.get("enabled")}
+        old_map = {t.get("id"): t for t in self._config if t.get("id")}
         old_ids = set(self._loops.keys())
         new_ids = set(new_map.keys())
 
@@ -179,11 +183,29 @@ class AgentScheduler:
             self._status.pop(tid, None)
             log.info("[%s] scheduler removed task %s", self.key, tid)
 
-        # 启动新增的任务（已存在的不重置，保留正在倒计时的睡眠）
+        def _changed(old: dict, new: dict) -> bool:
+            return (
+                old.get("cron") != new.get("cron")
+                or old.get("trigger") != new.get("trigger")
+                or old.get("prompt") != new.get("prompt")
+                or old.get("output_to") != new.get("output_to")
+                or old.get("execution_mode") != new.get("execution_mode")
+                or old.get("direct_actions") != new.get("direct_actions")
+            )
+
+        # 已存在但关键字段变了 → 取消旧 loop，让下面统一走重建分支
+        for tid in old_ids & new_ids:
+            if _changed(old_map.get(tid, {}), new_map[tid]):
+                self._loops[tid].cancel()
+                del self._loops[tid]
+                log.info("[%s] scheduler restarting task %s (config changed)", self.key, tid)
+
+        running_ids = set(self._loops.keys())
+
+        # 启动需要重建的（含全新 + 配置变更）；纯未变更的跳过
         for tid, task_cfg in new_map.items():
-            if tid in old_ids:
-                continue  # 已有且未变化，不打扰
-            self._config.append(task_cfg)
+            if tid in running_ids:
+                continue
             self._status[tid] = {
                 "name": task_cfg.get("name", tid),
                 "cron": task_cfg.get("cron", ""),
@@ -196,9 +218,10 @@ class AgentScheduler:
             if ttype in ("event", "webhook"):
                 log.info("[%s] registered %s-triggered task: %s", self.key, ttype, task_cfg.get("name"))
                 continue
-            loop = asyncio.create_task(self._cron_loop(tid, task_cfg))
+            # reload 路径下重建的 loop 跳过 catch-up，避免改 cron 后立刻被判"漏执行"补跑
+            loop = asyncio.create_task(self._cron_loop(tid, task_cfg, skip_catchup=True))
             self._loops[tid] = loop
-            log.info("[%s] scheduler added task %s", self.key, tid)
+            log.info("[%s] scheduler added/reloaded task %s", self.key, tid)
 
         # 同步 _config 为最新完整列表
         self._config = list(new_map.values())
@@ -248,8 +271,11 @@ class AgentScheduler:
 
     # ── 内部 ────────────────────────────────────────────────────────────────
 
-    async def _cron_loop(self, task_id: str, cfg: dict):
-        """单个任务的 cron 循环。支持 once=true 的一次性任务。P4.4: 兼容新 trigger 字段。"""
+    async def _cron_loop(self, task_id: str, cfg: dict, skip_catchup: bool = False):
+        """单个任务的 cron 循环。支持 once=true 的一次性任务。P4.4: 兼容新 trigger 字段。
+
+        skip_catchup=True：reload 路径用，跳过"上次漏执行"补跑，避免改 cron 后立刻被触发。
+        """
         trigger = cfg.get("trigger", {})
         # 优先读 trigger.cron / trigger.delay_seconds，兼容旧顶层字段
         cron_expr = trigger.get("cron") or cfg.get("cron", "0 * * * *")
@@ -295,9 +321,10 @@ class AgentScheduler:
                 return
 
             # P1.2 补跑：重启后检查是否有漏执行的 cron 触发（保守策略，只补最近一次）
+            # reload 路径不走这里（skip_catchup=True），改 cron 不会被误判为漏执行
             _CATCHUP_TOLERANCE_S = 60  # 容忍窗口：60s 内的漏执行不补（避免重启后瞬间触发）
             last_run_at_str = cfg.get("last_run_at")
-            if last_run_at_str and cron_expr:
+            if not skip_catchup and last_run_at_str and cron_expr:
                 try:
                     last_run_at = datetime.fromisoformat(last_run_at_str)
                     # 将 last_run_at 转为 naive（croniter 使用 naive datetime）
