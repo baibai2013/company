@@ -102,10 +102,11 @@ def _build_card_json(title: str, content: str, color: str) -> str:
     return build_card_json(title, content, color)
 
 
-def _create_card(
+async def _create_card(
     client: lark.Client, chat_id: str, title: str, content: str, color: str = "grey",
     thread_key: str | None = None,
 ) -> str | None:
+    """lark 同步 SDK 用 asyncio.to_thread 包装，避免阻塞 event loop（P0 修复）。"""
     card_json = _build_card_json(title, content, color)
     body = (
         CreateMessageRequestBody.builder()
@@ -114,7 +115,7 @@ def _create_card(
         .build()
     )
     req = CreateMessageRequest.builder().receive_id_type("chat_id").request_body(body).build()
-    resp = client.im.v1.message.create(req)
+    resp = await asyncio.to_thread(client.im.v1.message.create, req)
     ok = bool(resp.success() and resp.data and resp.data.message_id)
     _log_card("create", chat_id, card_json, ok=ok)
     if ok:
@@ -127,7 +128,7 @@ def _create_card(
     return None
 
 
-def _reply_card(
+async def _reply_card(
     client: lark.Client, parent_id: str, title: str, content: str, color: str = "grey",
     thread_key: str | None = None,
 ) -> str | None:
@@ -140,7 +141,7 @@ def _reply_card(
         .build()
     )
     req = ReplyMessageRequest.builder().message_id(parent_id).request_body(body).build()
-    resp = client.im.v1.message.reply(req)
+    resp = await asyncio.to_thread(client.im.v1.message.reply, req)
     ok = bool(resp.success() and resp.data and resp.data.message_id)
     _log_card("reply", parent_id, card_json, ok=ok)
     if ok:
@@ -153,11 +154,11 @@ def _reply_card(
     return None
 
 
-def _patch_card(client: lark.Client, message_id: str, title: str, content: str, color: str):
+async def _patch_card(client: lark.Client, message_id: str, title: str, content: str, color: str):
     card_json = _build_card_json(title, content, color)
     body = PatchMessageRequestBody.builder().content(card_json).build()
     req = PatchMessageRequest.builder().message_id(message_id).request_body(body).build()
-    resp = client.im.v1.message.patch(req)
+    resp = await asyncio.to_thread(client.im.v1.message.patch, req)
     ok = resp.success()
     _log_card("patch", message_id, card_json, ok=ok)
     if not ok:
@@ -424,7 +425,7 @@ async def handle_message(
     # 同话题串行：上一条还在跑就发排队提示
     if thread.lock.locked():
         if message_id:
-            _reply_card(
+            await _reply_card(
                 client, message_id, "⏳ 排队中",
                 f"话题 `{thread.title}` 还在执行，已排队…", "grey",
                 thread_key=thread.key,
@@ -433,12 +434,12 @@ async def handle_message(
     async with thread.lock:
         # 进度卡（持续 patch）：reply 到用户消息下，fallback 到普通发送
         if message_id:
-            progress_id = _reply_card(
+            progress_id = await _reply_card(
                 client, message_id, "⏳ 执行中", "处理中…", "grey",
                 thread_key=thread.key,
             )
         else:
-            progress_id = _create_card(
+            progress_id = await _create_card(
                 client, chat_id, "⏳ 执行中", "处理中…", "grey",
                 thread_key=thread.key,
             )
@@ -452,12 +453,12 @@ async def handle_message(
         last_text = [""]                # 最后一次完整文本，用于结果卡
         spinner_idx = [0]               # 思考中动画当前帧索引
 
-        def _do_patch():
+        async def _do_patch():
             if not progress_id:
                 return
             todo_block = _build_todo_block(task_list)
             if not steps and not todo_block:
-                _patch_card(client, progress_id, "⏳ 执行中", "处理中…", "grey")
+                await _patch_card(client, progress_id, "⏳ 执行中", "处理中…", "grey")
                 return
             # 进度卡按字符数从尾部往前累，超出 MAX_CARD_LEN 就停并加省略提示。
             # todo_block 在"必保留"集合：先扣它的预算，剩余给 steps。
@@ -479,20 +480,20 @@ async def handle_message(
             if picked:
                 parts.append(sep.join(reversed(picked)))
             content = sep.join(parts)
-            _patch_card(client, progress_id, "⏳ 执行中", content, "grey")
+            await _patch_card(client, progress_id, "⏳ 执行中", content, "grey")
 
-        def _maybe_patch():
+        async def _maybe_patch():
             now = time.time()
             if now - last_patch[0] >= 1.5:
                 last_patch[0] = now
-                _do_patch()
+                await _do_patch()
 
-        def _maybe_patch_todo():
+        async def _maybe_patch_todo():
             """task_list 变化时用更短节流，保证状态切换的视觉反馈（B5）。"""
             now = time.time()
             if now - last_patch[0] >= 0.4:
                 last_patch[0] = now
-                _do_patch()
+                await _do_patch()
 
         async def on_tool_start(tool_use_id: str, name: str, input_dict: dict):
             # TaskCreate：暂存等 on_tool_result 拿到真实 ID
@@ -505,7 +506,7 @@ async def handle_message(
             # TaskUpdate / TodoWrite：直接更新 todo 块
             if name in ("TaskUpdate", "TodoWrite"):
                 if _apply_task_update(task_list, name, input_dict):
-                    _maybe_patch_todo()
+                    await _maybe_patch_todo()
                 return
             # TaskList / TaskGet：纯查询，不显示
             if name in ("TaskList", "TaskGet"):
@@ -517,13 +518,13 @@ async def handle_message(
             if prog_block:
                 line = f"{line}\n{prog_block}"
             steps.append(line)
-            _maybe_patch()
+            await _maybe_patch()
 
         async def on_tool_result(tool_use_id: str, text: str):
             # 只关心 TaskCreate 的结果：从中抠真实 taskId 写回
             if tool_use_id in pending_creates:
                 if _resolve_task_create(task_list, pending_creates, tool_use_id, text):
-                    _maybe_patch_todo()
+                    await _maybe_patch_todo()
 
         async def on_thinking(_text: str):
             # 4.7 thinking 是 redacted（无明文），text 仅占位用；
@@ -536,7 +537,7 @@ async def handle_message(
             now = time.time()
             if now - last_patch[0] >= 1.5:
                 last_patch[0] = now
-                _do_patch()
+                await _do_patch()
 
         async def _spinner_tick():
             """思考期间无新事件时持续旋转 🤔 末尾的动画帧。"""
@@ -549,7 +550,7 @@ async def handle_message(
                     steps[-1] = _SPINNER_PREFIX + _SPINNER_FRAMES[spinner_idx[0]]
                     if time.time() - last_patch[0] >= _SPINNER_TICK:
                         last_patch[0] = time.time()
-                        _do_patch()
+                        await _do_patch()
             except asyncio.CancelledError:
                 pass
 
@@ -564,7 +565,7 @@ async def handle_message(
             now = time.time()
             if now - last_patch[0] >= 1.5:
                 last_patch[0] = now
-                _do_patch()
+                await _do_patch()
 
         # 准备图片
         image_paths = []
@@ -607,7 +608,7 @@ async def handle_message(
         # 进度卡：移除末尾的 🤔/💬 行，只保留工具步骤
         while steps and (steps[-1].startswith("💬") or steps[-1].startswith("🤔")):
             steps.pop()
-        _do_patch()
+        await _do_patch()
 
         # 另发结果卡（触发推送）
         is_error = result.startswith("❌")
@@ -622,12 +623,12 @@ async def handle_message(
 
         log.info("发送结果卡片: title=%s len=%d", final_title, len(answer))
         if message_id:
-            _reply_card(
+            await _reply_card(
                 client, message_id, final_title, answer, final_color,
                 thread_key=thread.key,
             )
         else:
-            _create_card(
+            await _create_card(
                 client, chat_id, final_title, answer, final_color,
                 thread_key=thread.key,
             )
@@ -643,25 +644,26 @@ async def _handle_command(
     cmd = parts[0].lower()
     arg = parts[1] if len(parts) > 1 else ""
 
-    def _send(title: str, content: str, color: str):
+    async def _send(title: str, content: str, color: str):
         if message_id:
-            _reply_card(client, message_id, title, content, color)
+            await _reply_card(client, message_id, title, content, color)
         else:
-            send_rich_card(client, chat_id, title, content, color)
+            # send_rich_card 是 sender 模块同步函数，扔线程池避免阻塞 event loop
+            await asyncio.to_thread(send_rich_card, client, chat_id, title, content, color)
 
     if cmd == "/new":
         old = router.reset_current(chat_id, sender_id)
         if old:
-            _send("🔄 新话题", f"已离开 `{old.title}`，下条消息开新话题。", "green")
+            await _send("🔄 新话题", f"已离开 `{old.title}`，下条消息开新话题。", "green")
         else:
-            _send("🔄 新话题", "下条消息开新话题。", "green")
+            await _send("🔄 新话题", "下条消息开新话题。", "green")
         return
 
     if cmd == "/threads":
         threads = router.list_threads(chat_id)
         cur = router.get_current(chat_id, sender_id)
         if not threads:
-            _send("🧵 话题列表", "（暂无话题）", "blue")
+            await _send("🧵 话题列表", "（暂无话题）", "blue")
             return
         threads.sort(key=lambda x: -x.last_active)
         # 默认只展示 20 个，/threads all 全量；防止飞书卡片正文超长
@@ -690,35 +692,35 @@ async def _handle_command(
             lines.append("")
             lines.append(f"_还有 {hidden} 个，使用 `/threads all` 查看全部_")
 
-        _send("🧵 话题列表", "\n".join(lines), "blue")
+        await _send("🧵 话题列表", "\n".join(lines), "blue")
         return
 
     # /stop /cwd /status 都按当前 sender 的"将进入的话题"操作
     thread = await router.try_resolve(chat_id, sender_id, parent_id)
     if thread is None:
-        _send("ℹ️ 无活跃话题", "尚未开启对话；先发一条消息试试。", "grey")
+        await _send("ℹ️ 无活跃话题", "尚未开启对话；先发一条消息试试。", "grey")
         return
 
     if cmd == "/stop":
         stopped = await thread.get_runner().stop()
         if stopped:
-            _send("⏹ 已中止", f"话题 `{thread.title}` 的当前任务已终止。", "orange")
+            await _send("⏹ 已中止", f"话题 `{thread.title}` 的当前任务已终止。", "orange")
         else:
-            _send("ℹ️ 无任务", "当前话题没有正在执行的任务。", "grey")
+            await _send("ℹ️ 无任务", "当前话题没有正在执行的任务。", "grey")
 
     elif cmd == "/cwd":
         if not arg:
-            _send("📂 当前目录", f"`{thread.cwd}`", "blue")
+            await _send("📂 当前目录", f"`{thread.cwd}`", "blue")
         else:
             err = router.set_cwd(thread, arg)
             if err:
-                _send("❌ 切换失败", err, "red")
+                await _send("❌ 切换失败", err, "red")
             else:
-                _send("📂 已切换", f"`{thread.cwd}`", "green")
+                await _send("📂 已切换", f"`{thread.cwd}`", "green")
 
     elif cmd == "/status":
         running = thread.runner is not None and thread.runner.is_running
-        _send("📊 状态", "\n".join([
+        await _send("📊 状态", "\n".join([
             f"**话题:** {thread.title}",
             f"**Key:** `{thread.key}`",
             f"**会话:** `{thread.session_id or '(无)'}`",
@@ -727,7 +729,7 @@ async def _handle_command(
         ]), "blue")
 
     else:
-        _send(
+        await _send(
             "❓ 未知命令",
             "可用命令: `/new` `/stop` `/cwd <path>` `/status` `/threads`",
             "grey",
