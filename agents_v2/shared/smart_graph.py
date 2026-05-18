@@ -9,6 +9,7 @@
 配置：所有 LLM 调用的模型、温度、prompts 均从 registry 读取。
 节点在每次执行时实时读 config，所以 DB 修改后下次调用立刻生效。
 """
+import logging
 from typing import Annotated, Any, Literal, TypedDict
 
 from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
@@ -16,6 +17,8 @@ from langgraph.graph import END, START, StateGraph
 from langgraph.graph.message import add_messages
 
 from agents_v2.shared.claude_client import make_langchain_llm
+
+log = logging.getLogger("agents_v2.smart_graph")
 
 
 # Fallback prompts — used when registry doesn't supply a global override.
@@ -74,6 +77,7 @@ class SmartState(TypedDict):
     plan: str
     execution_result: str
     cc: list
+    cc_session_id: str | None  # claude code --resume 续会话 id（cc 后端用）
 
 
 # ── Helpers ──────────────────────────────────────────────────────────────────
@@ -408,6 +412,67 @@ def _decide_after_route(state: SmartState) -> Literal["chat", "plan"]:
     return "chat" if state["route"] == "CHAT" else "plan"
 
 
+# ── claude code 后端 work 节点（阶段 6）──────────────────────────────────────
+
+async def _cc_work_node(state: SmartState, employee_key: str) -> dict:
+    """WORK 路径走 claude code CLI 后端。失败时回退 langchain _react_node。
+
+    plan 节点保留（出方案给用户看），execute 由 claude code 一站式接管：
+    它自带 Bash/Read/Write/Edit/Grep/TodoWrite 等工具，再加上 MCP company server
+    暴露的 schedule_task / send_feishu_message 等 6 个项目工具，能力完整。
+    """
+    from agents_v2.shared.cc_executor import (
+        run_cc_node,
+        make_progress_callbacks,
+        CCExecutorFailed,
+    )
+    from agents_v2.shared import runner as _runner
+    from backend.services import registry as _registry
+    import redis.asyncio as _aioredis
+
+    cfg = _registry.get_effective_sync(employee_key)
+    if not cfg:
+        return {"execution_result": "(员工配置缺失)"}
+
+    query = _text_only(state["task_input"])
+    plan = state.get("plan", "")
+    sid_in = state.get("cc_session_id")
+
+    chat_id = _runner.current_feishu_chat_id.get("")
+    thread_id = _runner.current_thread_id.get("")
+
+    # plan 作为 prompt prefix 送给 claude code，让它按方案执行
+    prompt = f"执行方案：\n{plan}\n\n原始需求：\n{query}" if plan else query
+
+    rclient = _aioredis.from_url("redis://localhost:6379/0")
+    try:
+        callbacks = make_progress_callbacks(employee_key, thread_id, rclient)
+        text, new_sid, _logs = await run_cc_node(
+            employee_key=employee_key,
+            query=prompt,
+            cwd=cfg.cwd,
+            session_id=sid_in,
+            chat_id=chat_id,
+            thread_id=thread_id,
+            feishu_app_id=cfg.feishu_app_id or "",
+            feishu_app_secret=cfg.feishu_app_secret or "",
+            agent_port=cfg.agent_port or "",
+            callbacks=callbacks,
+        )
+    except CCExecutorFailed as exc:
+        log.warning("[%s] cc_work_node fallback to langchain: %s", employee_key, exc)
+        # 取不到 tools 时退化到无工具 _execute_node
+        return _execute_node(state, employee_key)
+    finally:
+        await rclient.aclose()
+
+    return {
+        "execution_result": text,
+        "cc_session_id": new_sid or sid_in,
+        "messages": [_human_msg(state["task_input"]), AIMessage(text)],
+    }
+
+
 # ── Public builder ───────────────────────────────────────────────────────────
 
 def build_smart_agent(employee_key_or_prompt, checkpointer, cc_prompt: str = "", tools: list | None = None):
@@ -430,17 +495,31 @@ def build_smart_agent(employee_key_or_prompt, checkpointer, cc_prompt: str = "",
 
     employee_key = arg
 
+    # 阶段 6 后端开关：cc 走 claude code CLI 子进程；langchain 走旧路径
+    # 优先级：env > DB behavior > 默认 langchain（保守起步，逐员工灰度切 cc）
+    import os as _os
+    from backend.services import registry as _reg
+    _emp_cfg = _reg.get_effective_sync(employee_key)
+    _exec_backend = _os.environ.get("EMPLOYEE_EXEC_BACKEND") or \
+        ((_emp_cfg.behavior or {}).get("exec_backend") if _emp_cfg else "") or "langchain"
+
     g = StateGraph(SmartState)
     g.add_node("route", partial(_route_node, employee_key=employee_key))
     g.add_node("plan",  partial(_plan_node,  employee_key=employee_key))
 
-    # CHAT 路径：有工具时也走 ReAct（闲聊也可调工具，如"看看进程""现在几点"等轻量查询）
-    # 标签端已对应改为"简短回复（必要时调工具）"，避免和实际行为打脸
+    # CHAT 路径始终走 langchain（claude code 子进程冷启慢，对闲聊不可接受）
     if tools:
-        g.add_node("chat",    partial(_react_chat_node, employee_key=employee_key, tools=tools))
-        g.add_node("execute", partial(_react_node,      employee_key=employee_key, tools=tools))
+        g.add_node("chat", partial(_react_chat_node, employee_key=employee_key, tools=tools))
     else:
-        g.add_node("chat",    partial(_chat_node,    employee_key=employee_key))
+        g.add_node("chat", partial(_chat_node, employee_key=employee_key))
+
+    # WORK 执行节点：cc 走 claude code，langchain 走旧 react/execute
+    if _exec_backend == "cc":
+        g.add_node("execute", partial(_cc_work_node, employee_key=employee_key))
+        log.info("[%s] build_smart_agent: WORK 后端 = claude code CLI", employee_key)
+    elif tools:
+        g.add_node("execute", partial(_react_node, employee_key=employee_key, tools=tools))
+    else:
         g.add_node("execute", partial(_execute_node, employee_key=employee_key))
 
     g.add_edge(START, "route")

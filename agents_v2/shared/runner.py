@@ -217,6 +217,9 @@ async def run_with_events(
                             })
                     if out.get("cc"):
                         result_data["cc"] = out["cc"]
+                    # 阶段 6：cc_work_node 把 cc_session_id 写进 state，透传到调用方
+                    if out.get("cc_session_id"):
+                        result_data["cc_session_id"] = out["cc_session_id"]
 
             # 工具实际调用：langchain BaseTool.invoke 会发 on_tool_start，
             # data.input 是已 parse 好的完整 args（比 on_chat_model_end 拿 tool_calls 更可靠）
