@@ -268,6 +268,96 @@ psql -c "UPDATE employee SET behavior=behavior||'{\"exec_backend\":\"langchain\"
 
 ---
 
+### 阶段 6.5 — 跨员工协作：delegate_to_employee 委托机制（1 天）
+**目标**：员工 A 想改员工 B 负责的文件时，主动委托而不是被 sandbox 暴力拒绝。
+
+**为什么需要**：sandbox-exec 只是文件级隔离，**不解决"协作"问题**。光拒绝员工 A 写员工 B 的文件，员工 A 拿到 permission denied 不知所措。要给一个"敲门"机制：A 看到边界 → 主动调 delegate_to → 任务转派给 B → B 在自己 cwd 完成。
+
+**设计要点**：
+- **异步 fire-and-forget**：A 调 delegate_to 立刻拿到 task_id，A 继续跑自己的事；B 在飞书原对话里独立完成并发结果卡（用户能看到 A、B 接力）
+- **显式 path_ownership 表**：路径 glob ↔ employee_key，多匹配按 priority 高的胜
+- **CLAUDE.md 边界教育**：每员工 CLAUDE.md 渲染时附带"我的 cwd / 同事的 cwd / 不能改对方目录就用 delegate_to_<key>"
+
+**改动**：
+
+1. **新建 path_ownership 表**：
+   ```sql
+   CREATE TABLE path_ownership (
+       id SERIAL PRIMARY KEY,
+       path_pattern TEXT NOT NULL,    -- glob 形式
+       employee_key TEXT NOT NULL,
+       priority INT DEFAULT 0,        -- 多匹配时高优先级胜
+       created_at TIMESTAMPTZ DEFAULT NOW()
+   );
+   CREATE INDEX idx_path_ownership_pattern ON path_ownership(path_pattern);
+   ```
+   初始数据：
+   ```sql
+   INSERT INTO path_ownership (path_pattern, employee_key, priority) VALUES
+   ('employees/sysadmin/**',         'sysadmin',         100),
+   ('employees/tech_lead/**',        'tech_lead',        100),
+   ('employees/mechanical/**',       'mechanical',       100),
+   ('employees/hardware/**',         'hardware',         100),
+   ('employees/firmware/**',         'firmware',         100),
+   ('employees/algorithm/**',        'algorithm',        100),
+   ('employees/product_manager/**',  'product_manager',  100),
+   ('employees/project_manager/**',  'project_manager',  100),
+   ('employees/testing/**',          'testing',          100),
+   ('employees/cost/**',             'cost',             100),
+   ('**',                             'sysadmin',         0);   -- 默认归 sysadmin
+   ```
+
+2. **新增 `agents_v2/shared/ownership.py`**：
+   - `resolve_owner(path: str) -> str | None`：按 path_pattern fnmatch + priority 解析
+   - `list_all_owners() -> dict[str, list[str]]`：渲染给 CLAUDE.md
+   - 缓存（PG NOTIFY 失效，参考 registry 同款机制）
+
+3. **新增 MCP 工具 `delegate_to_employee`**（在 `mcp_servers/company_tools/server.py`）：
+   ```python
+   @mcp.tool
+   def delegate_to_employee(
+       target_employee: str,           # 必填：员工 key
+       task_description: str,          # 必填：任务描述
+       context_files: list[str] = [],  # 可选：相关文件路径
+   ) -> dict:
+       """把任务异步委托给另一个员工。立即返回 task_id，不等执行结果。
+       使用场景：你想改的文件不在自己 cwd，需要让对应员工来改。
+       目标员工会在飞书原对话里独立发出进度卡和结果卡。"""
+   ```
+   实现：调 backend `POST /api/employees/{target}/dispatch`，body 含 task + context_files + from_employee；立即 return task_id。
+
+4. **新增 backend API**：`POST /api/employees/{key}/dispatch`：
+   - 入参 `{task, context_files, from_employee, chat_id}`
+   - 内部调 employee 的 agent_port `/dispatch`，异步触发，不等
+   - 返回 `{task_id, status: "delegated"}`
+
+5. **CLAUDE.md 模板增强**（`employee_workspace.ensure_workspace`）：
+   - 模板注入"管辖范围"：从 path_ownership 拉自己的 patterns
+   - 注入"同事范围"：列其他 9 个员工 key + 各自 cwd
+   - 加固定语：「**重要**：要改任何不在我 cwd 下的文件，必须用 `mcp__company__delegate_to_employee` 工具委托给对应员工」
+
+**验证**：
+```bash
+# path_ownership 解析测试
+python -c "
+from agents_v2.shared.ownership import resolve_owner
+print(resolve_owner('employees/firmware/main.c'))   # 期待: firmware
+print(resolve_owner('robot-dog/leg.py'))            # 期待: sysadmin (默认)
+"
+
+# 委托端到端
+# 1. 飞书让机械员工 "把 employees/firmware/foo.py 加一行注释"
+# 2. 机械员工应该：(a) 调 delegate_to_employee(firmware, "...") (b) 立刻拿到 task_id 并告诉用户"已委托固件员工"
+# 3. 几秒内固件员工应在原对话发新进度卡 → 完成卡
+
+# sandbox 兜底测试（让员工故意不听 CLAUDE.md，直接 Bash 写）
+sandbox-exec -f /tmp/employee_mechanical.sb bash -c 'echo x > /Users/liyijiang/work/company/employees/firmware/test.txt' 2>&1 | grep -i "Operation not permitted"
+```
+
+**产出**：员工自治协作流程跑通，sandbox 拒绝 + delegate_to 主动调用两条路并存。
+
+---
+
 ### 阶段 7 — 全员铺开（半天）
 **目标**：10 个员工全切。
 
@@ -324,19 +414,29 @@ psql -c "UPDATE employee SET behavior=behavior||'{\"exec_backend\":\"langchain\"
 | 跨包依赖 cc_bridge.claude_runner | feishu 模块被重构时连锁断 | 后续可把 ClaudeRunner 抽到 `agents_v2/shared/`，本计划不动 |
 | 员工互相写穿（无沙箱时） | 阶段 1 上线但阶段 2 还没跑 | 阶段 1-2 必须连续上线，不留中间状态 |
 | ~/.claude/projects 体积膨胀 | 每员工独立 session 存历史 | 定期清理 / 加监控告警；当前 217MB 可控 |
+| 委托链死循环 | A delegate B、B delegate A | delegate_to 入参检查 from_employee；同一对话超过 3 跳直接拒绝 |
+| 委托结果用户感知混乱 | 飞书原对话突然冒出别的员工卡片 | 卡片标题加 "↪️ 来自机械员工的委托"，让用户知道这是什么 |
+| path_ownership 漏配 | 新建文件没匹配规则 → 默认归 sysadmin | 大目录默认归 sysadmin，CLAUDE.md 提示员工"拿不准就 delegate 到 sysadmin" |
 
 ---
 
 ## 7. 关键文件清单（实施时要改的）
 
 **新建**：
-- `mcp_servers/company_tools/server.py`
+- `mcp_servers/company_tools/server.py`（含 6 个原工具 + delegate_to_employee）
 - `agents_v2/shared/cc_executor.py`
 - `agents_v2/shared/sandbox.py`
 - `agents_v2/shared/employee_workspace.py`
 - `agents_v2/shared/mcp_config.py`
+- `agents_v2/shared/ownership.py`（路径归属解析 + PG NOTIFY 缓存）
 - `infra/sandbox/employee.sb`
 - `doc/design/employee-claude-code-backend.md`（本方案 copy）
+
+**新建表**：
+- `path_ownership`（path_pattern, employee_key, priority）
+
+**新建 API**：
+- `POST /api/employees/{key}/dispatch`（异步委托入口）
 
 **修改**：
 - `backend/models/employee.py`（加 cwd 字段）
@@ -363,9 +463,10 @@ psql -c "UPDATE employee SET behavior=behavior||'{\"exec_backend\":\"langchain\"
 | 4. cc_executor | 1 天 |
 | 5. task_events 回调桥 + 进度卡兼容 | 0.5 天 |
 | 6. LangGraph work_node 切换 + 单员工联调 | 2 天 |
+| **6.5. 跨员工委托 delegate_to_employee** | **1 天** |
 | 7. 全员铺开 | 0.5 天 |
 | 8. 清理与文档 | 0.5 天 |
-| **合计** | **6.5 天** |
+| **合计** | **7.5 天** |
 
 单会话肯定做不完。建议每完成一个阶段独立 commit，每阶段结束后跑一次"然后再测试"的验证清单。
 
