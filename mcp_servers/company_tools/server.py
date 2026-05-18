@@ -122,6 +122,51 @@ def send_group_chat_message(content: str) -> str:
     return _send_group_chat_message.invoke({"content": content})
 
 
+# ── 工具：跨员工委托（阶段 6.5）──────────────────────────────────────────────
+
+@mcp.tool()
+def delegate_to_employee(
+    target_employee: str,
+    task_description: str,
+    context_files: list[str] = [],
+) -> str:
+    """把任务异步委托给另一个员工，立即返回不等执行结果。
+
+    使用场景：你想改的文件不在自己 cwd（被 sandbox 拒绝写），需要让对应员工来改。
+    用 list_employees / 看 CLAUDE.md 同事范围 / 路径推断 找到目标员工。
+    目标员工会在飞书原对话里独立发出进度卡和结果卡，用户能看到接力。
+
+    Args:
+        target_employee: 员工 key（如 firmware / hardware / sysadmin）
+        task_description: 要委托的任务描述
+        context_files: 可选，相关文件路径列表（让目标员工快速定位上下文）
+
+    Returns:
+        '已委托 task_id=xxx 给 target_employee'
+    """
+    import httpx
+    from_employee = os.environ.get("EMPLOYEE_KEY", "")
+    chat_id = os.environ.get("EMPLOYEE_CHAT_ID", "")
+    try:
+        resp = httpx.post(
+            f"http://localhost:8000/api/employees/{target_employee}/dispatch",
+            json={
+                "task": task_description,
+                "context_files": context_files,
+                "from_employee": from_employee,
+                "chat_id": chat_id,
+            },
+            timeout=10,
+        )
+        if resp.status_code == 200:
+            data = resp.json()
+            return (f"✅ 已委托 {target_employee}（task_id={data['task_id']}）。"
+                    f"对方会在原对话独立发结果卡，你可以继续做自己的事。")
+        return f"❌ 委托失败 ({resp.status_code}): {resp.text[:200]}"
+    except Exception as exc:
+        return f"❌ 委托失败: {exc}"
+
+
 # ── 工具：历史检索 ────────────────────────────────────────────────────────────
 
 @mcp.tool()

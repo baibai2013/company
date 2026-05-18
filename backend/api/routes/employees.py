@@ -7,12 +7,15 @@ through ProcessManager.
 """
 from __future__ import annotations
 
+import logging
 from typing import Any
 
 from fastapi import APIRouter, Body, HTTPException, Query
 
 from backend.repos import audit_repo, employee_repo, llm_call_repo
 from backend.services import process_manager, registry
+
+log = logging.getLogger("backend.api.employees")
 
 router = APIRouter(prefix="/api/employees", tags=["employees"])
 
@@ -132,6 +135,85 @@ async def reload_employee(key: str) -> dict:
     """Force registry cache invalidation. Running processes pick up changes on next LLM call."""
     await registry.invalidate(key)
     return {"ok": True, "reloaded": key}
+
+
+@router.post("/{key}/dispatch")
+async def dispatch_to_employee(key: str, payload: dict = Body(...)) -> dict:
+    """阶段 6.5：跨员工委托入口。异步 fire-and-forget。
+
+    payload:
+        task: str            必填，要委托的任务描述
+        context_files: list  可选，相关文件路径
+        from_employee: str   可选，发起委托的员工 key（用于死循环检测 + 卡片标记来源）
+        chat_id: str         可选，飞书 chat_id（让结果回到原对话）
+
+    返回:
+        {task_id: 唯一 ID, status: 'delegated'}
+    立即返回，不等目标员工完成。
+    """
+    import asyncio
+    import os
+    import uuid
+    from datetime import datetime, timezone
+
+    cfg = await registry.get_effective(key)
+    if not cfg:
+        raise HTTPException(404, f"employee '{key}' not found")
+    if not cfg.agent_port:
+        raise HTTPException(400, f"employee '{key}' has no agent_port")
+
+    task = (payload.get("task") or "").strip()
+    if not task:
+        raise HTTPException(400, "task is required")
+
+    from_employee = payload.get("from_employee", "")
+    context_files = payload.get("context_files") or []
+    chat_id = payload.get("chat_id", "")
+
+    task_id = uuid.uuid4().hex[:12]
+    # 给 task 加上来源标记，让目标员工知道是委托来的
+    if from_employee:
+        prefix = f"【来自 {from_employee} 的委托】\n"
+        if context_files:
+            prefix += f"相关文件：{', '.join(context_files[:5])}\n"
+        prefix += "\n"
+        full_task = prefix + task
+    else:
+        full_task = task
+
+    # 异步触发目标员工的 a2a JSON-RPC tasks/send
+    import httpx as _httpx
+    a2a_url = f"http://localhost:{cfg.agent_port}/"
+    rpc_payload = {
+        "jsonrpc": "2.0",
+        "id": task_id,
+        "method": "tasks/send",
+        "params": {
+            "message": {"parts": [{"type": "text", "text": full_task}]},
+            "metadata": {
+                "task_id": f"delegate_{task_id}",
+                "chat_id": chat_id,
+                "from_employee": from_employee,
+            },
+        },
+    }
+
+    async def _fire():
+        try:
+            async with _httpx.AsyncClient(timeout=300) as client:
+                await client.post(a2a_url, json=rpc_payload)
+        except Exception as exc:
+            log.warning("delegate %s → %s 失败: %s", from_employee, key, exc)
+
+    asyncio.create_task(_fire())
+
+    return {
+        "task_id": task_id,
+        "status": "delegated",
+        "target_employee": key,
+        "from_employee": from_employee,
+        "queued_at": datetime.now(timezone.utc).isoformat(),
+    }
 
 
 @router.get("/{key}/status")
