@@ -176,6 +176,15 @@ _TOOL_ICONS = {
     "list_scheduled_tasks": "⏰", "create_scheduled_task": "⏰",
     "delete_scheduled_task": "⏰", "update_scheduled_task": "⏰",
     "send_message": "💬", "save_memory": "🧠", "search_memory": "🧠",
+    # claude code 自带工具（阶段 5 起 cc 后端会发出这些工具名）
+    "Bash": "💻", "Read": "📖", "Write": "✏️", "Edit": "✏️",
+    "MultiEdit": "✏️", "Glob": "🔍", "Grep": "🔍",
+    "Agent": "🤖", "WebFetch": "🌐", "WebSearch": "🌐",
+    "TodoWrite": "📋", "Task": "🤖",
+    # MCP company server 工具（剥前缀后会得到这些原名）
+    "send_feishu_message": "💬", "send_group_chat_message": "💬",
+    "schedule_task": "⏰", "cancel_scheduled_task": "⏰",
+    "recall_history": "🧠",
 }
 
 # 兜底参数提取：不在专属处理里的工具，按这些 key 优先级展示首个非空字符串值
@@ -216,6 +225,17 @@ def _step_line(name: str, args: dict) -> str:
         verb = {"create_scheduled_task": "新建", "update_scheduled_task": "更新",
                 "delete_scheduled_task": "删除", "list_scheduled_tasks": "列出"}[name]
         return f"{icon} {verb} {s}".rstrip()
+    if name == "schedule_task":
+        s = args.get("name") or args.get("cron") or ""
+        return f"{icon} 新建 {s}".rstrip() if s else f"{icon} 新建定时任务"
+    if name == "cancel_scheduled_task":
+        return f"{icon} 取消 {args.get('task_id', '')}".rstrip()
+    if name in ("send_feishu_message", "send_group_chat_message"):
+        text = args.get("content") or args.get("text") or ""
+        title = args.get("title", "")
+        return f"{icon} {(title + ': ' if title and title != '通知' else '')}{str(text)[:60]}" if text else f"{icon} {name}"
+    if name == "recall_history":
+        return f"{icon} 检索历史 (offset={args.get('offset', 20)}, count={args.get('count', 20)})"
     if name == "send_message":
         chat = args.get("chat_id") or args.get("to") or ""
         text = args.get("text") or args.get("content") or ""
@@ -223,6 +243,28 @@ def _step_line(name: str, args: dict) -> str:
     if name == "save_memory":
         text = args.get("content") or args.get("text") or ""
         return f"{icon} {str(text)[:60]}" if text else f"{icon} {name}"
+
+    # claude code 自带工具：复刻 cc_bridge/message_handler.py:195 的展示风格
+    if name == "Bash":
+        cmd = (args.get("command") or "").replace("\n", " ").strip()
+        return f"{icon} {(cmd[:80] + '…') if len(cmd) > 80 else cmd}" if cmd else f"{icon} {name}"
+    if name in ("Edit", "Write", "MultiEdit"):
+        return f"{icon} {args.get('file_path', name)}"
+    if name == "Read":
+        return f"{icon} {args.get('file_path', '')}" if args.get('file_path') else f"{icon} {name}"
+    if name in ("Glob", "Grep"):
+        return f"{icon} {args.get('pattern', '')}" if args.get('pattern') else f"{icon} {name}"
+    if name == "Agent" or name == "Task":
+        return f"{icon} {(args.get('description') or 'subagent')[:60]}"
+    if name in ("WebFetch", "WebSearch"):
+        t = args.get("url") or args.get("query") or ""
+        return f"{icon} {t[:80]}" if t else f"{icon} {name}"
+    if name == "TodoWrite":
+        todos = args.get("todos") or []
+        if isinstance(todos, list) and todos:
+            first = todos[0].get("content", "") if isinstance(todos[0], dict) else str(todos[0])
+            return f"{icon} {first[:60]} (+{len(todos) - 1})" if len(todos) > 1 else f"{icon} {first[:60]}"
+        return f"{icon} {name}"
 
     # 未知工具兜底：按通用 key 优先级找首个非空字符串值
     for k in _GENERIC_PARAM_KEYS:

@@ -134,3 +134,49 @@ def make_callbacks(
     cb.on_tool_start = on_tool_start
     cb.on_tool_result = on_tool_result
     return cb
+
+
+def make_progress_callbacks(employee: str, task_id: str, redis_client) -> _Callbacks:
+    """把 claude code 的 on_tool_start 转成 task_events 频道的 tool_use 事件。
+
+    employee_bot 端订阅 task_events 过滤本次 task_id，按 tool_name + tool_args
+    渲染步骤行（_step_line 已在阶段 5 追加 Bash/Read/Edit 等工具识别）。
+
+    on_text / on_thinking / on_tool_result 不发 task_events，避免太频繁淹没进度卡。
+    最终结果会通过 _cc_work_node 回填到 result_data["result"]，结果卡正常发。
+
+    Args:
+        employee: 员工 key
+        task_id: LangGraph thread_id（=task_events 过滤 key）
+        redis_client: aioredis Redis 实例（已 from_url）
+
+    Returns:
+        _Callbacks 容器，可直接传给 run_cc_node 的 callbacks 参数。
+    """
+    import json as _json
+
+    async def on_tool_start(tool_use_id: str, name: str, input_dict: dict) -> None:
+        # 剥 mcp__company__ 前缀，让 employee_bot _step_line 走原工具名分支
+        # （schedule_task / send_feishu_message 等已在 _TOOL_ICONS 字典里）
+        clean_name = name
+        if clean_name.startswith("mcp__"):
+            parts = clean_name.split("__", 2)
+            if len(parts) == 3:
+                clean_name = parts[2]   # mcp__company__schedule_task → schedule_task
+        try:
+            await redis_client.publish("task_events", _json.dumps({
+                "type": "tool_use",
+                "employee": employee,
+                "task_id": task_id,
+                "tool_name": clean_name,
+                "tool_args": input_dict if isinstance(input_dict, dict) else {},
+            }, ensure_ascii=False))
+        except Exception as exc:
+            log.debug("[%s] publish tool_use failed: %s", employee, exc)
+
+    return make_callbacks(
+        on_text=None,        # 不发，避免每个 token 都打 redis
+        on_thinking=None,    # 不发
+        on_tool_start=on_tool_start,
+        on_tool_result=None, # 不发，工具结果直接进 claude，不展示给用户
+    )
