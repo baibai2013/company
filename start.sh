@@ -61,7 +61,7 @@ start_py() {
     warn "端口 $port ($name) 已占用，跳过"
     return
   fi
-  nohup .venv/bin/python "$@" > "$LOG_DIR/$name.log" 2>&1 &
+  nohup .venv/bin/python "$@" > "$LOG_DIR/$name.log" 2>&1 < /dev/null &
   local pid=$!
   echo "$name $pid" >> "$PID_FILE"
   # Also drop a per-employee PID file so backend.services.process_manager
@@ -231,7 +231,7 @@ for k in registry.list_keys_sync_cached(active_only=True):
   started_bots=0
   while IFS= read -r emp; do
     [[ -z "$emp" ]] && continue
-    nohup .venv/bin/python -m feishu.employee_bot "$emp" > "$LOG_DIR/bot_${emp}.log" 2>&1 &
+    nohup .venv/bin/python -m feishu.employee_bot "$emp" > "$LOG_DIR/bot_${emp}.log" 2>&1 < /dev/null &
     bot_pid=$!
     echo "bot_${emp} $bot_pid" >> "$PID_FILE"
     mkdir -p "$LOG_DIR/.pids"
@@ -250,7 +250,7 @@ if [[ $NO_FEISHU -eq 0 ]]; then
   info "启动 CC Bridge (飞书 ↔ Claude Code CLI, jurigged 热更新)..."
   PYTHONUNBUFFERED=1 nohup .venv/bin/jurigged -v --poll 0.5 \
     -w feishu/cc_bridge -w feishu/sender.py \
-    -m feishu.cc_bridge.main > "$LOG_DIR/cc_bridge.log" 2>&1 &
+    -m feishu.cc_bridge.main > "$LOG_DIR/cc_bridge.log" 2>&1 < /dev/null &
   echo "cc_bridge $!" >> "$PID_FILE"
   ok "CC Bridge PID=$!  (logs/cc_bridge.log)"
 fi
@@ -258,14 +258,14 @@ fi
 # ── 8. GroupOrchestrator ──────────────────────────────────────────────────────
 echo ""
 info "启动 GroupOrchestrator（群聊调度器）..."
-nohup .venv/bin/python -m group_chat.orchestrator > "$LOG_DIR/orchestrator.log" 2>&1 &
+nohup .venv/bin/python -m group_chat.orchestrator > "$LOG_DIR/orchestrator.log" 2>&1 < /dev/null &
 echo "orchestrator $!" >> "$PID_FILE"
 ok "GroupOrchestrator (logs/orchestrator.log)"
 
 # ── 9. 热更新守护进程 ────────────────────────────────────────────────────────
 echo ""
 info "启动热更新守护进程..."
-nohup .venv/bin/python scripts/hot_reload.py > "$LOG_DIR/hot_reload.log" 2>&1 &
+nohup .venv/bin/python scripts/hot_reload.py > "$LOG_DIR/hot_reload.log" 2>&1 < /dev/null &
 echo "hot_reload $!" >> "$PID_FILE"
 ok "热更新守护进程 (logs/hot_reload.log)"
 

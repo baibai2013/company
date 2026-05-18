@@ -148,9 +148,12 @@ class ClaudeRunner:
         log.info("执行: cwd=%s session=%s cmd=%s", cwd, session_id, " ".join(cmd[:6]) + "...")
 
         # limit=4MB：claude 的 system init 行包含所有 slash_commands，远超默认 64KB
+        # stdin=DEVNULL：防止继承父进程 stdin（如 zsh here-doc 残留 fd），
+        # claude code CLI 在 stdin 不是 pipe/tty 时可能卡死等输入
         _limit = 4 * 1024 * 1024
         self._process = await asyncio.create_subprocess_exec(
             *cmd,
+            stdin=asyncio.subprocess.DEVNULL,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
             cwd=cwd,
