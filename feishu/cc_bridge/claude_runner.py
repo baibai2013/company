@@ -106,13 +106,19 @@ class ClaudeRunner:
         on_tool_result: callable = None,
         on_text: callable = None,
         on_thinking: callable = None,
+        extra_cli_args: list[str] | None = None,
+        cmd_wrapper: callable = None,
     ) -> tuple[str, list[str], str | None]:
         """
         执行 Claude Code CLI，流式返回结果。
 
         参数：
-          cwd:        本次运行的工作目录
-          session_id: 如有则 --resume 复用上下文
+          cwd:            本次运行的工作目录
+          session_id:     如有则 --resume 复用上下文
+          extra_cli_args: 额外插入的 claude CLI 参数（如 --mcp-config /
+                          --permission-mode acceptEdits）。在 prompt 前插入
+          cmd_wrapper:    argv → argv 的回调，给外部包 sandbox-exec 用。例：
+                          lambda argv: ['/usr/bin/sandbox-exec','-f',profile,*argv]
 
         返回 (最终文本, 工具调用日志, 新 session_id)。
         新 session_id 由调用方写回 Thread。
@@ -126,12 +132,18 @@ class ClaudeRunner:
         if session_id:
             cmd.extend(["--resume", session_id])
 
+        if extra_cli_args:
+            cmd.extend(extra_cli_args)
+
         # 图片：告知 Claude 文件路径，由其 Read 工具读取（支持多模态）
         if image_paths:
             paths_str = "\n".join(f"- {p}" for p in image_paths)
             prompt = f"请先用 Read 工具读取以下图片文件，然后再回答：\n{paths_str}\n\n用户问题：{prompt}"
 
         cmd.append(prompt)
+
+        if cmd_wrapper:
+            cmd = cmd_wrapper(cmd)
 
         log.info("执行: cwd=%s session=%s cmd=%s", cwd, session_id, " ".join(cmd[:6]) + "...")
 
