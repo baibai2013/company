@@ -29,6 +29,7 @@ from feishu.cc_bridge.claude_runner import (
     save_temp_image,
 )
 from feishu.cc_bridge.thread_router import Thread, get_router
+from feishu.cc_bridge import commands as cc_commands
 
 log = logging.getLogger("cc_bridge.handler")
 
@@ -412,8 +413,12 @@ async def handle_message(
     router = get_router()
 
     if text.startswith("/"):
-        await _handle_command(client, chat_id, sender_id, text, message_id, parent_id, router)
-        return
+        first_token = text.strip().split(maxsplit=1)[0].lower()
+        if cc_commands.is_local(first_token):
+            await _handle_command(client, chat_id, sender_id, text, message_id, parent_id, router)
+            return
+        # 未识别的 /xxx 透传给 Claude（skill 或自定义 slash 命令）
+        log.info("透传未知命令给 Claude: %s", first_token)
 
     # 解析归属话题
     thread, source = await router.resolve(chat_id, sender_id, parent_id, text)
@@ -651,6 +656,79 @@ async def _handle_command(
             # send_rich_card 是 sender 模块同步函数，扔线程池避免阻塞 event loop
             await asyncio.to_thread(send_rich_card, client, chat_id, title, content, color)
 
+    # ── 重定向：/clear → /new 等等 ──
+    target = cc_commands.get_redirect(cmd)
+    if target:
+        await _send(
+            f"↪️ 已转 `{target}`",
+            f"`{cmd}` 在飞书等价于 `{target}`，正在执行…",
+            "grey",
+        )
+        cmd = target
+        arg = ""  # 重定向后 arg 不复用，避免歧义
+
+    # ── 不支持的 TUI 命令 ──
+    msg = cc_commands.get_unsupported(cmd)
+    if msg:
+        await _send(f"❌ {cmd} 在飞书不可用", msg, "orange")
+        return
+
+    # ── 不依赖话题的命令（无需话题状态即可执行）──
+    if cmd == "/help":
+        title, content, color = cc_commands.cmd_help(arg)
+        await _send(title, content, color)
+        return
+
+    if cmd == "/mcp":
+        title, content, color = await cc_commands.cmd_mcp()
+        await _send(title, content, color)
+        return
+
+    if cmd == "/release-notes":
+        title, content, color = await cc_commands.cmd_release_notes()
+        await _send(title, content, color)
+        return
+
+    if cmd == "/hooks":
+        title, content, color = cc_commands.cmd_hooks()
+        await _send(title, content, color)
+        return
+
+    if cmd == "/cost":
+        title, content, color = cc_commands.cmd_cost()
+        await _send(title, content, color)
+        return
+
+    if cmd == "/compact":
+        title, content, color = cc_commands.cmd_compact()
+        await _send(title, content, color)
+        return
+
+    if cmd == "/model":
+        title, content, color = cc_commands.cmd_model(arg)
+        await _send(title, content, color)
+        return
+
+    if cmd == "/permissions":
+        title, content, color = cc_commands.cmd_permissions(arg)
+        await _send(title, content, color)
+        return
+
+    if cmd == "/agents":
+        # /agents 用当前 sender 默认话题的 cwd（找不到就用进程 cwd）
+        thread_for_cwd = await router.try_resolve(chat_id, sender_id, parent_id)
+        cwd = thread_for_cwd.cwd if thread_for_cwd else ""
+        title, content, color = cc_commands.cmd_agents(cwd)
+        await _send(title, content, color)
+        return
+
+    if cmd == "/memory":
+        thread_for_cwd = await router.try_resolve(chat_id, sender_id, parent_id)
+        cwd = thread_for_cwd.cwd if thread_for_cwd else ""
+        title, content, color = cc_commands.cmd_memory(arg, cwd)
+        await _send(title, content, color)
+        return
+
     if cmd == "/new":
         old = router.reset_current(chat_id, sender_id)
         if old:
@@ -729,8 +807,9 @@ async def _handle_command(
         ]), "blue")
 
     else:
+        # 走到这里说明 _LOCAL_CMDS 里有这个命令但没有对应分支（开发兜底）
         await _send(
-            "❓ 未知命令",
-            "可用命令: `/new` `/stop` `/cwd <path>` `/status` `/threads`",
+            "❓ 命令未实现",
+            f"`{cmd}` 暂未实现。`/help` 查看可用命令。",
             "grey",
         )
