@@ -172,15 +172,30 @@ def make_progress_callbacks(employee: str, task_id: str, redis_client) -> _Callb
                 "type": "tool_use",
                 "employee": employee,
                 "task_id": task_id,
+                "tool_use_id": tool_use_id,
                 "tool_name": clean_name,
                 "tool_args": input_dict if isinstance(input_dict, dict) else {},
             }, ensure_ascii=False))
         except Exception as exc:
             log.debug("[%s] publish tool_use failed: %s", employee, exc)
 
+    async def on_tool_result(tool_use_id: str, text: str) -> None:
+        # 仅对 TaskCreate 这类异步分配 ID 的工具有意义：bot 端用 result 文本
+        # 解析真实 taskId 写入 todo 列表。其他工具结果不展示给用户。
+        try:
+            await redis_client.publish("task_events", _json.dumps({
+                "type": "tool_result",
+                "employee": employee,
+                "task_id": task_id,
+                "tool_use_id": tool_use_id,
+                "result_text": (text or "")[:500],
+            }, ensure_ascii=False))
+        except Exception as exc:
+            log.debug("[%s] publish tool_result failed: %s", employee, exc)
+
     return make_callbacks(
         on_text=None,        # 不发，避免每个 token 都打 redis
         on_thinking=None,    # 不发
         on_tool_start=on_tool_start,
-        on_tool_result=None, # 不发，工具结果直接进 claude，不展示给用户
+        on_tool_result=on_tool_result,
     )

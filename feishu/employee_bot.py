@@ -17,6 +17,7 @@ import json
 import logging
 import os
 import re
+from collections import OrderedDict
 import sys
 import threading
 import time
@@ -197,6 +198,98 @@ _GENERIC_PARAM_KEYS = (
 
 _MAX_STEPS_SHOWN = 15
 
+# todo 聚合（参考 cc_bridge/message_handler.py 实现）
+_TASK_TOOLS = {"TaskCreate", "TaskUpdate", "TodoWrite"}
+_TODO_LIMIT = 30
+_TASK_CREATE_RE = re.compile(r"Task\s+#(\d+)\s+created\s+successfully", re.IGNORECASE)
+
+
+def _normalize_subject(subject: str | None) -> str:
+    s = (subject or "").replace("\n", " ").replace("\r", " ").replace("\t", " ").strip()
+    if not s:
+        return "(无标题)"
+    return s[:60] + "…" if len(s) > 60 else s
+
+
+def _apply_task_update(task_list: dict, name: str, input_dict: dict) -> bool:
+    """处理 TodoWrite / TaskUpdate（同步 ID）。返回 True 表示需要刷新进度卡。"""
+    if name == "TodoWrite":
+        task_list.clear()
+        for i, item in enumerate(input_dict.get("todos", []) or []):
+            tid = f"_tw_{i}"
+            task_list[tid] = {
+                "subject": item.get("content") or item.get("subject") or "(无标题)",
+                "status": item.get("status", "pending"),
+            }
+        return True
+    if name == "TaskUpdate":
+        tid = str(input_dict.get("taskId", "")).strip()
+        if not tid:
+            return False
+        new_status = input_dict.get("status")
+        if new_status == "deleted":
+            return task_list.pop(tid, None) is not None
+        new_subject = input_dict.get("subject")
+        cur = task_list.get(tid)
+        changed = False
+        if cur is None:
+            cur = {"subject": new_subject or f"Task #{tid}", "status": "pending"}
+            task_list[tid] = cur
+            changed = True
+        if new_subject and cur.get("subject") != new_subject:
+            cur["subject"] = new_subject
+            changed = True
+        if new_status and cur.get("status") != new_status:
+            cur["status"] = new_status
+            changed = True
+        return changed
+    return False
+
+
+def _resolve_task_create(task_list: dict, pending: dict, tool_use_id: str, result_text: str) -> bool:
+    """on_tool_result 时把 pending TaskCreate 落到 task_list（解析真实 task ID）。"""
+    info = pending.pop(tool_use_id, None)
+    if info is None:
+        return False
+    m = _TASK_CREATE_RE.search(result_text or "")
+    if not m:
+        task_list[tool_use_id] = info
+        return True
+    tid = m.group(1)
+    existing = task_list.get(tid)
+    if existing is None:
+        task_list[tid] = info
+    else:
+        for k, v in info.items():
+            existing.setdefault(k, v)
+    return True
+
+
+def _build_todo_block(task_list: dict) -> str | None:
+    if not task_list:
+        return None
+    items = list(task_list.items())
+    total = len(items)
+    hidden = 0
+    if total > _TODO_LIMIT:
+        rank = {"in_progress": 0, "pending": 1, "completed": 2}
+        items.sort(key=lambda kv: rank.get(kv[1].get("status", "pending"), 1))
+        hidden = total - _TODO_LIMIT
+        items = items[:_TODO_LIMIT]
+    lines = ["📋 任务列表"]
+    for _tid, info in items:
+        subject = _normalize_subject(info.get("subject"))
+        status = info.get("status", "pending")
+        if status == "completed":
+            lines.append(f"- [✓] <font color='green'>~~{subject}~~</font>")
+        elif status == "in_progress":
+            lines.append(f"- [~] <font color='blue'>{subject}</font>")
+        else:
+            lines.append(f"- [ ] <font color='grey'>{subject}</font>")
+    if hidden > 0:
+        lines.append(f"_…还有 {hidden} 条已折叠（按未完成优先展示）_")
+    return "\n".join(lines)
+
 
 def _step_line(name: str, args: dict) -> str:
     """单步展示：cc_bridge 风格，每步独立一行，带工具的关键参数。"""
@@ -311,6 +404,11 @@ def _render_progress(state: dict) -> tuple[str, str, str]:
             lines.append(f"_…前 {hidden} 步已折叠_")
         lines.extend(shown)
 
+    # Todo 列表块（TaskCreate / TaskUpdate / TodoWrite 聚合渲染）
+    todo_block = _build_todo_block(state.get("task_list") or {})
+    if todo_block:
+        lines.append(todo_block)
+
     phase = state.get("phase", "start")
     if finished:
         lines.append(f"**阶段**：{_PHASE_LABEL['done']}")
@@ -378,8 +476,10 @@ async def _handle(employee: str, task: str, chat_id: str, client: lark.Client,
         "task": (task[:80] + "…") if task and len(task) > 80 else (task or "（图片消息）"),
         "phase": "start",
         "route": None,
-        "plan_first": "",   # plan 首句，整体一行
-        "steps": [],        # 工具调用步骤累积流
+        "plan_first": "",       # plan 首句，整体一行
+        "steps": [],            # 工具调用步骤累积流
+        "task_list": OrderedDict(),  # TodoWrite/TaskCreate/TaskUpdate 聚合
+        "pending_creates": {},  # tool_use_id → {subject, status} 等 tool_result 解析真实 ID
         "started_at": time.monotonic(),
         "elapsed": 0.0,
         "finished": False,
@@ -442,14 +542,36 @@ async def _handle(employee: str, task: str, chat_id: str, client: lark.Client,
                         progress_state["plan_first"] = (first[:80] + "…") if len(first) > 80 else first
                         await _patch_progress(force=True)
                     elif typ == "tool_use":
-                        line = _step_line(
-                            payload.get("tool_name") or "?",
-                            payload.get("tool_args") or {},
-                        )
-                        # 跟上一行完全相同（同工具同参数）才去重，否则保留以体现真实流程
-                        if not progress_state["steps"] or progress_state["steps"][-1] != line:
-                            progress_state["steps"].append(line)
-                        await _patch_progress()
+                        tn = payload.get("tool_name") or "?"
+                        targs = payload.get("tool_args") or {}
+                        tuid = payload.get("tool_use_id", "")
+                        # TaskCreate / TaskUpdate / TodoWrite 聚合到 task_list，
+                        # 不进 steps（避免散行 "🔧 TaskUpdate" 淹没进度卡）
+                        if tn in _TASK_TOOLS:
+                            if tn == "TaskCreate":
+                                # 真实 task ID 由 claude 主程序分配，等 tool_result
+                                progress_state["pending_creates"][tuid] = {
+                                    "subject": targs.get("subject") or targs.get("description") or "(无标题)",
+                                    "status": "pending",
+                                }
+                            else:
+                                _apply_task_update(progress_state["task_list"], tn, targs)
+                            await _patch_progress()
+                        else:
+                            line = _step_line(tn, targs)
+                            if not progress_state["steps"] or progress_state["steps"][-1] != line:
+                                progress_state["steps"].append(line)
+                            await _patch_progress()
+                    elif typ == "tool_result":
+                        tuid = payload.get("tool_use_id", "")
+                        rtext = payload.get("result_text", "")
+                        if tuid and progress_state["pending_creates"].get(tuid):
+                            if _resolve_task_create(
+                                progress_state["task_list"],
+                                progress_state["pending_creates"],
+                                tuid, rtext,
+                            ):
+                                await _patch_progress()
         except asyncio.CancelledError:
             pass
         except Exception as exc:
