@@ -55,6 +55,36 @@
 | `src/**/*.{c,h,cpp}` | C/C++ 源 | B2 §6.3 资源页 code | — |
 | `platformio.ini` | PlatformIO 配置 | — | `[env:esp32...]` |
 | `build/firmware.{bin,elf,map}` | 编译产物 | — | bin 给烧录,elf 给调试,map 给 size 分析 |
+| **`wiring.json`** | JSON | **B2-connectivity-view §5.4** | **`connections[].{from, to, kind, label?, data_subtype?}`**;每条 from/to 形如 `<node_id>:<interface_id>` |
+
+### wiring.json 责任边界
+
+**为什么由我出 wiring 而非 hardware**:
+- 接什么 GPIO 是固件层决策(GPIO 分配权属于固件工程师)
+- KiCad schematic 由 hardware 出,但 schematic 不强约束 GPIO 用法
+- 解耦:hardware 声明"哪些信号脚可用"(bom interfaces),firmware 决定"具体怎么连"
+
+### wiring.json 范式(B2-connectivity-view §5.4)
+
+```jsonc
+{
+  "version": "1.0",
+  "connections": [
+    {"from": "esp32_main:GPIO13", "to": "mg996r_fl_hip:signal", "kind": "data", "label": "PWM 50Hz"},
+    {"from": "esp32_main:GPIO14", "to": "mg996r_fl_knee:signal", "kind": "data", "label": "PWM 50Hz"},
+    {"from": "battery_18650:positive", "to": "dcdc_5v:vin", "kind": "power", "label": "+12V"},
+    {"from": "dcdc_5v:vout", "to": "esp32_main:VIN", "kind": "power", "label": "+5V"},
+    {"from": "esp32_main:GPIO21", "to": "imu_main:sda", "kind": "data", "data_subtype": "i2c", "label": "I2C SDA"},
+    {"from": "esp32_main:GPIO22", "to": "imu_main:scl", "kind": "data", "data_subtype": "i2c", "label": "I2C SCL"}
+  ]
+}
+```
+
+`kind` 仅 `data` / `power`(机械边由 mechanical 的 mount_points 自动生成);
+`data_subtype` 选填(i2c / spi / uart / pwm 等)。
+
+merge 时所引用的 from/to node id 必须在 bom.json 或 parts.json 里存在,interface id
+必须在对应 node 的 interfaces[] 里(否则校验失败)。
 
 ### PlatformIO 范式
 

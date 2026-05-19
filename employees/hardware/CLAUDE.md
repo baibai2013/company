@@ -54,7 +54,46 @@
 |---|---|---|---|
 | `*.kicad_sch` + `*.kicad_pcb` | KiCad 8 源 | B2 §5.4 | — |
 | `cad/exports/*.{svg,pdf,step,glb}` | kicad-cli 出 | B2 §5.4 | 与源同名 |
-| **`bom.json`** | JSON | **B2 §2.3** | **`category`(12 类之一)、`qty`、`vendors[]` 长度 ≥ 2(覆盖 pro/maker/budget 任两档)** |
+| **`bom.json`** | JSON | **B2 §2.3 + connectivity §5.3** | **每 item 含 `id`/`category`/`qty`/`vendors[]≥2`/`interfaces[]`/`owner`,跨域件加 `cross_domain: true` + `cad_model`** |
+
+### BOM item 扩展(B2-connectivity-view §5.3)
+
+**关键:每个实例独立一行**(以前 `MG996R qty:8` → 现在拆成 8 行 `mg996r_fl_hip` /
+`mg996r_fl_knee` / ...,每行 `qty: 1`),让每个舵机能在 connectivity 视图里独立连线。
+
+```jsonc
+{
+  "id": "mg996r_fl_hip",                          // ← connectivity 节点 id(全局唯一)
+  "name": "MG996R Servo (FL Hip)",
+  "category": "actuator",                         // ← 12 类之一
+  "owner": "hardware",
+  "qty": 1,                                       // ← 拆实例后 qty=1
+  "datasheet": "https://...",
+  "vendors": [
+    {"name": "DigiKey", "url": "...", "price_cny": 88, "tier": "pro"},
+    {"name": "AliExpress", "url": "...", "price_cny": 22, "tier": "budget"}
+  ],
+  "selected_vendor": "AliExpress",
+  "interfaces": [                                 // ← 端口列表(merge 脚本依据这个画端口圆点)
+    {"id": "signal", "kind": "data"},
+    {"id": "vcc",    "kind": "power"},
+    {"id": "gnd",    "kind": "power"},
+    {"id": "body",   "kind": "mechanical"}
+  ],
+  "cross_domain": true,                           // ← 跨域件(既电子又机械固定)
+  "cad_model": "domains/mechanical/parts/mg996r.glb"  // ← cross_domain=true 时必填
+}
+```
+
+### id 命名空间(避免撞名)
+
+- 电子元件: `<part_type>_<location>`(如 `mg996r_fl_hip` / `imu_main` / `dcdc_5v`)
+- 跨域件 id 与 mechanical mount_points 引用的 id **必须完全一致**
+
+### BomPreview 显示侧补救
+
+前端 BomPreview.vue 在 BOM 视图里把同型号多实例(`mg996r_*`)折叠显示("MG996R × 8"),
+保留可读性。connectivity 视图按拆开的实例画端口连线。
 
 ### 12 类 category 枚举
 `microcontroller / sensor / actuator / power / module / display / structural / enclosure / mechanism / hardware / 3D-printed / generic`

@@ -358,6 +358,26 @@ def load_assembly_doc(project: str) -> AssemblyDoc:
         raise HTTPException(500, f"assembly.json parse error: {exc}")
 
 
+def load_connectivity(project: str):
+    """读 connectivity.json。
+
+    不存在时返回空 doc(merge_failed=False);存在但解析失败时返回空 doc + merge_failed=True。
+    见 B2-connectivity-view.md §2 数据契约 / §7 风险表"merge 失败兜底"。
+    """
+    from backend.schemas.project import ConnectivityDoc
+    root = project_root(project)
+    if not root.exists():
+        raise HTTPException(404, f"project '{project}' not found")
+    p = root / "connectivity.json"
+    if not p.exists():
+        return ConnectivityDoc()
+    try:
+        return ConnectivityDoc(**json.loads(p.read_text()))
+    except Exception as exc:
+        log.warning("connectivity.json parse failed for %s: %s", project, exc)
+        return ConnectivityDoc(merge_failed=True)
+
+
 # ── tree ──────────────────────────────────────────────────────────────────────
 
 _HIDDEN_PREFIXES = (".", "__pycache__")

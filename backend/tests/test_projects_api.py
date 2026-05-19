@@ -275,6 +275,92 @@ async def test_bom_invalid_category_rejected(projects_client):
     shutil.rmtree(proj)
 
 
+# ── CN-1: connectivity 端点 ────────────────────────────────────────────────
+
+async def test_connectivity_returns_empty_doc_when_missing(projects_client):
+    """CN-1a: 没 connectivity.json 时返回空 doc(不是 404)。"""
+    proj = _make_project("conn-empty")
+    (proj / "charter.md").write_text("# conn-empty\n")
+    r = await projects_client.get("/api/projects/conn-empty/connectivity")
+    assert r.status_code == 200
+    body = r.json()
+    assert body["nodes"] == []
+    assert body["edges"] == []
+    assert body["merge_failed"] is False
+    shutil.rmtree(proj)
+
+
+async def test_connectivity_parses_real_doc(projects_client):
+    """CN-1b: connectivity.json 存在且合法 → 完整 nodes/edges 返回。"""
+    proj = _make_project("conn-real")
+    (proj / "charter.md").write_text("# conn-real\n")
+    doc = {
+        "version": "1.0",
+        "nodes": [
+            {
+                "id": "esp32_main", "kind": "mcu", "label": "ESP32",
+                "domain": "electronics", "owner": "hardware",
+                "interfaces": [{"id": "GPIO13", "kind": "data"}],
+            },
+            {
+                "id": "leg_fl_thigh", "kind": "cad_part", "label": "FL Thigh",
+                "domain": "mechanical", "owner": "mechanical",
+                "interfaces": [{"id": "hip_mount", "kind": "mechanical"}],
+            },
+        ],
+        "edges": [
+            {
+                "id": "e1", "from": "esp32_main:GPIO13",
+                "to": "leg_fl_thigh:hip_mount", "kind": "data",
+                "label": "PWM",
+            }
+        ],
+    }
+    (proj / "connectivity.json").write_text(json.dumps(doc))
+    r = await projects_client.get("/api/projects/conn-real/connectivity")
+    assert r.status_code == 200
+    body = r.json()
+    assert len(body["nodes"]) == 2
+    assert len(body["edges"]) == 1
+    assert body["edges"][0]["from"] == "esp32_main:GPIO13"
+    shutil.rmtree(proj)
+
+
+async def test_connectivity_invalid_json_returns_merge_failed(projects_client):
+    """CN-1c: connectivity.json 解析失败 → merge_failed=true,空 doc(不抛 500)。"""
+    proj = _make_project("conn-broken")
+    (proj / "charter.md").write_text("# conn-broken\n")
+    (proj / "connectivity.json").write_text("{not valid json")
+    r = await projects_client.get("/api/projects/conn-broken/connectivity")
+    assert r.status_code == 200
+    body = r.json()
+    assert body["merge_failed"] is True
+    assert body["nodes"] == []
+    shutil.rmtree(proj)
+
+
+async def test_connectivity_invalid_kind_rejected(projects_client):
+    """CN-1d: edge.kind 非 mechanical/power/data → pydantic 拒绝,merge_failed=true"""
+    proj = _make_project("conn-bad-kind")
+    (proj / "charter.md").write_text("# conn-bad-kind\n")
+    bad = {
+        "nodes": [{
+            "id": "a", "kind": "mcu", "label": "A",
+            "domain": "electronics", "owner": "hardware",
+            "interfaces": [{"id": "p", "kind": "data"}],
+        }],
+        "edges": [{
+            "id": "e1", "from": "a:p", "to": "a:p",
+            "kind": "wireless",  # 非法 kind
+        }],
+    }
+    (proj / "connectivity.json").write_text(json.dumps(bad))
+    r = await projects_client.get("/api/projects/conn-bad-kind/connectivity")
+    assert r.status_code == 200  # 不抛,但 merge_failed=true
+    assert r.json()["merge_failed"] is True
+    shutil.rmtree(proj)
+
+
 # ── B2-7: 不存在的项目 404 ───────────────────────────────────────────────────
 
 async def test_unknown_project_returns_404(projects_client):

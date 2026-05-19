@@ -54,7 +54,26 @@
 |---|---|---|---|
 | **`manifest.json`** | 汇总入口 | **B2 §2.2** | **`tags[]`(3-5 项)、`hero_image`、`summary{mass_g,dof,parts_count,cost_by_category}`、`assembly.parts[]`、`deliverables[]`** |
 | **`assembly.json`** | 装配指南 | **B2 §2.5** | **`tools[]`、`assumptions[]`、`phases[5]`(Fabricate/Wire/Assemble/Program/Calibrate),每 step 有 id/text/parts** |
+| **`connectivity.json`** | 部件互连图 | **B2-connectivity-view §2.1** | **由 `scripts/merge_connectivity.py` 跑出,不手填** |
 | `prd/<topic>.md` | PRD | B2 §2.1 | — |
+
+### connectivity.json 合成步骤(在 conclude 阶段做)
+
+不要手写。等 mechanical / hardware / firmware 三方各自交付完之后,跑 merge 脚本:
+
+```bash
+cd /Users/liyijiang/work/company
+python scripts/merge_connectivity.py ~/work/robot-dog/
+```
+
+merge 脚本读这三份输入:
+- `domains/electronics/bom.json` 每行(hardware 出)→ 电子节点
+- `domains/mechanical/parts/*.json` 的 `mount_points[].mounted_to` → 跨域机械边
+- `domains/firmware/wiring.json`(firmware 出)→ data/power 边
+
+merge 脚本会校验 id 唯一 / interface 引用合法 / kind 合法,失败时 `connectivity.json`
+顶层加 `merge_failed: true`,前端显示告警 banner。校验通过后写入
+`~/work/robot-dog/connectivity.json`。
 
 ### manifest 聚合范式(conclude 阶段做)
 

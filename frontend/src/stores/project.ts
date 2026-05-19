@@ -116,6 +116,58 @@ export interface PipelineSnapshot {
   edges: any[]
 }
 
+// ── Connectivity (B2-connectivity-view.md §2.1) ────────────────────────────
+
+export type NodeKind =
+  | 'mcu' | 'sensor' | 'actuator' | 'power' | 'module' | 'display'
+  | 'cad_part' | 'actuator_cross_domain' | 'generic'
+
+export type EdgeKind = 'mechanical' | 'power' | 'data'
+export type InterfaceKind = 'data' | 'power' | 'mechanical'
+
+export interface NodeInterface {
+  id: string
+  kind: InterfaceKind
+}
+
+export interface ConnectivityRef {
+  bom?: string | null
+  datasheet?: string | null
+  schematic_block?: string | null
+  step?: string | null
+  glb?: string | null
+  part_meta?: string | null
+  cad_model?: string | null
+}
+
+export interface ConnectivityNode {
+  id: string
+  kind: NodeKind
+  label: string
+  domain: string
+  owner: string
+  owner_label: string
+  ref: ConnectivityRef
+  interfaces: NodeInterface[]
+}
+
+export interface ConnectivityEdge {
+  id: string
+  from: string             // "<node_id>:<interface_id>"
+  to: string
+  kind: EdgeKind
+  label: string
+  data_subtype: string
+}
+
+export interface ConnectivityDoc {
+  version: string
+  generated_at: string | null
+  nodes: ConnectivityNode[]
+  edges: ConnectivityEdge[]
+  merge_failed: boolean
+}
+
 // ── store 定义 ─────────────────────────────────────────────────────────────
 
 const API_BASE = '/api/projects'
@@ -128,8 +180,17 @@ export const useProjectStore = defineStore('project', () => {
   const bom = ref<BomDoc | null>(null)
   const assemblyDoc = ref<AssemblyDoc | null>(null)
   const pipeline = ref<PipelineSnapshot | null>(null)
+  const connectivity = ref<ConnectivityDoc | null>(null)  // B2-connectivity-view
   const loading = ref(false)
   const error = ref<string | null>(null)
+
+  // B2-connectivity-view §3.6 — 抽屉点击「跳转 §4 装配视图」时,
+  // 由 ShowcaseHomeView 监听这个 ref,在 3D viewer 里高亮对应 part。
+  // 仅 connectivity 流程使用,加 action 不改既有 state 名。
+  const connectivityHighlight = ref<string | null>(null)
+  function setConnectivityHighlight(partId: string | null) {
+    connectivityHighlight.value = partId
+  }
 
   // getters
   const partsById = computed(() => {
@@ -171,6 +232,14 @@ export const useProjectStore = defineStore('project', () => {
         assemblyDoc.value = null
       }
 
+      // connectivity.json (B2-connectivity-view) — 端点总返回 200(空 doc 兜底)
+      try {
+        const c = await axios.get<ConnectivityDoc>(`${API_BASE}/${project}/connectivity`)
+        connectivity.value = c.data
+      } catch {
+        connectivity.value = null
+      }
+
       if (m.status === 'rejected') {
         error.value = '无法加载 manifest'
       }
@@ -188,6 +257,7 @@ export const useProjectStore = defineStore('project', () => {
     bom.value = null
     assemblyDoc.value = null
     pipeline.value = null
+    connectivity.value = null
     error.value = null
   }
 
@@ -255,11 +325,13 @@ export const useProjectStore = defineStore('project', () => {
 
   return {
     // state
-    current, manifest, tree, bom, assemblyDoc, pipeline, loading, error,
+    current, manifest, tree, bom, assemblyDoc, pipeline, connectivity, loading, error,
+    connectivityHighlight,
     // getters
     partsById, deliverableByKind, totalCost, isFallback,
     // actions
     ensureLoaded, clear, fileUrl,
     startLiveRefresh, stopLiveRefresh,
+    setConnectivityHighlight,
   }
 })

@@ -14,11 +14,12 @@ from fastapi import APIRouter, Header, HTTPException, Query, Response
 from fastapi.responses import FileResponse, StreamingResponse
 
 from backend.schemas.project import (
-    AssemblyDoc, BomDoc, ManifestRead, PipelineSnapshot, ProjectListItem, TreeNode,
+    AssemblyDoc, BomDoc, ConnectivityDoc, ManifestRead, PipelineSnapshot,
+    ProjectListItem, TreeNode,
 )
 from backend.services.project_service import (
     build_tree, etag_for_dir, etag_for_path, list_projects, load_assembly_doc,
-    load_bom, load_manifest, project_root, _resolve_safe,
+    load_bom, load_connectivity, load_manifest, project_root, _resolve_safe,
 )
 
 log = logging.getLogger(__name__)
@@ -96,6 +97,27 @@ async def get_bom(
 @router.get("/{project}/assembly", response_model=AssemblyDoc)
 async def get_assembly(project: str):
     return load_assembly_doc(project)
+
+
+@router.get("/{project}/connectivity", response_model=ConnectivityDoc)
+async def get_connectivity(
+    project: str,
+    response: Response,
+    if_none_match: str | None = Header(default=None),
+):
+    """返回 connectivity.json(部件互连图,B2-connectivity-view.md)。
+
+    不存在时返回空 doc(空 nodes/edges),前端走"暂无互连数据"占位;
+    解析失败时 merge_failed=True,前端可显示告警。
+    """
+    root = project_root(project)
+    if not root.exists():
+        raise HTTPException(404, f"project '{project}' not found")
+    etag = etag_for_path(root / "connectivity.json")
+    if if_none_match == etag:
+        return Response(status_code=304)
+    response.headers["ETag"] = etag
+    return load_connectivity(project)
 
 
 @router.get("/{project}/pipeline", response_model=PipelineSnapshot)

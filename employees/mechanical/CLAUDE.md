@@ -54,8 +54,35 @@
 | 文件 | 格式 | schema 锚点 | 不可省字段 |
 |---|---|---|---|
 | `parts/<name>.step` + `parts/<name>.glb` | build123d 双导出 | B2 §5.2 | 同名 / 同坐标系 |
-| `parts/<name>.json` | 元信息 | B2 §2.2 manifest.parts[] | `name, mass_g, material, explode_offset[3]` |
+| `parts/<name>.json` | 元信息 | B2 §2.2 + connectivity §5.2 | `id, name, owner, mass_g, material, explode_offset[3], mount_points[]` |
 | `assembly.step` + `assembly.glb` | 整机 | B2 §5.1 | 原点 = 装配中心 |
+
+### parts/<name>.json 扩展(B2-connectivity-view §5.2)
+
+```jsonc
+{
+  "id": "leg_fl_thigh",                           // ← connectivity 节点 id,全局唯一
+  "name": "Front-Left Thigh Shell",
+  "owner": "mechanical",
+  "mass_g": 42,
+  "material": "PETG",
+  "explode_offset": [0, 50, 0],
+  "mount_points": [                               // ← 跨域机械边声明
+    {"id": "hip_mount",  "mounted_to": "mg996r_fl_hip:body",  "fastener": "M3×4 self-tapping"},
+    {"id": "knee_mount", "mounted_to": "leg_fl_shin:knee_top", "fastener": "M3×8 + nylock"}
+  ]
+}
+```
+
+`mount_points[].mounted_to` 是 `<其他 node id>:<其他 interface id>`,merge 脚本会自动生成
+跨域 `kind: mechanical` 边。所引用的 node id 必须在 hardware bom 或别的 mechanical part 里
+存在(否则 merge 会校验失败)。
+
+### id 命名空间
+
+- CAD 零件: `<assembly>_<part>`(如 `leg_fl_thigh` / `body_main`)
+- 跨域件出现在两边声明里,**id 必须完全一致**(如舵机的 body 既是 hardware 的 bom item,
+  又是 mechanical mount_points 的 target)
 
 ### build123d 双导出范式
 

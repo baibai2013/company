@@ -215,6 +215,61 @@ class PipelineSnapshot(BaseModel):
     edges: list[WorkflowEdge] = Field(default_factory=list)
 
 
+# ── Connectivity (B2-connectivity-view §2.1) ─────────────────────────────────
+
+NodeKind = Literal[
+    "mcu", "sensor", "actuator", "power", "module", "display",
+    "cad_part", "actuator_cross_domain", "generic",
+]
+EdgeKind = Literal["mechanical", "power", "data"]
+InterfaceKind = Literal["data", "power", "mechanical"]
+
+
+class NodeInterface(BaseModel):
+    id: str
+    kind: InterfaceKind
+
+
+class ConnectivityRef(BaseModel):
+    bom: str | None = None
+    datasheet: str | None = None
+    schematic_block: str | None = None
+    step: str | None = None
+    glb: str | None = None
+    part_meta: str | None = None
+    cad_model: str | None = None
+
+
+class ConnectivityNode(BaseModel):
+    id: str
+    kind: NodeKind
+    label: str
+    domain: str = ""
+    owner: str
+    owner_label: str = ""
+    ref: ConnectivityRef = Field(default_factory=ConnectivityRef)
+    interfaces: list[NodeInterface] = Field(default_factory=list)
+
+
+class ConnectivityEdge(BaseModel):
+    id: str
+    from_: str = Field(alias="from")
+    to: str
+    kind: EdgeKind
+    label: str = ""
+    data_subtype: str = ""
+
+    model_config = {"populate_by_name": True}
+
+
+class ConnectivityDoc(BaseModel):
+    version: str = "1.0"
+    generated_at: datetime | None = None
+    nodes: list[ConnectivityNode] = Field(default_factory=list)
+    edges: list[ConnectivityEdge] = Field(default_factory=list)
+    merge_failed: bool = False
+
+
 # ── 项目列表条目 ────────────────────────────────────────────────────────────────
 
 class ProjectListItem(BaseModel):

@@ -560,7 +560,19 @@ AssemblyViewer3D.vue
 
 > **AssemblyTree 行为**: 切 ELECTRICAL [显] → 3D 视图舵机/PCB 全部消失,只剩结构件; 切 3D PRINT [显] → 可视化打印件占整机比例。整机包围盒尺寸标在右栏首行(由 build123d `Compound.bounding_box()` 算后写到 manifest.summary)。
 
-### 6.2 流程页 `/showcase/robot-dog/workflow`(ComfyUI 风格)
+### 6.2 ~~流程页~~ → CONNECTIVITY 部件互连图 `/showcase/robot-dog/workflow`
+
+> ⚠️ **本节(§6.2.x)已被 [B2-connectivity-view.md](./B2-connectivity-view.md) 取代**
+>
+> 用户反馈"AI 团队 Workflow 流程图"看不懂,真实需求是 **机器狗实物部件之间的关系网图**
+>(CAD 零件 / 电子元件 / 跨域硬件三者如何互连)。技术栈仍是 vue-flow + elkjs,但
+> 节点/边语义重做。url path `workflow` 保留以避免破坏外链;视图组件命名为 `ConnectivityView`。
+>
+> 详见: B2-connectivity-view.md §3 视图设计 / §5 产出契约联动。
+>
+> 下面 §6.2.1-§6.2.5 是历史 ComfyUI Workflow 设计,**保留作参考但不再实施**。
+
+### 6.2(历史) 流程页 ComfyUI 风格设计
 
 **视觉目标:** 复刻 ComfyUI 节点图编辑器观感 — 深色网格画布、圆角矩形节点、节点头部色条、彩色端口圆点、源色贝塞尔连线、节点序号徽章、可拖拽 / 可缩放 / 可框选。**只读模式**:不允许新建 / 删除节点,不允许手动连线,不显示右键菜单。
 
@@ -930,7 +942,7 @@ function onNodeClick(evt: { node: DeliverableNode }) {
 | **B2.1** | 后端 `projects` 路由 + manifest 兜底 + 路径保护 | 1d | 5 个 GET 端点 + 单元测试 |
 | **B2.2** | 机械员工 prompt 加 `.glb` 导出约定 + cost 加 `.json` 约定 | 0.5d | 改 `employees/mechanical/CLAUDE.md` 和 `employees/cost/CLAUDE.md` |
 | **B2.3** | 3D viewer 基础(`AssemblyViewer3D` + `Cad3DPreview` + Showcase 路由骨架) | 3d | 单个 .glb 能转,装配能拼,爆炸滑块能动 |
-| **B2.4** | Workflow 流程页(@vue-flow + DeliverableNode 自定义节点 + TypedEdge 染色 + DeliverableDialog) | 3d | ComfyUI 风格画布 + 5 节点 + 4 类预览(cad/code/md/bom)弹层 |
+| **B2.4** | **CONNECTIVITY 部件互连图**(@vue-flow + PartNode 双重染色 + TypedEdge mech/power/data + ConnectivityDrawer 三视图联动) | 2.5d | 真实部件节点 + 跨域机械边 + GPIO 接线 + localStorage 持久化(详见 [B2-connectivity-view.md](./B2-connectivity-view.md)) |
 | **B2.5** | Resources 资源页(树 + 多类型 preview pane) | 2d | 树 → 任一文件预览闭环 |
 | **B2.5b** | 装配指南页(`ShowcaseInstructionsView` + assembly.json 契约 + product_manager 员工产出 assembly.json + localStorage 进度) | 1d | 5 phase 检查表 + 进度 + tools/assumptions 顶部头(借鉴 Blueprint.am INSTRUCTIONS tab) |
 | **B2.6** | 联调 + 在 B1 e2e 跑出的 robot-dog 项目上验证 + 截图 | 2.5d | 一份给投资人看的 demo URL |
@@ -1177,7 +1189,7 @@ cd frontend && npx vitest src/components/showcase/__tests__/
 | **B2.1** | 后端路由 + Pydantic schema + 路径越界保护 + 单测 | 代码生成 + pytest(可控) | 主 session 直跑(后端 pytest 失败重试需主 session 灵活诊断) |
 | **B2.2** | 改 mechanical / cost 员工的 CLAUDE.md | 纯 markdown 编辑,零代码 | 主 session 直跑(20 分钟内完工) |
 | **B2.3** | 3D viewer:`AssemblyViewer3D` + `Cad3DPreview` + 路由骨架 | 纯前端 Vue 代码生成 | **subagent A:`general-purpose`** |
-| **B2.4** | Workflow 流程页:@vue-flow + DeliverableNode + TypedEdge + DeliverableDialog + elkjs 异步布局 | 纯前端 Vue 代码生成 + elkjs 集成 | **subagent B:`general-purpose`** |
+| **B2.4** | **CONNECTIVITY 部件互连图**:@vue-flow + PartNode(双重染色)+ TypedEdge(mech/power/data 三类)+ ConnectivityDrawer(双击抽屉,三视图跳转)+ elkjs DOWN 布局 + 显隐过滤 + localStorage 持久化 | 纯前端 Vue 代码生成 + elkjs + Drawer | **subagent B:`general-purpose`**(参考 [B2-connectivity-view.md](./B2-connectivity-view.md)) |
 | **B2.5** | Resources 资源页:树 + 8 类 preview pane | 纯前端 Vue 代码生成 | **subagent C:`general-purpose`** |
 | **B2.5b** | 装配指南页:`ShowcaseInstructionsView` + assembly.json schema + product_manager 员工 prompt 微调 | 纯前端 Vue + markdown | **subagent D:`general-purpose`** |
 | **B2.6** | 联调 / 在 B1 e2e 跑出的 robot-dog 项目上验证 / 截图 / OCP 视觉验证 | shell 密集(`./start.sh` / `npm run dev` / playwright 截图 / OCP) | 主 session 直跑(memory 规则:OCP 截图验证不交 subagent) |
