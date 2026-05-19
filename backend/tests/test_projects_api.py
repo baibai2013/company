@@ -97,6 +97,39 @@ async def test_manifest_fallback_scans_directory(projects_client):
     shutil.rmtree(proj)
 
 
+# ── B2-2b: domains/ 新结构兜底扫描(B2 patch §2.2) ───────────────────────────
+
+async def test_manifest_fallback_scans_domains_structure(projects_client):
+    """B2-2b: domains/<domain>/ 新结构(机械->parts/电子->cad/exports)被识别"""
+    proj = _make_project("domains-test")
+    (proj / "charter.md").write_text("# domains-test\n")
+    (proj / "domains" / "mechanical" / "parts").mkdir(parents=True)
+    (proj / "domains" / "mechanical" / "parts" / "femur.glb").write_bytes(b"fake-glb")
+    (proj / "domains" / "mechanical" / "parts" / "femur.step").write_text("ISO-10303;\n")
+    (proj / "domains" / "electronics" / "cad" / "exports").mkdir(parents=True)
+    (proj / "domains" / "electronics" / "cad" / "exports" / "leg-driver-sch.svg").write_text("<svg/>")
+    (proj / "domains" / "electronics" / "cad" / "exports" / "leg-driver-pcb-top.svg").write_text("<svg/>")
+    (proj / "domains" / "electronics" / "bom.json").write_text(json.dumps({
+        "currency": "CNY", "items": [], "summary": {"total": 0, "by_category": {}},
+    }))
+    (proj / "domains" / "firmware" / "src").mkdir(parents=True)
+    (proj / "domains" / "firmware" / "src" / "main.c").write_text("// fw")
+    (proj / "domains" / "firmware" / "algo").mkdir(parents=True)
+    (proj / "domains" / "firmware" / "algo" / "ik.py").write_text("# ik")
+
+    r = await projects_client.get("/api/projects/domains-test/manifest")
+    assert r.status_code == 200
+    body = r.json()
+    assert body["fallback"] is True
+    kinds = {d["kind"] for d in body["deliverables"]}
+    assert {"cad", "schematic", "pcb", "firmware", "algorithm", "bom"}.issubset(kinds), kinds
+    # part 的 glb 路径应是新位置
+    paths = {p["glb"] for p in body["assembly"]["parts"]}
+    assert "domains/mechanical/parts/femur.glb" in paths
+
+    shutil.rmtree(proj)
+
+
 # ── B2-3: 路径越界拦截 ───────────────────────────────────────────────────────
 
 async def test_file_path_traversal_blocked(projects_client):

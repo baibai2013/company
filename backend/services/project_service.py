@@ -26,7 +26,7 @@ log = logging.getLogger(__name__)
 
 
 PROJECTS_ROOT = Path(
-    os.environ.get("PROJECTS_ROOT", str(Path.home() / "work" / "projects"))
+    os.environ.get("PROJECTS_ROOT", str(Path.home() / "work"))
 ).resolve()
 
 
@@ -173,63 +173,117 @@ def _check_part_files(m: ManifestRead, root: Path) -> None:
 
 
 def _scan_fallback(project: str, root: Path) -> ManifestRead:
-    """目录扫描:按约定子目录推断 deliverables。assembly 部分按 parts/*.glb 扫。"""
+    """目录扫描:按 B2 patch §2.2 域结构 domains/<domain>/ 推断 deliverables。
+
+    优先扫 domains/<domain>/(新结构),回退顶级 parts/firmware/electronics/...(B1 e2e 旧布局)。
+    """
     deliverables: list[Deliverable] = []
 
-    if (root / "prd" / "leg-2dof.md").exists():
-        deliverables.append(Deliverable(kind="prd", path="prd/leg-2dof.md",
-                                        owner=_DEFAULT_OWNERS["prd"]))
-    elif (root / "prd").exists():
+    # ── 新结构: domains/<domain>/ (B2 patch §2.2) ─────────────────────────
+    domains = root / "domains"
+
+    # 1. PRD: prd/<file>.md(项目根)
+    if (root / "prd").exists():
         for f in (root / "prd").glob("*.md"):
-            deliverables.append(Deliverable(kind="prd", path=f"prd/{f.name}",
-                                            owner=_DEFAULT_OWNERS["prd"]))
+            deliverables.append(Deliverable(
+                kind="prd", path=f"prd/{f.name}",
+                owner=_DEFAULT_OWNERS["prd"],
+            ))
+            break
 
-    if (root / "parts").exists():
-        deliverables.append(Deliverable(kind="cad", path="parts/",
-                                        owner=_DEFAULT_OWNERS["cad"]))
+    # 2. CAD: domains/mechanical/parts/*.glb 或回退 parts/
+    cad_dir = None
+    if (domains / "mechanical" / "parts").exists():
+        cad_dir = domains / "mechanical" / "parts"
+        deliverables.append(Deliverable(
+            kind="cad", path="domains/mechanical/parts/",
+            owner=_DEFAULT_OWNERS["cad"],
+        ))
+    elif (root / "parts").exists():
+        cad_dir = root / "parts"
+        deliverables.append(Deliverable(
+            kind="cad", path="parts/", owner=_DEFAULT_OWNERS["cad"],
+        ))
 
-    if (root / "electronics").exists():
-        sch_svg = next((root / "electronics").glob("*-sch.svg"), None)
+    # 3. 电子: domains/electronics/cad/exports/*-sch.svg / *-pcb-*.svg(优先) 或 electronics/
+    elec_root = None
+    if (domains / "electronics").exists():
+        elec_root = domains / "electronics"
+        export_dir = elec_root / "cad" / "exports"
+        sch_dir = export_dir if export_dir.exists() else elec_root
+    elif (root / "electronics").exists():
+        elec_root = root / "electronics"
+        sch_dir = elec_root
+    else:
+        sch_dir = None
+    if sch_dir is not None and sch_dir.exists():
+        sch_svg = next(sch_dir.glob("*-sch.svg"), None)
         if sch_svg:
+            rel = str(sch_svg.relative_to(root)).replace(os.sep, "/")
             deliverables.append(Deliverable(
-                kind="schematic", path=f"electronics/{sch_svg.name}",
-                owner=_DEFAULT_OWNERS["schematic"],
+                kind="schematic", path=rel, owner=_DEFAULT_OWNERS["schematic"],
             ))
-        pcb_top = next((root / "electronics").glob("*-pcb-top.svg"), None)
+        pcb_top = next(sch_dir.glob("*-pcb-top.svg"), None)
         if pcb_top:
+            rel = str(pcb_top.relative_to(root)).replace(os.sep, "/")
             deliverables.append(Deliverable(
-                kind="pcb", path=f"electronics/{pcb_top.name}",
-                owner=_DEFAULT_OWNERS["pcb"],
+                kind="pcb", path=rel, owner=_DEFAULT_OWNERS["pcb"],
             ))
 
-    for sub_kind, sub_dir in (
-        ("firmware", "firmware"),
-        ("algorithm", "algorithm"),
-    ):
-        sub = root / sub_dir
-        if sub.exists():
-            for f in sub.iterdir():
-                if f.is_file() and f.suffix in (".c", ".h", ".cpp", ".py"):
-                    deliverables.append(Deliverable(
-                        kind=sub_kind, path=f"{sub_dir}/{f.name}",
-                        owner=_DEFAULT_OWNERS[sub_kind],
-                    ))
-                    break
+    # 4. firmware: domains/firmware/src/ 或回退 firmware/
+    fw_dir = None
+    if (domains / "firmware" / "src").exists():
+        fw_dir = domains / "firmware" / "src"
+    elif (domains / "firmware").exists():
+        fw_dir = domains / "firmware"
+    elif (root / "firmware").exists():
+        fw_dir = root / "firmware"
+    if fw_dir is not None:
+        for f in fw_dir.rglob("*"):
+            if f.is_file() and f.suffix in (".c", ".h", ".cpp"):
+                rel = str(f.relative_to(root)).replace(os.sep, "/")
+                deliverables.append(Deliverable(
+                    kind="firmware", path=rel, owner=_DEFAULT_OWNERS["firmware"],
+                ))
+                break
 
-    bom = root / "bom" / "leg-cost.json"
-    if bom.exists():
-        deliverables.append(Deliverable(kind="bom", path="bom/leg-cost.json",
-                                        owner=_DEFAULT_OWNERS["bom"]))
+    # 5. algorithm: domains/firmware/algo/*.py 或 algorithm/ 或 domains/simulation/
+    algo_dir = None
+    if (domains / "firmware" / "algo").exists():
+        algo_dir = domains / "firmware" / "algo"
+    elif (root / "algorithm").exists():
+        algo_dir = root / "algorithm"
+    if algo_dir is not None:
+        for f in algo_dir.glob("*.py"):
+            rel = str(f.relative_to(root)).replace(os.sep, "/")
+            deliverables.append(Deliverable(
+                kind="algorithm", path=rel, owner=_DEFAULT_OWNERS["algorithm"],
+            ))
+            break
 
+    # 6. BOM: domains/electronics/bom.json + domains/integration/cost_summary.json
+    #         或回退 bom/leg-cost.json
+    bom = None
+    if (domains / "electronics" / "bom.json").exists():
+        bom = domains / "electronics" / "bom.json"
+    elif (root / "bom" / "leg-cost.json").exists():
+        bom = root / "bom" / "leg-cost.json"
+    if bom is not None:
+        rel = str(bom.relative_to(root)).replace(os.sep, "/")
+        deliverables.append(Deliverable(
+            kind="bom", path=rel, owner=_DEFAULT_OWNERS["bom"],
+        ))
+
+    # parts 列表: 优先从新位置扫 .glb,回退 parts/
     parts = []
-    parts_dir = root / "parts"
-    if parts_dir.exists():
-        for glb in sorted(parts_dir.glob("*.glb")):
+    if cad_dir is not None:
+        for glb in sorted(cad_dir.glob("*.glb")):
             stem = glb.stem
-            step = parts_dir / f"{stem}.step"
+            step = cad_dir / f"{stem}.step"
+            rel_glb = str(glb.relative_to(root)).replace(os.sep, "/")
+            rel_step = str(step.relative_to(root)).replace(os.sep, "/") if step.exists() else ""
             parts.append(AssemblyPart(
-                id=stem, name=stem, glb=f"parts/{glb.name}",
-                step=f"parts/{step.name}" if step.exists() else "",
+                id=stem, name=stem, glb=rel_glb, step=rel_step,
                 owner=_DEFAULT_OWNERS["cad"],
             ))
 
@@ -253,7 +307,7 @@ def _scan_fallback(project: str, root: Path) -> ManifestRead:
     if (root / "manifest.json").exists():
         updated = (root / "manifest.json").stat().st_mtime
     elif parts:
-        updated = max((parts_dir / Path(p.glb).name).stat().st_mtime for p in parts)
+        updated = max((root / p.glb).stat().st_mtime for p in parts if (root / p.glb).exists())
     elif charter.exists():
         updated = charter.stat().st_mtime
 

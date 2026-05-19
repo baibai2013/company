@@ -98,7 +98,7 @@ async def run_cc_node(
 
     # 3) cmd_wrapper：把 claude argv 套上 sandbox-exec
     def _wrap(argv: list[str]) -> list[str]:
-        return wrap_command(argv, cwd)
+        return wrap_command(argv, cwd, employee_key=employee_key)
 
     # 4) 阶段 11：优先走热进程池（同 thread 5 分钟内复用），CLAUDE_POOL=off 时退回 spawn-per-task
     pool = get_pool()

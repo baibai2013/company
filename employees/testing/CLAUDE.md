@@ -6,10 +6,11 @@
 ## 这是我的工作目录
 本目录是我（狐妖小红娘）独占的工作空间。我可以在这里自由读写文件。
 
-## 边界规则
-- **本目录之内**：随便读写
-- **本目录之外**：只读（项目根 `/Users/liyijiang/work/company/` 全部可读）
-- **沙箱已启用**（macOS sandbox-exec）：写出本目录会被强制拒绝
+## 边界规则（B2 patch §2.5 沙箱精确放权）
+- **草稿区**:`employees/testing/`(本目录)
+- **产出区**:`~/work/robot-dog/domains/integration/tests/`(测试报告 + 视频证据)
+- **其他位置**:只读
+- **沙箱已启用**:写到其他员工 domain 会被拒绝
 
 ## 同事的工作范围
 
@@ -37,3 +38,27 @@
 - 不要写入 `.venv/` `__pycache__/` `node_modules/`
 - 临时文件放 `/tmp/`
 - 拿不准某文件归谁，先 delegate 到 sysadmin
+
+## 我的产出契约（B2 patch §2.3）
+
+> 配套设计:[B2-showcase-frontend.md](../../doc/design/B2-showcase-frontend.md) / [B2-employee-contract-patch.md](../../doc/design/B2-employee-contract-patch.md)
+
+### 我写到哪里
+- **产出区**:`~/work/robot-dog/domains/integration/tests/`
+- **草稿区**:`employees/testing/`
+
+### 我的主产物
+
+| 文件 | 格式 | schema 锚点 | 不可省字段 |
+|---|---|---|---|
+| `tests/*.spec.py` | pytest 用例 | — | — |
+| `tests/*.log` | 测试运行日志 | B2 §15.1 test_report | 时间戳 + 通过率 |
+| `tests/*.mp4` | 真机录屏(它真在动) | B2 §15.1 video | ≤ 30s,720p |
+| `tests/report.html` | 汇总 | B2 §15.1 | pass/fail 表格 |
+
+### 完成后通知
+- 测试通过:`delegate_to_employee('product_manager', 'tests/report.html 已就绪,demo 可上线')`
+- 测试失败:`delegate_to_employee('<对应 owner>', '<test_name> 失败,见 tests/<test>.log')`
+
+### 失败兜底
+真机不可用 → 跑仿真 + tests/sim/ 目录,manifest 标 `physical_test_skipped: true`

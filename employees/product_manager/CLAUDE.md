@@ -6,10 +6,11 @@
 ## 这是我的工作目录
 本目录是我（小米）独占的工作空间。我可以在这里自由读写文件。
 
-## 边界规则
-- **本目录之内**：随便读写
-- **本目录之外**：只读（项目根 `/Users/liyijiang/work/company/` 全部可读）
-- **沙箱已启用**（macOS sandbox-exec）：写出本目录会被强制拒绝
+## 边界规则（B2 patch §2.5 沙箱精确放权）
+- **草稿区**:`employees/product_manager/`(本目录)
+- **产出区**:`~/work/robot-dog/`(整个项目根,manifest.json + assembly.json + renders/ 等)— 我是终端汇总者
+- **其他位置**:只读
+- **沙箱已启用**:其他人写不进 `~/work/robot-dog/` 根,我是唯一能写 manifest/assembly 的
 
 ## 同事的工作范围
 
@@ -38,15 +39,24 @@
 - 临时文件放 `/tmp/`
 - 拿不准某文件归谁，先 delegate 到 sysadmin
 
-## 项目交付物约定（B2 Showcase）
+## 我的产出契约（B2 patch §2.3）
 
-### PRD 落地
+> 配套设计:[B2-showcase-frontend.md](../../doc/design/B2-showcase-frontend.md) / [B2-employee-contract-patch.md](../../doc/design/B2-employee-contract-patch.md)
 
-`~/work/projects/robot-dog/prd/leg-2dof.md`(或对应主题命名),markdown 格式。
+### 我写到哪里
+- **产出区**:`~/work/robot-dog/`(根)— 我是终端汇总者,manifest/assembly 等汇总入口归我写
+- **PRD**:`~/work/robot-dog/prd/<topic>.md`
+- **草稿区**:`employees/product_manager/`(自己的工作目录)
 
-### manifest 聚合(在 conclude 阶段)
+### 我的主产物
 
-5 员工 fanout 完成后,你负责合成 `~/work/projects/robot-dog/manifest.json`:
+| 文件 | 格式 | schema 锚点 | 不可省字段 |
+|---|---|---|---|
+| **`manifest.json`** | 汇总入口 | **B2 §2.2** | **`tags[]`(3-5 项)、`hero_image`、`summary{mass_g,dof,parts_count,cost_by_category}`、`assembly.parts[]`、`deliverables[]`** |
+| **`assembly.json`** | 装配指南 | **B2 §2.5** | **`tools[]`、`assumptions[]`、`phases[5]`(Fabricate/Wire/Assemble/Program/Calibrate),每 step 有 id/text/parts** |
+| `prd/<topic>.md` | PRD | B2 §2.1 | — |
+
+### manifest 聚合范式(conclude 阶段做)
 
 ```jsonc
 {
@@ -56,50 +66,61 @@
   "tags": ["BIPED-COMPATIBLE", "MG996R-BASED", "<200G-PER-LEG"],
   "hero_image": "renders/leg_isometric.png",
   "summary": {
-    "mass_g": 198,
-    "dof": 8,
-    "parts_count": 29,
-    "cost_by_category": {"electrical": 59.00, "mechanical": 38.52, "total": 97.52},
+    "mass_g": 198, "dof": 8, "parts_count": 29,
+    "cost_by_category": {"electrical": 59.0, "mechanical": 38.52, "total": 97.52},
     "currency": "CNY"
   },
   "assembly": {
     "parts": [
-      {"id": "femur-fl", "name": "左前-大腿", "glb": "parts/femur.glb",
-       "step": "parts/femur.step",
+      {"id": "femur-fl", "name": "左前-大腿",
+       "glb": "domains/mechanical/parts/femur.glb",
+       "step": "domains/mechanical/parts/femur.step",
        "transform": {"translation": [0,0,0], "rotation": [0,0,0,1]},
        "explode_offset": [0, 50, 0], "color": "#a0a0a0", "owner": "mechanical"}
     ]
   },
   "deliverables": [
-    {"kind": "prd",       "path": "prd/leg-2dof.md",                "owner": "product_manager"},
-    {"kind": "cad",       "path": "parts/",                         "owner": "mechanical"},
-    {"kind": "schematic", "path": "electronics/leg-driver-sch.svg", "owner": "hardware"},
-    {"kind": "pcb",       "path": "electronics/leg-driver-pcb-top.svg", "owner": "hardware"},
-    {"kind": "firmware",  "path": "firmware/leg_pwm.c",             "owner": "firmware"},
-    {"kind": "algorithm", "path": "algorithm/ik_2dof.py",           "owner": "algorithm"},
-    {"kind": "bom",       "path": "bom/leg-cost.json",              "owner": "cost"}
+    {"kind": "prd",       "path": "prd/leg-2dof.md",                              "owner": "product_manager"},
+    {"kind": "cad",       "path": "domains/mechanical/parts/",                    "owner": "mechanical"},
+    {"kind": "schematic", "path": "domains/electronics/cad/exports/leg-driver-sch.svg", "owner": "hardware"},
+    {"kind": "pcb",       "path": "domains/electronics/cad/exports/leg-driver-pcb-top.svg", "owner": "hardware"},
+    {"kind": "firmware",  "path": "domains/firmware/src/leg_pwm.c",               "owner": "firmware"},
+    {"kind": "algorithm", "path": "domains/firmware/algo/ik_2dof.py",             "owner": "algorithm"},
+    {"kind": "bom",       "path": "domains/electronics/bom.json",                 "owner": "cost"}
   ]
 }
 ```
 
-### assembly.json(装配指南)
+### 数据来源汇总
+- mechanical → `assembly.parts[]` / `summary.mass_g` / `summary.dof` / `summary.bbox`
+- hardware → `deliverables[].schematic` / `pcb`
+- cost → `summary.cost_by_category`(读 `domains/integration/cost_summary.json`)
+- testing → `deliverables[].test_report` / 视频
 
-`~/work/projects/robot-dog/assembly.json`,聚合 mechanical/hardware/firmware 各自给出的步骤片段,合并产出 5 phase:
+### hero_image 来源(决策 E)
+**three.js 整机视图截图脚本** 自动生成 → 写到 `renders/hero_iso.png`。
+不靠人工挑帧,与 manifest 同步刷新。
+
+### assembly.json(装配指南,5 phase 固定)
 
 ```jsonc
 {
-  "tools": ["3D printer (PETG)", "M2/M3 hex keys", "Soldering iron", ...],
-  "assumptions": ["Basic soldering skills", "PlatformIO familiarity", ...],
+  "tools": ["3D printer (PETG)", "M2/M3 hex keys", "Soldering iron", "..."],
+  "assumptions": ["Basic soldering skills", "PlatformIO familiarity", "..."],
   "phases": [
-    {"name": "Fabricate", "icon": "🛠", "steps": [
-      {"id": "1.1", "text": "3D print all leg shells", "parts": 8, "refs": ["femur-fl"]}
-    ]},
-    {"name": "Wire",      "icon": "🔌", "steps": [...]},
-    {"name": "Assemble",  "icon": "🔧", "steps": [...]},
-    {"name": "Program",   "icon": "💾", "steps": [...]},
-    {"name": "Calibrate", "icon": "🎯", "steps": [...]}
+    {"name": "Fabricate", "icon": "🛠", "steps": [{"id": "1.1", "text": "...", "parts": 8, "refs": ["femur-fl"]}]},
+    {"name": "Wire",      "icon": "🔌", "steps": []},
+    {"name": "Assemble",  "icon": "🔧", "steps": []},
+    {"name": "Program",   "icon": "💾", "steps": []},
+    {"name": "Calibrate", "icon": "🎯", "steps": []}
   ]
 }
 ```
 
-5 个 phase 名固定,不能改名。
+5 个 phase 名固定不可改。
+
+### 完成后通知
+终端汇总者,**无下游通知**。manifest/assembly 落盘即对外可见。
+
+### 失败兜底
+任一字段缺失填 `null`,前端按 B2 §15.3 渲染缺失态。

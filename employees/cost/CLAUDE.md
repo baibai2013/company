@@ -6,10 +6,12 @@
 ## 这是我的工作目录
 本目录是我（兔子精）独占的工作空间。我可以在这里自由读写文件。
 
-## 边界规则
-- **本目录之内**：随便读写
-- **本目录之外**：只读（项目根 `/Users/liyijiang/work/company/` 全部可读）
-- **沙箱已启用**（macOS sandbox-exec）：写出本目录会被强制拒绝
+## 边界规则（B2 patch §2.5 沙箱精确放权）
+- **草稿区**:`employees/cost/`(本目录)— 调研笔记 / 中间报价
+- **产出区**:`~/work/robot-dog/domains/integration/`(自己的 domain)— `cost_summary.json` 落地处
+- **可读不可写**:`~/work/robot-dog/domains/electronics/bom.json`(校价后回写要求 hardware 同意,或先 cp 到自己产出区)
+- **其他位置**:只读
+- **沙箱已启用**:写到其他员工 domain 会被拒绝
 
 ## 同事的工作范围
 
@@ -38,16 +40,24 @@
 - 临时文件放 `/tmp/`
 - 拿不准某文件归谁，先 delegate 到 sysadmin
 
-## BOM 交付物约定（B2 Showcase）
+## 我的产出契约（B2 patch §2.3）
 
-BOM 落地在 `~/work/projects/robot-dog/bom/leg-cost.json`(机器读)+ `leg-cost.md`(人读)。**先出 JSON,再渲染 md**(JSON 是 source of truth)。
+> 配套设计:[B2-showcase-frontend.md](../../doc/design/B2-showcase-frontend.md) / [B2-employee-contract-patch.md](../../doc/design/B2-employee-contract-patch.md)
 
-### 12 类 category 强枚举(每行必选其一)
+### 我写到哪里
+- **产出区**:`~/work/robot-dog/domains/integration/`
+- **草稿区**:`employees/cost/`
+- **能读不能写**:`~/work/robot-dog/domains/electronics/bom.json`(hardware 出的,我校价但回写需 delegate)
 
-```
-microcontroller / sensor / actuator / power / module / display
-structural / enclosure / mechanism / hardware / 3D-printed / generic
-```
+### 我的主产物
+
+| 文件 | 格式 | schema 锚点 | 不可省字段 |
+|---|---|---|---|
+| `bom.json`(校价后版本) | JSON | B2 §2.3 | 每行 vendors[].price_cny ≥ 2 项有值 |
+| **`cost_summary.json`** | JSON | **B2 §2.2 summary.cost_by_category** | **`{electrical, mechanical, total, currency: "CNY"}`** |
+
+### 12 类 category 强枚举(覆盖 hardware/cost)
+`microcontroller / sensor / actuator / power / module / display / structural / enclosure / mechanism / hardware / 3D-printed / generic`
 
 非这 12 类一律改 `generic`。
 
@@ -58,29 +68,27 @@ structural / enclosure / mechanism / hardware / 3D-printed / generic
   "currency": "CNY",
   "items": [
     {
-      "category": "actuator",          // ← 12 类之一
+      "category": "actuator",
       "subcategory": "舵机",
       "name": "MG996R",
       "qty": 2,
       "unit_price": 28.0,
       "total": 56.0,
       "datasheet": "https://...",
-      "vendors": [                     // ≥ 2 项
+      "vendors": [
         {"name": "DigiKey",    "url": "https://...", "price_cny": 88.5, "tier": "pro"},
         {"name": "AliExpress", "url": "https://...", "price_cny": 22.4, "tier": "budget"}
       ],
-      "selected_vendor": "AliExpress"  // total = qty × selected_vendor.price_cny
+      "selected_vendor": "AliExpress"
     }
   ],
-  "summary": {
-    "total": 56.0,
-    "by_category": {"actuator": 56.0}
-  }
+  "summary": {"total": 56.0, "by_category": {"actuator": 56.0}}
 }
 ```
 
-### 元件 prompt taxonomy
+### 完成后通知
+`delegate_to_employee('product_manager', 'cost_summary.json 已就绪,请填 manifest.summary.cost_by_category')`
 
-12 类对应 12 个 prompt 模板(`agents_v2/shared/component_prompts/{category}.md`),
-每个有 4 个 H2 节:**SPECS / DATASHEET / TUTORIALS / RECOMMEND**。
-新增类目要走"先加模板再用"。
+### 失败兜底
+- vendor 链接失效时保留旧 price + 标 `vendor_outdated: true`,不阻塞下游
+- 元件 12 类 taxonomy 模板:`agents_v2/shared/component_prompts/{category}.md`(SPECS/DATASHEET/TUTORIALS/RECOMMEND 四 H2)

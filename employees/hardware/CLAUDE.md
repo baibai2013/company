@@ -6,10 +6,11 @@
 ## 这是我的工作目录
 本目录是我（大法师）独占的工作空间。我可以在这里自由读写文件。
 
-## 边界规则
-- **本目录之内**：随便读写
-- **本目录之外**：只读（项目根 `/Users/liyijiang/work/company/` 全部可读）
-- **沙箱已启用**（macOS sandbox-exec）：写出本目录会被强制拒绝
+## 边界规则（B2 patch §2.5 沙箱精确放权）
+- **草稿区**:`employees/hardware/`(本目录)— 调研笔记 / 中间产物
+- **产出区**:`~/work/robot-dog/domains/electronics/`(自己的 domain)— KiCad 源 + 渲染件
+- **其他位置**:只读
+- **沙箱已启用**:写到其他员工 domain(如 mechanical/parts/)会被拒绝
 
 ## 同事的工作范围
 
@@ -38,51 +39,52 @@
 - 临时文件放 `/tmp/`
 - 拿不准某文件归谁，先 delegate 到 sysadmin
 
-## EDA 交付物约定（B2 Showcase）
+## 我的产出契约（B2 patch §2.3）
 
-KiCad 工程落地在 `~/work/projects/robot-dog/electronics/`。**源文件 + 渲染件双格式**:
+> 配套设计:[B2-showcase-frontend.md](../../doc/design/B2-showcase-frontend.md) / [B2-employee-contract-patch.md](../../doc/design/B2-employee-contract-patch.md)
 
-```bash
-# 源文件(工业交付,KiCad 私有)
-electronics/leg-driver.kicad_sch
-electronics/leg-driver.kicad_pcb
-electronics/leg-driver.pro
+### 我写到哪里
+- **产出区**:`~/work/robot-dog/domains/electronics/`
+- **草稿区**:`employees/hardware/`
+- **不要直写**:`~/work/robot-dog/domains/{mechanical,firmware,...}/`(走 delegate)
 
-# 渲染件(给前端展示,每次改完原理图/PCB 必须重新导)
-kicad-cli sch export svg --output electronics/leg-driver-sch.svg \
-    electronics/leg-driver.kicad_sch
-kicad-cli sch export pdf --output electronics/leg-driver-sch.pdf \
-    electronics/leg-driver.kicad_sch
-kicad-cli pcb export svg --layers F.Cu,F.Mask,F.SilkS \
-    --output electronics/leg-driver-pcb-top.svg electronics/leg-driver.kicad_pcb
-kicad-cli pcb export svg --layers B.Cu,B.Mask,B.SilkS \
-    --output electronics/leg-driver-pcb-bot.svg electronics/leg-driver.kicad_pcb
+### 我的主产物
 
-# PCB 3D(拼到主装配整机视图)
-kicad-cli pcb export step --output /tmp/pcb.step electronics/leg-driver.kicad_pcb
-python -c "from build123d import *; \
-  p = import_step('/tmp/pcb.step'); \
-  p.export_gltf('electronics/leg-driver-pcb.glb', binary=True)"
+| 文件 | 格式 | schema 锚点 | 不可省字段 |
+|---|---|---|---|
+| `*.kicad_sch` + `*.kicad_pcb` | KiCad 8 源 | B2 §5.4 | — |
+| `cad/exports/*.{svg,pdf,step,glb}` | kicad-cli 出 | B2 §5.4 | 与源同名 |
+| **`bom.json`** | JSON | **B2 §2.3** | **`category`(12 类之一)、`qty`、`vendors[]` 长度 ≥ 2(覆盖 pro/maker/budget 任两档)** |
 
-# Gerber 制造文件
-kicad-cli pcb export gerbers --output /tmp/gerbers electronics/leg-driver.kicad_pcb
-cd /tmp && zip -r electronics/leg-driver.gerbers.zip gerbers/
-```
+### 12 类 category 枚举
+`microcontroller / sensor / actuator / power / module / display / structural / enclosure / mechanism / hardware / 3D-printed / generic`
 
-### BOM 也要出 CSV
+### kicad-cli 双导出范式
 
 ```bash
-kicad-cli sch export bom --output electronics/leg-driver-bom.csv \
-    electronics/leg-driver.kicad_sch
+ROOT=~/work/robot-dog/domains/electronics
+EXPORTS=$ROOT/cad/exports
+
+# 渲染件(每次改完源必须重导)
+kicad-cli sch export svg --output $EXPORTS/leg-driver-sch.svg $ROOT/leg-driver.kicad_sch
+kicad-cli sch export pdf --output $EXPORTS/leg-driver-sch.pdf $ROOT/leg-driver.kicad_sch
+kicad-cli pcb export svg --layers F.Cu,F.Mask,F.SilkS --output $EXPORTS/leg-driver-pcb-top.svg $ROOT/leg-driver.kicad_pcb
+kicad-cli pcb export svg --layers B.Cu,B.Mask,B.SilkS --output $EXPORTS/leg-driver-pcb-bot.svg $ROOT/leg-driver.kicad_pcb
+
+# PCB 3D(拼到主装配)
+kicad-cli pcb export step --output /tmp/pcb.step $ROOT/leg-driver.kicad_pcb
+python -c "from build123d import *; p=import_step('/tmp/pcb.step'); p.export_gltf('$EXPORTS/leg-driver-pcb.glb', binary=True)"
+
+# Gerber + CSV BOM
+kicad-cli pcb export gerbers --output /tmp/gerbers $ROOT/leg-driver.kicad_pcb
+(cd /tmp && zip -r $EXPORTS/leg-driver.gerbers.zip gerbers/)
+kicad-cli sch export bom --output $EXPORTS/leg-driver-bom.csv $ROOT/leg-driver.kicad_sch
 ```
 
-由 cost 员工汇入总 BOM `bom/leg-cost.json`。
-
-### 元件 prompt taxonomy(与 cost 共用)
-
-每个 BOM 元件按 12 类(microcontroller/sensor/actuator/power/module/display/structural/enclosure/mechanism/hardware/3D-printed/generic)分类,
-按 SPECS/DATASHEET/TUTORIALS/RECOMMEND 四块填充。
+### 完成后通知
+- `delegate_to_employee('cost', 'bom.json 已就绪,请校价 at ~/work/robot-dog/domains/electronics/bom.json')`
+- `delegate_to_employee('product_manager', '电子原理图已就绪')`
 
 ### 失败兜底
-
-`kicad-cli` 不可用时降级到只出 SVG/PDF,不出 .glb;前端在主装配处用包围盒占位。
+- `kicad-cli` 不可用 → 降级只出 SVG/PDF,不出 .glb;manifest 标 `pcb_step_missing: true`
+- 前端在主装配处用包围盒占位

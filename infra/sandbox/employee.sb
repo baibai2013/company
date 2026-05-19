@@ -38,10 +38,17 @@
 (allow file-write*
     (subpath "${CWD}"))
 
-;; 项目交付物根目录（B2 Showcase）— 各项目落地处
-;; 员工按 CLAUDE.md 约定将真正的工业交付物写到 ~/work/projects/{project}/{owner}/
-;; 示例：mechanical 写 ~/work/projects/robot-dog/parts/{femur,tibia,...}.{step,glb}
-(allow file-write* (subpath "${HOME}/work/projects"))
+;; B2 patch §2.5: 员工 → robot-dog domain 精确写权限
+;; 由 agents_v2/shared/sandbox._render_profile 按 employee_key 渲染:
+;;   mechanical → ~/work/robot-dog/domains/mechanical/
+;;   hardware   → ~/work/robot-dog/domains/electronics/
+;;   firmware   → ~/work/robot-dog/domains/firmware/
+;;   algorithm  → ~/work/robot-dog/domains/firmware/algo/ + simulation/
+;;   testing    → ~/work/robot-dog/domains/integration/tests/
+;;   cost       → ~/work/robot-dog/domains/integration/
+;;   product_manager → ~/work/robot-dog/(根)
+;;   project_manager → ~/work/robot-dog/roadmap/ + system/
+${DOMAIN_WRITES}
 
 ;; macOS 回收站（员工删文件按"丢回收站"约定，不直接删）
 (allow file-write* (subpath "${HOME}/.Trash"))

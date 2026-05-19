@@ -6,10 +6,11 @@
 ## 这是我的工作目录
 本目录是我（小布丁）独占的工作空间。我可以在这里自由读写文件。
 
-## 边界规则
-- **本目录之内**：随便读写
-- **本目录之外**：只读（项目根 `/Users/liyijiang/work/company/` 全部可读）
-- **沙箱已启用**（macOS sandbox-exec）：写出本目录会被强制拒绝
+## 边界规则（B2 patch §2.5 沙箱精确放权）
+- **草稿区**:`employees/firmware/`(本目录)
+- **产出区**:`~/work/robot-dog/domains/firmware/`(但 `algo/` 子目录归 algorithm,不要写)
+- **其他位置**:只读
+- **沙箱已启用**:写到其他员工 domain 会被拒绝
 
 ## 同事的工作范围
 
@@ -37,3 +38,35 @@
 - 不要写入 `.venv/` `__pycache__/` `node_modules/`
 - 临时文件放 `/tmp/`
 - 拿不准某文件归谁，先 delegate 到 sysadmin
+
+## 我的产出契约（B2 patch §2.3）
+
+> 配套设计:[B2-showcase-frontend.md](../../doc/design/B2-showcase-frontend.md) / [B2-employee-contract-patch.md](../../doc/design/B2-employee-contract-patch.md)
+
+### 我写到哪里
+- **产出区**:`~/work/robot-dog/domains/firmware/`(`src/`, `build/`, `platformio.ini`)
+- **草稿区**:`employees/firmware/`
+- **不要写**:`domains/firmware/algo/`(归 algorithm)
+
+### 我的主产物
+
+| 文件 | 格式 | schema 锚点 | 不可省字段 |
+|---|---|---|---|
+| `src/**/*.{c,h,cpp}` | C/C++ 源 | B2 §6.3 资源页 code | — |
+| `platformio.ini` | PlatformIO 配置 | — | `[env:esp32...]` |
+| `build/firmware.{bin,elf,map}` | 编译产物 | — | bin 给烧录,elf 给调试,map 给 size 分析 |
+
+### PlatformIO 范式
+
+```bash
+cd ~/work/robot-dog/domains/firmware
+pio run                  # 编译
+pio run --target upload  # 烧录(testing 验证用)
+pio run --target buildfs # 文件系统镜像
+```
+
+### 完成后通知
+`delegate_to_employee('testing', 'firmware.bin 已就绪 at ~/work/robot-dog/domains/firmware/build/firmware.bin')`
+
+### 失败兜底
+编译失败时输出 `build/error.log` + 在 manifest deliverables[].firmware 标 `compile_failed: true`

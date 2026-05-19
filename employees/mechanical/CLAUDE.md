@@ -6,10 +6,11 @@
 ## 这是我的工作目录
 本目录是我（Dave）独占的工作空间。我可以在这里自由读写文件。
 
-## 边界规则
-- **本目录之内**：随便读写
-- **本目录之外**：只读（项目根 `/Users/liyijiang/work/company/` 全部可读）
-- **沙箱已启用**（macOS sandbox-exec）：写出本目录会被强制拒绝
+## 边界规则（B2 patch §2.5 沙箱精确放权）
+- **草稿区**：`employees/mechanical/`（本目录）— 调研笔记 / 中间产物 / debug 文件,自由读写
+- **产出区**：`~/work/robot-dog/domains/mechanical/`（自己的 domain）— 对外可见的 STEP/GLB,自由读写
+- **其他位置**：只读（项目根 `/Users/liyijiang/work/company/` + 整个 `~/work/robot-dog/` 都可读）
+- **沙箱已启用**（macOS sandbox-exec）：写到其他员工 domain（如 electronics/）会被拒绝,要改对方走 `delegate_to_employee`
 
 ## 同事的工作范围
 
@@ -38,9 +39,25 @@
 - 临时文件放 `/tmp/`
 - 拿不准某文件归谁，先 delegate 到 sysadmin
 
-## 项目交付物约定（B2 Showcase）
+## 我的产出契约（B2 patch §2.3）
 
-robot-dog 项目交付物落地在 `~/work/projects/robot-dog/parts/`,**每个零件必须同时输出 `.step` 和 `.glb`**:
+> 配套设计:[B2-showcase-frontend.md](../../doc/design/B2-showcase-frontend.md) / [B2-employee-contract-patch.md](../../doc/design/B2-employee-contract-patch.md)
+> schema 变更先改 patch §2.2 表格,再回填本节
+
+### 我写到哪里
+- **产出区(对外)**:`~/work/robot-dog/domains/mechanical/`
+- **草稿区(自留)**:`employees/mechanical/`(调研笔记 / 中间产物)
+- **不要直写**:`~/work/robot-dog/manifest.json`(归 product_manager) / 其他 domain(走 delegate)
+
+### 我的主产物
+
+| 文件 | 格式 | schema 锚点 | 不可省字段 |
+|---|---|---|---|
+| `parts/<name>.step` + `parts/<name>.glb` | build123d 双导出 | B2 §5.2 | 同名 / 同坐标系 |
+| `parts/<name>.json` | 元信息 | B2 §2.2 manifest.parts[] | `name, mass_g, material, explode_offset[3]` |
+| `assembly.step` + `assembly.glb` | 整机 | B2 §5.1 | 原点 = 装配中心 |
+
+### build123d 双导出范式
 
 ```python
 from build123d import *
@@ -49,19 +66,17 @@ with BuildPart() as femur:
     Box(80, 20, 10)
     fillet(femur.edges(), 1)
 
-# 工业交付物(必须)
-femur.part.export_step("/Users/liyijiang/work/projects/robot-dog/parts/femur.step")
-
-# 前端 3D 展示(必须,同时输出)
-femur.part.export_gltf(
-    "/Users/liyijiang/work/projects/robot-dog/parts/femur.glb",
-    binary=True,
-)
+ROOT = "/Users/liyijiang/work/robot-dog/domains/mechanical/parts"
+femur.part.export_step(f"{ROOT}/femur.step")            # 工业交付(必须)
+femur.part.export_gltf(f"{ROOT}/femur.glb", binary=True)  # 前端展示(必须,同时输出)
 ```
 
-**硬约束:**
-- `.step` 是 ISO-10303 工业交付,`.glb` 是 glTF binary 给前端 three.js
-- glb 失败时输出 `.stl` 兜底(用 `export_stl`),前端会用占位包围盒
-- 每个 part 在 manifest 里登记 id/name/transform/explode_offset/owner
-- 整机视图 `renders/leg_isometric.png` 截图也由本员工出(build123d 截图 → PIL.save)
-- 整机包围盒 `summary.bbox` 由 `Compound.bounding_box()` 算后写到 manifest
+### 完成后通知
+`mcp__company__delegate_to_employee('product_manager', '<part>.glb 已就绪 at ~/work/robot-dog/domains/mechanical/parts/<part>.glb')`
+
+### 硬约束
+- 文件名小写 + 短横线;版本走 git,不在文件名带 `-v1`
+- `.step` ISO-10303,`.glb` glTF binary
+- glb export 失败 → 输出 `.stl` 兜底 + `part.json` 标 `glb_failed: true`(B2 §5.3)
+- 整机包围盒 `summary.bbox` 由 `Compound.bounding_box()` 算后给 product_manager
+- schema 外字段不出
