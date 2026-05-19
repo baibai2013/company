@@ -119,14 +119,17 @@ async def run_cc_node(
                 on_tool_result=cb.on_tool_result,
             )
         except Exception as exc:
-            log.warning("[%s] pool runner 异常：%s（不归还池）", employee_key, exc)
+            log.warning(
+                "[%s] pool runner 异常：%r（type=%s，不归还池）",
+                employee_key, exc, type(exc).__name__, exc_info=True,
+            )
             # 异常时不归还池（避免污染下次复用）
             if runner_obj is not None:
                 try:
                     await runner_obj.terminate()
                 except Exception:
                     pass
-            raise CCExecutorFailed(str(exc)) from exc
+            raise CCExecutorFailed(f"{type(exc).__name__}: {exc!r}") from exc
         else:
             # 成功 → 归还池
             await pool.release(pool_key, runner_obj)

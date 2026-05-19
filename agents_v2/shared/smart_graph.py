@@ -412,15 +412,21 @@ def _valid_employees() -> set[str]:
             if k not in {"product_manager", "sysadmin"}}
 
 
-def _cc_node(state: SmartState, employee_key: str, cc_prompt: str) -> dict:
-    """PM-only: decide which specialists should add a follow-up."""
+async def _cc_node(state: SmartState, employee_key: str, cc_prompt: str) -> dict:
+    """决定哪些专家应在主回复后追加一段补充意见。走轻量 claude code CLI（不入池、不挂 MCP）。"""
     import json as _json
     import re as _re
-    llm = _llm_for(employee_key, "cc", default_model="claude-sonnet-4-6")
-    context = f"原始消息：{_text_only(state['task_input'])}\n\n产品经理回复：{state['execution_result']}"
-    resp = llm.invoke([SystemMessage(cc_prompt), HumanMessage(context)])
+    from agents_v2.shared.cc_oneshot import run_cli_oneshot, CLIOneshotFailed
+
+    context = f"原始消息：{_text_only(state['task_input'])}\n\n{employee_key}回复：{state['execution_result']}"
+    prompt = f"{cc_prompt}\n\n{context}"
     try:
-        m = _re.search(r"\[.*?\]", resp.content, _re.DOTALL)
+        text = await run_cli_oneshot(prompt, model="claude-sonnet-4-6", effort="low", timeout=30.0)
+    except CLIOneshotFailed as exc:
+        log.warning("[%s] cc_node oneshot 失败：%s", employee_key, exc)
+        return {"cc": []}
+    try:
+        m = _re.search(r"\[.*?\]", text, _re.DOTALL)
         cc = _json.loads(m.group()) if m else []
         valid = _valid_employees()
         cc = [e for e in cc if e in valid]
