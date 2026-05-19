@@ -38,6 +38,11 @@
 (allow file-write*
     (subpath "${CWD}"))
 
+;; 项目交付物根目录（B2 Showcase）— 各项目落地处
+;; 员工按 CLAUDE.md 约定将真正的工业交付物写到 ~/work/projects/{project}/{owner}/
+;; 示例：mechanical 写 ~/work/projects/robot-dog/parts/{femur,tibia,...}.{step,glb}
+(allow file-write* (subpath "${HOME}/work/projects"))
+
 ;; macOS 回收站（员工删文件按"丢回收站"约定，不直接删）
 (allow file-write* (subpath "${HOME}/.Trash"))
 

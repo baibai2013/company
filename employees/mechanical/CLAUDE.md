@@ -37,3 +37,31 @@
 - 不要写入 `.venv/` `__pycache__/` `node_modules/`
 - 临时文件放 `/tmp/`
 - 拿不准某文件归谁，先 delegate 到 sysadmin
+
+## 项目交付物约定（B2 Showcase）
+
+robot-dog 项目交付物落地在 `~/work/projects/robot-dog/parts/`,**每个零件必须同时输出 `.step` 和 `.glb`**:
+
+```python
+from build123d import *
+
+with BuildPart() as femur:
+    Box(80, 20, 10)
+    fillet(femur.edges(), 1)
+
+# 工业交付物(必须)
+femur.part.export_step("/Users/liyijiang/work/projects/robot-dog/parts/femur.step")
+
+# 前端 3D 展示(必须,同时输出)
+femur.part.export_gltf(
+    "/Users/liyijiang/work/projects/robot-dog/parts/femur.glb",
+    binary=True,
+)
+```
+
+**硬约束:**
+- `.step` 是 ISO-10303 工业交付,`.glb` 是 glTF binary 给前端 three.js
+- glb 失败时输出 `.stl` 兜底(用 `export_stl`),前端会用占位包围盒
+- 每个 part 在 manifest 里登记 id/name/transform/explode_offset/owner
+- 整机视图 `renders/leg_isometric.png` 截图也由本员工出(build123d 截图 → PIL.save)
+- 整机包围盒 `summary.bbox` 由 `Compound.bounding_box()` 算后写到 manifest

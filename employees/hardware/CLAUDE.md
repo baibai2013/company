@@ -37,3 +37,52 @@
 - 不要写入 `.venv/` `__pycache__/` `node_modules/`
 - 临时文件放 `/tmp/`
 - 拿不准某文件归谁，先 delegate 到 sysadmin
+
+## EDA 交付物约定（B2 Showcase）
+
+KiCad 工程落地在 `~/work/projects/robot-dog/electronics/`。**源文件 + 渲染件双格式**:
+
+```bash
+# 源文件(工业交付,KiCad 私有)
+electronics/leg-driver.kicad_sch
+electronics/leg-driver.kicad_pcb
+electronics/leg-driver.pro
+
+# 渲染件(给前端展示,每次改完原理图/PCB 必须重新导)
+kicad-cli sch export svg --output electronics/leg-driver-sch.svg \
+    electronics/leg-driver.kicad_sch
+kicad-cli sch export pdf --output electronics/leg-driver-sch.pdf \
+    electronics/leg-driver.kicad_sch
+kicad-cli pcb export svg --layers F.Cu,F.Mask,F.SilkS \
+    --output electronics/leg-driver-pcb-top.svg electronics/leg-driver.kicad_pcb
+kicad-cli pcb export svg --layers B.Cu,B.Mask,B.SilkS \
+    --output electronics/leg-driver-pcb-bot.svg electronics/leg-driver.kicad_pcb
+
+# PCB 3D(拼到主装配整机视图)
+kicad-cli pcb export step --output /tmp/pcb.step electronics/leg-driver.kicad_pcb
+python -c "from build123d import *; \
+  p = import_step('/tmp/pcb.step'); \
+  p.export_gltf('electronics/leg-driver-pcb.glb', binary=True)"
+
+# Gerber 制造文件
+kicad-cli pcb export gerbers --output /tmp/gerbers electronics/leg-driver.kicad_pcb
+cd /tmp && zip -r electronics/leg-driver.gerbers.zip gerbers/
+```
+
+### BOM 也要出 CSV
+
+```bash
+kicad-cli sch export bom --output electronics/leg-driver-bom.csv \
+    electronics/leg-driver.kicad_sch
+```
+
+由 cost 员工汇入总 BOM `bom/leg-cost.json`。
+
+### 元件 prompt taxonomy(与 cost 共用)
+
+每个 BOM 元件按 12 类(microcontroller/sensor/actuator/power/module/display/structural/enclosure/mechanism/hardware/3D-printed/generic)分类,
+按 SPECS/DATASHEET/TUTORIALS/RECOMMEND 四块填充。
+
+### 失败兜底
+
+`kicad-cli` 不可用时降级到只出 SVG/PDF,不出 .glb;前端在主装配处用包围盒占位。
