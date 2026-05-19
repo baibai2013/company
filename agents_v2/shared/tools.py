@@ -33,6 +33,35 @@ class ToolMeta:
 COMPANY_DIR = Path(__file__).parent.parent.parent
 
 
+def _employee_cwd() -> Path:
+    """从 EMPLOYEE_KEY env 拿当前员工 cwd；fallback 到项目根。
+
+    每个 agent 进程启动时由 generic.main lifespan 注入 EMPLOYEE_KEY，
+    这里按 key 查 registry 拿 EffectiveConfig.cwd。
+    langchain 工具相对路径通过本函数定位员工目录，避免误写项目根。
+    """
+    import os as _os
+    key = _os.environ.get("EMPLOYEE_KEY", "")
+    if not key:
+        return COMPANY_DIR
+    try:
+        from backend.services import registry as _reg
+        cfg = _reg.get_effective_sync(key)
+        if cfg and cfg.cwd:
+            return Path(cfg.cwd)
+    except Exception:
+        pass
+    return COMPANY_DIR
+
+
+def _resolve_path(path: str) -> Path:
+    """相对路径相对员工 cwd 解析；绝对路径原样返回。"""
+    p = Path(path)
+    if p.is_absolute():
+        return p
+    return _employee_cwd() / p
+
+
 def _trigger_scheduler_reload() -> None:
     """通知本 agent 进程的 scheduler 重新加载任务列表。"""
     import os
@@ -50,11 +79,11 @@ def _trigger_scheduler_reload() -> None:
 
 @tool
 def run_command(cmd: str) -> str:
-    """执行 shell 命令，返回输出。超时 30s。"""
+    """执行 shell 命令，返回输出。超时 30s。在员工自己 cwd 下执行。"""
     try:
         result = subprocess.run(
             cmd, shell=True, capture_output=True, text=True,
-            timeout=30, cwd=str(COMPANY_DIR),
+            timeout=30, cwd=str(_employee_cwd()),
         )
         out = (result.stdout + result.stderr).strip()
         return out[:3000] if out else "(无输出)"
@@ -66,9 +95,10 @@ def run_command(cmd: str) -> str:
 
 @tool
 def read_file(path: str) -> str:
-    """读取文件内容（返回最后 3000 字符）。"""
+    """读取文件内容（返回最后 3000 字符）。相对路径相对员工 cwd 解析。"""
     try:
-        content = Path(path).read_text(encoding="utf-8", errors="replace")
+        target = _resolve_path(path)
+        content = target.read_text(encoding="utf-8", errors="replace")
         return content[-3000:] if len(content) > 3000 else content
     except Exception as e:
         return f"读取失败: {e}"
@@ -76,10 +106,18 @@ def read_file(path: str) -> str:
 
 @tool
 def write_file(path: str, content: str) -> str:
-    """将内容写入文件（覆盖）。"""
+    """将内容写入文件（覆盖）。相对路径相对员工 cwd 解析；写到员工目录之外会被拒绝。"""
     try:
-        Path(path).write_text(content, encoding="utf-8")
-        return f"已写入 {path}"
+        target = _resolve_path(path).resolve()
+        cwd = _employee_cwd().resolve()
+        # 防越界：必须在员工 cwd 之内（不允许 ../../ 跳出）
+        try:
+            target.relative_to(cwd)
+        except ValueError:
+            return f"拒绝写入：{target} 不在员工工作目录 {cwd} 之内。如需修改其他员工的目录，请用 delegate_to_employee 委托给负责人。"
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(content, encoding="utf-8")
+        return f"已写入 {target}"
     except Exception as e:
         return f"写入失败: {e}"
 
