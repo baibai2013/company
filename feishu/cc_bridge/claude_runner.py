@@ -69,6 +69,146 @@ def compress_image(image_bytes: bytes, max_side: int = 1568) -> bytes:
     return buf.getvalue()
 
 
+# ── stream-json 解析（公共逻辑，spawn-per-task + 常驻进程池都复用）────────────
+
+class StreamState:
+    """单次任务的累积状态。常驻模式下每次 submit 创建一个新 state。"""
+    __slots__ = ("accumulated", "thinking_buf", "tool_log", "current_tool",
+                 "result_text", "new_session_id")
+
+    def __init__(self):
+        self.accumulated: list[str] = []
+        self.thinking_buf: list[str] = []
+        self.tool_log: list[str] = []
+        self.current_tool: str | None = None
+        self.result_text: str = ""
+        self.new_session_id: str | None = None
+
+
+async def parse_stream_loop(
+    stdout: asyncio.StreamReader,
+    *,
+    on_text=None, on_thinking=None,
+    on_tool_start=None, on_tool_result=None, on_chunk=None,
+    stop_on_result: bool = False,
+    timeout: float = MAX_TIMEOUT,
+) -> StreamState:
+    """读 stream-json 事件，更新 state，调回调，返回最终 state。
+
+    stop_on_result=False（默认 / spawn-per-task）：读到 EOF 才停。
+    stop_on_result=True（常驻模式）：读到 result 事件就 return，让进程继续等下个任务。
+    """
+    state = StreamState()
+    last_callback_len = 0
+    while True:
+        line = await asyncio.wait_for(stdout.readline(), timeout=timeout)
+        if not line:
+            break
+        line = line.decode("utf-8", errors="replace").strip()
+        if not line:
+            continue
+        try:
+            event = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+
+        if event.get("session_id"):
+            state.new_session_id = event["session_id"]
+
+        etype = event.get("type")
+
+        if etype == "stream_event":
+            e = event.get("event", {})
+            et = e.get("type")
+            if et == "content_block_start":
+                cb = e.get("content_block", {})
+                if cb.get("type") == "thinking":
+                    state.thinking_buf.clear()
+                    if on_thinking:
+                        await on_thinking("（模型思考中…）")
+            elif et == "content_block_delta":
+                delta = e.get("delta", {})
+                dt = delta.get("type")
+                if dt == "text_delta":
+                    t = delta.get("text", "")
+                    if t:
+                        state.accumulated.append(t)
+                        if on_text:
+                            await on_text("".join(state.accumulated))
+                elif dt == "thinking_delta":
+                    t = delta.get("thinking", "")
+                    if t:
+                        state.thinking_buf.append(t)
+                        if on_thinking:
+                            await on_thinking("".join(state.thinking_buf))
+
+        elif etype == "assistant":
+            msg = event.get("message", {})
+            for block in msg.get("content", []):
+                if not isinstance(block, dict):
+                    continue
+                if block.get("type") == "tool_use":
+                    if state.current_tool:
+                        state.tool_log.append(f"✅ {state.current_tool}")
+                    tool_id = block.get("id", "")
+                    name = block.get("name", "?")
+                    input_dict = block.get("input", {})
+                    state.current_tool = _tool_summary(name, input_dict)
+                    log.info("工具调用: %s", state.current_tool)
+                    if on_tool_start:
+                        await on_tool_start(tool_id, name, input_dict)
+                    elif on_chunk:
+                        await on_chunk(
+                            "".join(state.accumulated),
+                            list(state.tool_log),
+                            state.current_tool,
+                            True,
+                        )
+
+        elif etype == "user":
+            msg = event.get("message", {})
+            for block in msg.get("content", []):
+                if not isinstance(block, dict):
+                    continue
+                if block.get("type") == "tool_result" and on_tool_result:
+                    tool_use_id = block.get("tool_use_id", "")
+                    raw = block.get("content", [])
+                    if isinstance(raw, list):
+                        tr_text = "\n".join(
+                            c.get("text", "")
+                            for c in raw
+                            if isinstance(c, dict) and c.get("type") == "text"
+                        )
+                    elif isinstance(raw, str):
+                        tr_text = raw
+                    else:
+                        tr_text = ""
+                    if tool_use_id:
+                        await on_tool_result(tool_use_id, tr_text)
+
+        elif etype == "result":
+            state.result_text = event.get("result", "")
+            if stop_on_result:
+                # 常驻模式：result 事件后退出循环，让进程继续等下个任务的 stdin
+                # 最后一个工具的"已完成"标记由调用方决定（commit 到 tool_log）
+                if state.current_tool:
+                    state.tool_log.append(f"✅ {state.current_tool}")
+                    state.current_tool = None
+                return state
+
+        # 文本累积到 200 字时触发普通更新
+        current_text = "".join(state.accumulated)
+        if on_chunk and len(current_text) - last_callback_len >= 200:
+            last_callback_len = len(current_text)
+            await on_chunk(current_text, list(state.tool_log), state.current_tool, False)
+
+    # 读到 EOF（spawn-per-task 模式）：补提交最后一个 in-flight 工具
+    if state.current_tool:
+        state.tool_log.append(f"✅ {state.current_tool}")
+        state.current_tool = None
+    return state
+
+
 class ClaudeRunner:
     """管理 Claude Code CLI 子进程。无状态：cwd / session_id 每次 run() 传入。
 
@@ -164,118 +304,23 @@ class ClaudeRunner:
             limit=_limit,
         )
 
-        accumulated: list[str] = []        # 所有 text block 增量累加
-        thinking_buf: list[str] = []       # 当前 thinking block 增量累加（每块清零）
-        tool_log: list[str] = []           # 已完成的工具调用（含图标）
-        current_tool: str | None = None    # 当前进行中的工具
-        result_text = ""
-        new_session_id = None
+        state = StreamState()
 
         try:
-            async def read_stream():
-                nonlocal result_text, new_session_id, current_tool
-                last_callback_len = 0
+            async def _read():
+                nonlocal state
+                state = await parse_stream_loop(
+                    self._process.stdout,
+                    on_text=on_text,
+                    on_thinking=on_thinking,
+                    on_tool_start=on_tool_start,
+                    on_tool_result=on_tool_result,
+                    on_chunk=on_chunk,
+                    stop_on_result=False,   # spawn-per-task 模式：读到 EOF 才停
+                    timeout=MAX_TIMEOUT,
+                )
 
-                while True:
-                    line = await asyncio.wait_for(
-                        self._process.stdout.readline(), timeout=MAX_TIMEOUT
-                    )
-                    if not line:
-                        break
-                    line = line.decode("utf-8", errors="replace").strip()
-                    if not line:
-                        continue
-                    try:
-                        event = json.loads(line)
-                    except json.JSONDecodeError:
-                        continue
-
-                    if event.get("session_id"):
-                        new_session_id = event["session_id"]
-
-                    # 流式增量：thinking / text 实时推送
-                    if event.get("type") == "stream_event":
-                        e = event.get("event", {})
-                        et = e.get("type")
-                        if et == "content_block_start":
-                            cb = e.get("content_block", {})
-                            if cb.get("type") == "thinking":
-                                # 4.7 thinking 加密（redacted），只有 signature_delta 没明文，
-                                # 给个占位让飞书进度卡能看到"思考中"
-                                thinking_buf.clear()
-                                if on_thinking:
-                                    await on_thinking("（模型思考中…）")
-                        elif et == "content_block_delta":
-                            delta = e.get("delta", {})
-                            dt = delta.get("type")
-                            if dt == "text_delta":
-                                t = delta.get("text", "")
-                                if t:
-                                    accumulated.append(t)
-                                    if on_text:
-                                        await on_text("".join(accumulated))
-                            elif dt == "thinking_delta":
-                                t = delta.get("thinking", "")
-                                if t:
-                                    thinking_buf.append(t)
-                                    if on_thinking:
-                                        await on_thinking("".join(thinking_buf))
-
-                    # 完整 snapshot：仅取 tool_use（input 已完整），text/thinking 由 stream_event 处理避免重复
-                    elif event.get("type") == "assistant":
-                        msg = event.get("message", {})
-                        for block in msg.get("content", []):
-                            if not isinstance(block, dict):
-                                continue
-                            if block.get("type") == "tool_use":
-                                if current_tool:
-                                    tool_log.append(f"✅ {current_tool}")
-                                tool_id = block.get("id", "")
-                                name = block.get("name", "?")
-                                input_dict = block.get("input", {})
-                                current_tool = _tool_summary(name, input_dict)
-                                log.info("工具调用: %s", current_tool)
-                                if on_tool_start:
-                                    await on_tool_start(tool_id, name, input_dict)
-                                elif on_chunk:
-                                    await on_chunk(
-                                        "".join(accumulated),
-                                        list(tool_log),
-                                        current_tool,
-                                        True,
-                                    )
-
-                    elif event.get("type") == "user":
-                        msg = event.get("message", {})
-                        for block in msg.get("content", []):
-                            if not isinstance(block, dict):
-                                continue
-                            if block.get("type") == "tool_result" and on_tool_result:
-                                tool_use_id = block.get("tool_use_id", "")
-                                raw = block.get("content", [])
-                                if isinstance(raw, list):
-                                    tr_text = "\n".join(
-                                        c.get("text", "")
-                                        for c in raw
-                                        if isinstance(c, dict) and c.get("type") == "text"
-                                    )
-                                elif isinstance(raw, str):
-                                    tr_text = raw
-                                else:
-                                    tr_text = ""
-                                if tool_use_id:
-                                    await on_tool_result(tool_use_id, tr_text)
-
-                    if event.get("type") == "result":
-                        result_text = event.get("result", "")
-
-                    # 文本累积到 200 字时触发普通更新
-                    current_text = "".join(accumulated)
-                    if on_chunk and len(current_text) - last_callback_len >= 200:
-                        last_callback_len = len(current_text)
-                        await on_chunk(current_text, list(tool_log), current_tool, False)
-
-            async def drain_stderr():
+            async def _drain_stderr():
                 err = await self._process.stderr.read()
                 if err:
                     log.warning(
@@ -283,23 +328,19 @@ class ClaudeRunner:
                         err.decode("utf-8", errors="replace")[:500],
                     )
 
-            await asyncio.gather(read_stream(), drain_stderr())
+            await asyncio.gather(_read(), _drain_stderr())
             await self._process.wait()
 
         except asyncio.TimeoutError:
             log.warning("Claude 执行超时，终止进程")
             await self.stop()
-            result_text = "".join(accumulated) + "\n\n⚠️ 执行超时（10分钟），已中止。"
+            state.result_text = "".join(state.accumulated) + "\n\n⚠️ 执行超时（10分钟），已中止。"
 
         finally:
             self._process = None
 
-        # 最后一个工具完成
-        if current_tool:
-            tool_log.append(f"✅ {current_tool}")
-
-        final = result_text or "".join(accumulated)
-        return (final.strip() if final else "(无输出)"), tool_log, new_session_id
+        final = state.result_text or "".join(state.accumulated)
+        return (final.strip() if final else "(无输出)"), state.tool_log, state.new_session_id
 
 
 def save_temp_image(image_bytes: bytes) -> str:

@@ -23,6 +23,7 @@ from typing import Awaitable, Callable
 
 from feishu.cc_bridge.claude_runner import ClaudeRunner
 
+from agents_v2.shared.claude_pool import SpawnArgs, get_pool
 from agents_v2.shared.mcp_config import build_mcp_config, to_cli_arg
 from agents_v2.shared.sandbox import wrap_command
 
@@ -99,24 +100,56 @@ async def run_cc_node(
     def _wrap(argv: list[str]) -> list[str]:
         return wrap_command(argv, cwd)
 
-    runner = ClaudeRunner()
-    try:
-        final_text, tool_logs, new_sid = await runner.run(
-            prompt=query,
-            cwd=cwd,
-            session_id=session_id,
-            on_text=cb.on_text,
-            on_thinking=cb.on_thinking,
-            on_tool_start=cb.on_tool_start,
-            on_tool_result=cb.on_tool_result,
-            extra_cli_args=extra_args,
-            cmd_wrapper=_wrap,
-            model=model,
-            effort=effort,
+    # 4) 阶段 11：优先走热进程池（同 thread 5 分钟内复用），CLAUDE_POOL=off 时退回 spawn-per-task
+    pool = get_pool()
+    if pool.enabled and thread_id:
+        spawn_args = SpawnArgs(
+            cwd=cwd, model=model, effort=effort,
+            extra_cli_args=extra_args, cmd_wrapper=_wrap,
         )
-    except Exception as exc:
-        log.warning("[%s] claude code 子进程异常：%s", employee_key, exc)
-        raise CCExecutorFailed(str(exc)) from exc
+        pool_key = (employee_key, cwd, thread_id, model, effort)
+        runner_obj = None
+        try:
+            runner_obj = await pool.acquire(pool_key, spawn_args)
+            final_text, new_sid, tool_logs = await runner_obj.submit(
+                prompt=query,
+                on_text=cb.on_text,
+                on_thinking=cb.on_thinking,
+                on_tool_start=cb.on_tool_start,
+                on_tool_result=cb.on_tool_result,
+            )
+        except Exception as exc:
+            log.warning("[%s] pool runner 异常：%s（不归还池）", employee_key, exc)
+            # 异常时不归还池（避免污染下次复用）
+            if runner_obj is not None:
+                try:
+                    await runner_obj.terminate()
+                except Exception:
+                    pass
+            raise CCExecutorFailed(str(exc)) from exc
+        else:
+            # 成功 → 归还池
+            await pool.release(pool_key, runner_obj)
+    else:
+        # 退回旧 spawn-per-task（CLAUDE_POOL=off 或无 thread_id）
+        runner = ClaudeRunner()
+        try:
+            final_text, tool_logs, new_sid = await runner.run(
+                prompt=query,
+                cwd=cwd,
+                session_id=session_id,
+                on_text=cb.on_text,
+                on_thinking=cb.on_thinking,
+                on_tool_start=cb.on_tool_start,
+                on_tool_result=cb.on_tool_result,
+                extra_cli_args=extra_args,
+                cmd_wrapper=_wrap,
+                model=model,
+                effort=effort,
+            )
+        except Exception as exc:
+            log.warning("[%s] claude code 子进程异常：%s", employee_key, exc)
+            raise CCExecutorFailed(str(exc)) from exc
 
     if not final_text or not final_text.strip():
         log.warning("[%s] claude code 返回空文本（session=%s）", employee_key, session_id)
