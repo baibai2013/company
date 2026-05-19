@@ -108,6 +108,8 @@ class ClaudeRunner:
         on_thinking: callable = None,
         extra_cli_args: list[str] | None = None,
         cmd_wrapper: callable = None,
+        model: str = "claude-opus-4-7",
+        effort: str = "high",
     ) -> tuple[str, list[str], str | None]:
         """
         执行 Claude Code CLI，流式返回结果。
@@ -119,6 +121,8 @@ class ClaudeRunner:
                           --permission-mode acceptEdits）。在 prompt 前插入
           cmd_wrapper:    argv → argv 的回调，给外部包 sandbox-exec 用。例：
                           lambda argv: ['/usr/bin/sandbox-exec','-f',profile,*argv]
+          model:          claude --model 值（默认 opus-4-7；闲聊场景可用 sonnet）
+          effort:         claude --effort 值（默认 high；闲聊场景可用 low）
 
         返回 (最终文本, 工具调用日志, 新 session_id)。
         新 session_id 由调用方写回 Thread。
@@ -126,8 +130,8 @@ class ClaudeRunner:
         # 4.7 用 --effort 控制 thinking（adaptive 模式），不接受 --max-thinking-tokens
         # --include-partial-messages 启用 stream_event 增量事件
         cmd = [CLAUDE_BIN, "-p", "--output-format", "stream-json", "--verbose",
-               "--include-partial-messages", "--effort", "high",
-               "--model", "claude-opus-4-7"]
+               "--include-partial-messages", "--effort", effort,
+               "--model", model]
 
         if session_id:
             cmd.extend(["--resume", session_id])

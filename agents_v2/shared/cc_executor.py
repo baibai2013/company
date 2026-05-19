@@ -53,6 +53,8 @@ async def run_cc_node(
     feishu_app_secret: str = "",
     agent_port: int | str = "",
     callbacks: _Callbacks | None = None,
+    model: str = "claude-opus-4-7",
+    effort: str = "high",
 ) -> tuple[str, str | None, list[str]]:
     """跑一次 claude code CLI 完成员工的 WORK 任务。
 
@@ -109,6 +111,8 @@ async def run_cc_node(
             on_tool_result=cb.on_tool_result,
             extra_cli_args=extra_args,
             cmd_wrapper=_wrap,
+            model=model,
+            effort=effort,
         )
     except Exception as exc:
         log.warning("[%s] claude code 子进程异常：%s", employee_key, exc)

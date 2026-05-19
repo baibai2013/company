@@ -221,6 +221,9 @@ def _route_node(state: SmartState, employee_key: str) -> dict:
 
 
 def _chat_node(state: SmartState, employee_key: str) -> dict:
+    """legacy fallback only — backend=cc 时 chat 走 _cc_work_node。
+    保留作 backend=langchain 时的应急回退。
+    """
     suffix = _global_prompt(employee_key, "chat_suffix", _DEFAULT_CHAT_SUFFIX)
     query = _text_only(state["task_input"])
     llm = _llm_for(employee_key, "chat", default_model="claude-sonnet-4-6")
@@ -345,7 +348,12 @@ def _react_node(state: SmartState, employee_key: str, tools: list, max_rounds: i
 
 
 def _react_chat_node(state: SmartState, employee_key: str, tools: list) -> dict:
-    """带工具的 chat node — 闲聊时也可调用工具。"""
+    """legacy fallback only — backend=cc 时 chat 走 _cc_work_node。
+    保留作 backend=langchain 时的应急回退。
+
+    带工具的 chat node — 闲聊时也可调用工具。已知问题：state.messages 历史
+    污染容易触发"过度工具化"（参见 commit d34a8c3 上下文）。
+    """
     from langchain_core.messages import AIMessage, ToolMessage as TM
 
     suffix = _global_prompt(employee_key, "chat_suffix", _DEFAULT_CHAT_SUFFIX)
@@ -449,13 +457,36 @@ async def _cc_work_node(state: SmartState, employee_key: str) -> dict:
 
     query = _text_only(state["task_input"])
     plan = state.get("plan", "")
+    route = state.get("route", "WORK")
     sid_in = state.get("cc_session_id")
 
     chat_id = _runner.current_feishu_chat_id.get("")
     thread_id = _runner.current_thread_id.get("")
 
-    # plan 作为 prompt prefix 送给 claude code，让它按方案执行
-    prompt = f"执行方案：\n{plan}\n\n原始需求：\n{query}" if plan else query
+    # prompt 拼装：
+    # - WORK 路径：plan 节点已出方案，作为 prompt prefix 让 claude 按方案执行
+    # - CHAT 路径：闲聊语义提示，让 claude 简短回复，不要主动调工具
+    if route == "CHAT":
+        prompt = (
+            "【对话模式】这是日常对话/简短问答，不是工作任务。\n"
+            "- 用户只是问候、确认、闲聊或简单回忆历史时，简短回复即可（150 字内）\n"
+            "- 没明确要求时不要主动调用 Bash / Write / Edit 等工具去做事\n"
+            "- 用户问\"刚才创建了什么\"是查询，回答即可，不要重复创建\n\n"
+            f"用户消息：{query}"
+        )
+    elif plan:
+        prompt = f"执行方案：\n{plan}\n\n原始需求：\n{query}"
+    else:
+        prompt = query
+
+    # CHAT 路径用 Sonnet + low effort（闲聊不要 Opus + thinking 那么慢）
+    # WORK 路径用 Opus + high effort（重活值得）
+    if route == "CHAT":
+        cc_model = "claude-sonnet-4-6"
+        cc_effort = "low"
+    else:
+        cc_model = "claude-opus-4-7"
+        cc_effort = "high"
 
     rclient = _aioredis.from_url("redis://localhost:6379/0")
     try:
@@ -471,6 +502,8 @@ async def _cc_work_node(state: SmartState, employee_key: str) -> dict:
             feishu_app_secret=cfg.feishu_app_secret or "",
             agent_port=cfg.agent_port or "",
             callbacks=callbacks,
+            model=cc_model,
+            effort=cc_effort,
         )
     except CCExecutorFailed as exc:
         log.warning("[%s] cc_work_node fallback to langchain: %s", employee_key, exc)
@@ -520,8 +553,14 @@ def build_smart_agent(employee_key_or_prompt, checkpointer, cc_prompt: str = "",
     g.add_node("route", partial(_route_node, employee_key=employee_key))
     g.add_node("plan",  partial(_plan_node,  employee_key=employee_key))
 
-    # CHAT 路径始终走 langchain（claude code 子进程冷启慢，对闲聊不可接受）
-    if tools:
+    # 阶段 9.5：cc 后端下 CHAT 也走 claude code CLI（弃用 langchain react_chat）
+    # 理由：langchain react_chat 多次出现"过度工具化"和"历史污染"问题
+    # （问"刚才创建了什么"被理解成再创建一次、问候被回复提醒等）；切到 cc 后端
+    # 后由 acceptEdits + sandbox + 自管 session 提供更稳的行为。代价是闲聊
+    # 也要 5-15s（子进程冷启）。langchain 路径保留作 backend=langchain 时的 fallback。
+    if _exec_backend == "cc":
+        g.add_node("chat", partial(_cc_work_node, employee_key=employee_key))
+    elif tools:
         g.add_node("chat", partial(_react_chat_node, employee_key=employee_key, tools=tools))
     else:
         g.add_node("chat", partial(_chat_node, employee_key=employee_key))
@@ -529,7 +568,7 @@ def build_smart_agent(employee_key_or_prompt, checkpointer, cc_prompt: str = "",
     # WORK 执行节点：cc 走 claude code，langchain 走旧 react/execute
     if _exec_backend == "cc":
         g.add_node("execute", partial(_cc_work_node, employee_key=employee_key))
-        log.info("[%s] build_smart_agent: WORK 后端 = claude code CLI", employee_key)
+        log.info("[%s] build_smart_agent: CHAT + WORK 后端 = claude code CLI", employee_key)
     elif tools:
         g.add_node("execute", partial(_react_node, employee_key=employee_key, tools=tools))
     else:
