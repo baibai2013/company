@@ -499,3 +499,108 @@ git commit -m "docs(design): 员工 WORK 路径切换 claude code CLI + 隔离�
 ```
 
 之后再按阶段 1 → 8 推进。
+
+---
+
+## 11. 阶段 9 hotfix - claude 子进程卡死
+
+**根因**：`asyncio.create_subprocess_exec` 没显式 `stdin=DEVNULL`，agent 主进程的 fd 0 继承了 zsh here-doc 临时文件（`/private/var/tmp/sh-thd-*`），claude code CLI 看到 stdin 是 REG 文件而非 pipe/tty 行为异常卡死。
+
+**修复**（commit c1c822b）：
+- `feishu/cc_bridge/claude_runner.py:152` 加 `stdin=asyncio.subprocess.DEVNULL`
+- `./start.sh` 5 处 nohup 全加 `< /dev/null`
+
+---
+
+## 12. 阶段 9.5 - CHAT 路径也切 claude code CLI（弃用 react_chat）
+
+**用户反馈**：langchain `_react_chat_node` 反复出错（"你好"被回复"提醒"、"刚才创建了什么"被理解成再创建一次）。
+
+**修法**（commit 00c8e31）：
+- `_build_graph` cc 后端下，chat 节点也用 `_cc_work_node`
+- `_cc_work_node` 区分 route：
+  - CHAT → Sonnet 4.6 + low effort + 闲聊语义提示（不主动调工具）
+  - WORK → Opus 4.7 + high effort
+- ClaudeRunner.run / cc_executor 加 model/effort 参数透传
+- `_react_chat_node` / `_chat_node` 标 legacy fallback
+
+---
+
+## 13. 阶段 9.6 - cc 后端删除 plan 节点
+
+**用户洞察**："plan 也用 cli，因为做计划需要查实际的情况"。langchain Opus 闭眼出方案没工具支撑是空想；plan 改 cc 跟 execute 改 cc 重复（双 claude 子进程）。
+
+**最优解**（commit 60abf6b）：删 plan 节点，让 claude code 自己用 TodoWrite + Bash/Read/Grep 内化规划。
+
+`_decide_after_route`: WORK 直接返回 `execute`（不再 `plan`）。`_cc_work_node` WORK 路径加"任务模式"提示引导用 TodoWrite 先查实情。
+
+省一次 langchain Opus 调用 + 一次 claude 子进程冷启 ≈ 5-10s/任务。
+
+langchain backend 路径保留 plan 节点作 fallback。
+
+---
+
+## 14. 阶段 10 - 进度卡 todo 聚合（commit 2c01d3d）
+
+进度卡里 TaskCreate / TaskUpdate / TodoWrite 不再散行渲染（"🔧 TaskCreate: xxx"），改成聚合为单一 markdown 任务列表块（参考 cc_bridge 现有实现）：
+
+```
+📋 任务列表
+- [✓] ~~查实际情况~~（绿，完成）
+- [~] 创建产品文档1（蓝，进行中）
+- [ ] 创建产品文档2（灰，待办）
+```
+
+实现要点：
+- `cc_executor.make_progress_callbacks` on_tool_start 加 `tool_use_id`；新增 on_tool_result 发 `tool_result` 事件让 bot 解析 TaskCreate 真实 ID
+- `employee_bot.py` 移植 `_apply_task_update` / `_resolve_task_create` / `_build_todo_block`（参考 cc_bridge/message_handler.py）
+- progress_state 加 `task_list: OrderedDict` + `pending_creates: dict`
+- _render_progress 在 steps 后追加 todo 块
+
+---
+
+## 15. 阶段 11 - claude code 子进程热进程池（commit 3a8ad41）
+
+**目标**：避免每任务 spawn claude 的冷启代价（~2-3s）。同 thread 5 分钟内复用同进程。
+
+**架构**：
+```
+agent 进程
+  └── ClaudePool（单例，进程内）
+        └── pool[(employee, cwd, thread_id, model, effort)] = [PersistentRunner, ...]
+              └── PersistentRunner 包装 claude 子进程（stdin 流式协议）
+```
+
+**关键设计**：pool key 必须含 `thread_id`。claude code stream-json 输入模式下，进程内多次 submit 是同对话（session 累积消息），不同 thread 复用同进程会历史串扰。
+
+**协议（已 spike 验证）**：
+```bash
+claude -p --output-format stream-json --verbose \
+  --include-partial-messages \
+  --input-format stream-json \         # ★ 持续读 stdin
+  --effort low --model claude-sonnet-4-6 \
+  --mcp-config <inline> --strict-mcp-config \
+  --permission-mode acceptEdits
+# （没有 prompt argv —— 等 stdin 输入）
+```
+
+每条任务往 stdin 写：
+```json
+{"type":"user","message":{"role":"user","content":[{"type":"text","text":"<task>"}]}}
+```
+
+读 stdout 到 `{"type":"result"}` 事件就停，进程不退出，等下一条。
+
+**主要文件**：
+- `feishu/cc_bridge/claude_runner.py`：抽 `parse_stream_loop()` 公共函数，含 `stop_on_result` 参数
+- `agents_v2/shared/claude_pool.py`（新建）：
+  - `PersistentRunner.start()` / `submit(prompt) -> (text, sid, tool_logs)` / `terminate()`
+  - `ClaudePool.acquire(key, spawn_args)` / `release(key, runner)`
+  - 后台 GC 任务每 30s 扫，5 分钟 idle SIGTERM；池上限 30 LRU 淘汰
+- `agents_v2/shared/cc_executor.py:run_cc_node`：优先走 pool，CLAUDE_POOL=off 或无 thread_id 时退回 spawn-per-task
+
+**E2E 验证**：
+- PersistentRunner 单测：T1 5.6s（spawn）/ T2 2.3s（命中）= 省 3.3s ✓
+- dispatch HTTP：同 task_id 第 2 次 ps 看到 claude 子进程只 1 个 = 复用 ✓
+
+**回退**：env `CLAUDE_POOL=off` 一键禁用。
