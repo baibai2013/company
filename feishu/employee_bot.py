@@ -632,12 +632,12 @@ async def _handle(employee: str, task: str, chat_id: str, client: lark.Client,
                 f"{context_base}{prior_section}\n\n"
                 "【重要】只需发表你自己的专业意见，不要@任何人，不要建议找其他人，不要安排下一步任务。"
             )
-            _send_card("⏳ 处理中", f"{cc_emoji} {cc_name} 发表意见中…", "grey")
+            _send_card_sync("⏳ 处理中", f"{cc_emoji} {cc_name} 发表意见中…", "grey")
             try:
                 cc_data = await handle_dispatch(cc_emp, context)
                 cc_result = cc_data.get("result", "(无输出)")
                 prior_voices.append(f"{cc_name}：{cc_result[:200]}")
-                _send_card(f"{cc_emoji} {cc_name}", cc_result[:2000], "blue")
+                _send_card_sync(f"{cc_emoji} {cc_name}", cc_result[:2000], "blue")
             except Exception as exc:
                 log.warning("cc dispatch failed for %s: %s", cc_emp, exc)
 
