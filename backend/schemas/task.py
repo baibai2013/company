@@ -23,9 +23,11 @@ class TaskStepRead(BaseModel):
     id: str
     step_name: str
     status: str
+    input: str | None = None
     output: str | None
     started_at: datetime | None
     finished_at: datetime | None
+    duration_ms: int | None = None
 
     model_config = {"from_attributes": True}
 

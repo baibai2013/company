@@ -43,6 +43,7 @@ from .pipelines import (
 from . import prompts as _p  # 模块级引用，支持 watchdog 热重载后自动使用新值
 from .scenarios import SCENARIO_REGISTRY
 from .session import SessionStore
+from .task_steps import extract_task_id, is_task_chat, mark_task_status, step_record
 
 log = logging.getLogger("group_chat.orchestrator")
 
@@ -97,6 +98,19 @@ def _state_set_session(state: OrchestratorState, session: GroupSession) -> dict:
     return {"session_json": json.dumps(ss._serialize(session), ensure_ascii=False)}
 
 
+# Task 触发场景的关键词识别(MVP 实现,B2 阶段可换 LLM intent classifier)
+_ROBOT_ENG_KEYWORDS = (
+    "机器狗", "四足", "腿部", "髋关节", "膝关节", "舵机",
+    "STEP 文件", "step 文件", "PRD", "build123d",
+)
+
+
+def _match_robot_engineering(text: str) -> bool:
+    if not text:
+        return False
+    return any(kw in text for kw in _ROBOT_ENG_KEYWORDS)
+
+
 
 
 # ── Graph Nodes ───────────────────────────────────────────────────────────────
@@ -108,39 +122,46 @@ async def _receive_node(
 ) -> dict:
     """Load or create session, append the triggering message to history."""
     event = _state_get_event(state)
-    session = _state_get_session(state)
+    task_id = extract_task_id(event.chat_id)
 
-    if not session.id:
-        # New session: try to find active session in this group
-        active = await session_store.find_active(event.chat_id)
-        if active and active.status != "done":
-            session = active
-        else:
-            session = GroupSession(
-                id=event.message_id or str(uuid.uuid4()),
-                chat_id=event.chat_id,
-                trigger_message_id=event.message_id,
-                created_at=time.time(),
-            )
+    # Task 触发场景:推进 pending → in_progress(幂等)
+    if task_id:
+        await mark_task_status(task_id, "in_progress")
 
-    # Append user message to history
-    msg = ConversationMessage(
-        id=str(uuid.uuid4()),
-        session_id=session.id,
-        sender="user",
-        sender_name="用户",
-        content=event.text or "[图片]",
-        platform_message_id=event.message_id,
-        created_at=time.time(),
-        role="user",
-    )
-    session.history.append(msg)
-    session.trigger_message_id = event.message_id
+    async with step_record(task_id, "receive", input_summary=event.text[:200]):
+        session = _state_get_session(state)
 
-    log.info("receive_node: session=%s chat=%s history_len=%d",
-             session.id, session.chat_id, len(session.history))
+        if not session.id:
+            # New session: try to find active session in this group
+            active = await session_store.find_active(event.chat_id)
+            if active and active.status != "done":
+                session = active
+            else:
+                session = GroupSession(
+                    id=event.message_id or str(uuid.uuid4()),
+                    chat_id=event.chat_id,
+                    trigger_message_id=event.message_id,
+                    created_at=time.time(),
+                )
 
-    return _state_set_session(state, session)
+        # Append user message to history
+        msg = ConversationMessage(
+            id=str(uuid.uuid4()),
+            session_id=session.id,
+            sender="user",
+            sender_name="用户",
+            content=event.text or "[图片]",
+            platform_message_id=event.message_id,
+            created_at=time.time(),
+            role="user",
+        )
+        session.history.append(msg)
+        session.trigger_message_id = event.message_id
+
+        log.info("receive_node: session=%s chat=%s history_len=%d",
+                 session.id, session.chat_id, len(session.history))
+
+        return _state_set_session(state, session)
 
 
 async def _decide_node(
@@ -151,117 +172,149 @@ async def _decide_node(
     """LLM call to decide: mode, participants, and optionally session roles."""
     session = _state_get_session(state)
     event = _state_get_event(state)
+    task_id = extract_task_id(event.chat_id)
 
-    llm_haiku = make_langchain_llm("claude-haiku-4-5-20251001")
+    # Task 触发场景:关键词命中后跳过 LLM 决策,固定走 robot_engineering scenario
+    if task_id and _match_robot_engineering(event.text):
+        async with step_record(task_id, "decide",
+                               input_summary=f"[scenario=robot_engineering] {event.text[:200]}"):
+            session.template = "robot_engineering"
+            session.host = "project_manager"
+            participants = ["product_manager", "mechanical", "firmware", "algorithm", "cost"]
+            # 过滤掉 registry 里没的 key(测试环境可能 EMPLOYEE_CONFIG 为空)
+            if len(EMPLOYEE_CONFIG) > 0:
+                participants = [e for e in participants if e in EMPLOYEE_CONFIG]
+            session.mode = "parallel"
+            session.participants = participants
+            session.pending = list(participants)
+            scenario_cls = SCENARIO_REGISTRY.get("robot_engineering")
+            if scenario_cls:
+                scenario = scenario_cls(session, session_store=session_store)
+                session.game_state = scenario.initialize(event.text) or {"phase": "init"}
+            else:
+                session.game_state = {"phase": "init"}
+            await session_store.save(session)
+            log.info("decide_node: task scenario=robot_engineering participants=%s", participants)
+            return {
+                **_state_set_session(state, session),
+                "decision_json": json.dumps({
+                    "mode": "parallel",
+                    "participants": participants,
+                    "reason": "matched robot_engineering scenario",
+                }, ensure_ascii=False),
+            }
 
-    # Step 1: Check for explicit role assignment
-    explicit_roles = await _p.extract_explicit_roles(
-        event.text, event.mentions, llm_haiku,
-    )
-    if explicit_roles:
-        session.role_assignments = explicit_roles
-        session.role_history.append((time.time(), dict(explicit_roles)))
-        log.info("decide_node: explicit roles from user: %s", list(explicit_roles.keys()))
+    async with step_record(task_id, "decide", input_summary=event.text[:200]):
+        llm_haiku = make_langchain_llm("claude-haiku-4-5-20251001")
 
-    # Step 2: Decide mode and participants
-    resp = await llm_haiku.ainvoke([
-        SystemMessage(_p.DECIDE_PROMPT),
-        HumanMessage(event.text),
-    ])
+        # Step 1: Check for explicit role assignment
+        explicit_roles = await _p.extract_explicit_roles(
+            event.text, event.mentions, llm_haiku,
+        )
+        if explicit_roles:
+            session.role_assignments = explicit_roles
+            session.role_history.append((time.time(), dict(explicit_roles)))
+            log.info("decide_node: explicit roles from user: %s", list(explicit_roles.keys()))
 
-    import re as _re
-    try:
-        m = _re.search(r"\{.*\}", resp.content, _re.DOTALL)
-        data = json.loads(m.group()) if m else {}
-    except Exception:
-        data = {}
+        # Step 2: Decide mode and participants
+        resp = await llm_haiku.ainvoke([
+            SystemMessage(_p.DECIDE_PROMPT),
+            HumanMessage(event.text),
+        ])
 
-    decision = OrchestratorDecision(
-        mode=data.get("mode", "single"),
-        participants=data.get("participants", []),
-        reason=data.get("reason", ""),
-    )
+        import re as _re
+        try:
+            m = _re.search(r"\{.*\}", resp.content, _re.DOTALL)
+            data = json.loads(m.group()) if m else {}
+        except Exception:
+            data = {}
 
-    # Default: if no participants, route to project_manager
-    if not decision.participants and decision.mode != "ignore":
-        decision.participants = ["project_manager"]
+        decision = OrchestratorDecision(
+            mode=data.get("mode", "single"),
+            participants=data.get("participants", []),
+            reason=data.get("reason", ""),
+        )
 
-    # 过滤掉 LLM 幻觉出的无效 key（仅在 EMPLOYEE_CONFIG 非空时过滤，避免 registry 未 warmup 误删）
-    if len(EMPLOYEE_CONFIG) > 0:
-        decision.participants = [e for e in decision.participants if e in EMPLOYEE_CONFIG]
-    if not decision.participants and decision.mode != "ignore":
-        decision.participants = ["project_manager"]
+        # Default: if no participants, route to project_manager
+        if not decision.participants and decision.mode != "ignore":
+            decision.participants = ["project_manager"]
 
-    session.mode = decision.mode
-    session.participants = decision.participants
-    session.pending = list(decision.participants)
+        # 过滤掉 LLM 幻觉出的无效 key（仅在 EMPLOYEE_CONFIG 非空时过滤，避免 registry 未 warmup 误删）
+        if len(EMPLOYEE_CONFIG) > 0:
+            decision.participants = [e for e in decision.participants if e in EMPLOYEE_CONFIG]
+        if not decision.participants and decision.mode != "ignore":
+            decision.participants = ["project_manager"]
 
-    # Step 3: Auto-assign roles if no explicit roles and not "free"
-    if not session.role_assignments and decision.mode != "ignore":
-        # Use ROLE_DECIDE_PROMPT for complex modes
-        if decision.mode in ("sequential", "parallel") and len(decision.participants) > 1:
-            try:
-                # 过滤掉 LLM 幻觉出的无效 key，只保留 EMPLOYEE_CONFIG 里有的
-                valid_participants = [e for e in decision.participants if e in EMPLOYEE_CONFIG]
-                if not valid_participants:
-                    # registry 未 warmup，跳过角色分配
-                    raise RuntimeError("EMPLOYEE_CONFIG empty, registry not warmed up")
-                participant_list = "\n".join(
-                    f"- {e}: {EMPLOYEE_CONFIG.get(e, ('👤', e))[0]} {EMPLOYEE_CONFIG.get(e, ('👤', e))[1]} ({ROLE_DESCRIPTIONS.get(e, '')})"
-                    for e in valid_participants
-                )
-                role_resp = await llm_haiku.ainvoke([
-                    SystemMessage(_p.ROLE_DECIDE_PROMPT),
-                    HumanMessage(f"参与者列表：\n{participant_list}\n\n话题：{event.text}"),
-                ])
-                m2 = _re.search(r"\{.*\}", role_resp.content, _re.DOTALL)
-                if m2:
-                    role_data = json.loads(m2.group())
-                    session.template = role_data.get("template", "free")
-                    session.activity_rules = role_data.get("activity_rules", "") or ""
-                    session.host = role_data.get("host", "") or ""
-                    roles_dict = role_data.get("roles", {})
-                    for emp_key, rdata in roles_dict.items():
-                        if emp_key in EMPLOYEE_CONFIG and isinstance(rdata, dict):
-                            session.role_assignments[emp_key] = SessionRole(
-                                employee=emp_key,
-                                role_name=rdata.get("role_name", ""),
-                                role_desc=rdata.get("role_desc", ""),
-                                visible_to=rdata.get("visible_to", []),
-                                faction=rdata.get("faction", ""),
-                            )
-                    if session.activity_rules:
-                        log.info("decide_node: activity_rules=%s host=%s",
-                                 session.activity_rules[:80], session.host)
+        session.mode = decision.mode
+        session.participants = decision.participants
+        session.pending = list(decision.participants)
 
-                    # Initialize game state via scenario registry
-                    scenario_cls = SCENARIO_REGISTRY.get(session.template)
-                    if scenario_cls and session.host and not session.game_state:
-                        # 游戏场景自动加入 CEO（真实用户）
-                        if "user" not in session.participants:
-                            await add_participant(session, session_store, "user")
-                            session.pending.append("user")
-                            decision.participants.append("user")
-                        scenario = scenario_cls(session, session_store=session_store)
-                        session.game_state = scenario.initialize(session.activity_rules)
-                        log.info("decide_node: scenario=%s state=%s (user joined)",
-                                 session.template, session.game_state)
-            except Exception as exc:
-                log.warning("decide_node: role assignment failed: %s", exc)
+        # Step 3: Auto-assign roles if no explicit roles and not "free"
+        if not session.role_assignments and decision.mode != "ignore":
+            # Use ROLE_DECIDE_PROMPT for complex modes
+            if decision.mode in ("sequential", "parallel") and len(decision.participants) > 1:
+                try:
+                    # 过滤掉 LLM 幻觉出的无效 key，只保留 EMPLOYEE_CONFIG 里有的
+                    valid_participants = [e for e in decision.participants if e in EMPLOYEE_CONFIG]
+                    if not valid_participants:
+                        # registry 未 warmup，跳过角色分配
+                        raise RuntimeError("EMPLOYEE_CONFIG empty, registry not warmed up")
+                    participant_list = "\n".join(
+                        f"- {e}: {EMPLOYEE_CONFIG.get(e, ('👤', e))[0]} {EMPLOYEE_CONFIG.get(e, ('👤', e))[1]} ({ROLE_DESCRIPTIONS.get(e, '')})"
+                        for e in valid_participants
+                    )
+                    role_resp = await llm_haiku.ainvoke([
+                        SystemMessage(_p.ROLE_DECIDE_PROMPT),
+                        HumanMessage(f"参与者列表：\n{participant_list}\n\n话题：{event.text}"),
+                    ])
+                    m2 = _re.search(r"\{.*\}", role_resp.content, _re.DOTALL)
+                    if m2:
+                        role_data = json.loads(m2.group())
+                        session.template = role_data.get("template", "free")
+                        session.activity_rules = role_data.get("activity_rules", "") or ""
+                        session.host = role_data.get("host", "") or ""
+                        roles_dict = role_data.get("roles", {})
+                        for emp_key, rdata in roles_dict.items():
+                            if emp_key in EMPLOYEE_CONFIG and isinstance(rdata, dict):
+                                session.role_assignments[emp_key] = SessionRole(
+                                    employee=emp_key,
+                                    role_name=rdata.get("role_name", ""),
+                                    role_desc=rdata.get("role_desc", ""),
+                                    visible_to=rdata.get("visible_to", []),
+                                    faction=rdata.get("faction", ""),
+                                )
+                        if session.activity_rules:
+                            log.info("decide_node: activity_rules=%s host=%s",
+                                     session.activity_rules[:80], session.host)
 
-    await session_store.save(session)
+                        # Initialize game state via scenario registry
+                        scenario_cls = SCENARIO_REGISTRY.get(session.template)
+                        if scenario_cls and session.host and not session.game_state:
+                            # 游戏场景自动加入 CEO（真实用户）
+                            if "user" not in session.participants:
+                                await add_participant(session, session_store, "user")
+                                session.pending.append("user")
+                                decision.participants.append("user")
+                            scenario = scenario_cls(session, session_store=session_store)
+                            session.game_state = scenario.initialize(session.activity_rules)
+                            log.info("decide_node: scenario=%s state=%s (user joined)",
+                                     session.template, session.game_state)
+                except Exception as exc:
+                    log.warning("decide_node: role assignment failed: %s", exc)
 
-    log.info("decide_node: mode=%s participants=%s reason=%s",
-             decision.mode, decision.participants, decision.reason)
+        await session_store.save(session)
 
-    return {
-        **_state_set_session(state, session),
-        "decision_json": json.dumps({
-            "mode": decision.mode,
-            "participants": decision.participants,
-            "reason": decision.reason,
-        }, ensure_ascii=False),
-    }
+        log.info("decide_node: mode=%s participants=%s reason=%s",
+                 decision.mode, decision.participants, decision.reason)
+
+        return {
+            **_state_set_session(state, session),
+            "decision_json": json.dumps({
+                "mode": decision.mode,
+                "participants": decision.participants,
+                "reason": decision.reason,
+            }, ensure_ascii=False),
+        }
 
 
 async def _dispatch_node(
@@ -273,40 +326,45 @@ async def _dispatch_node(
     session = _state_get_session(state)
     decision = _state_get_decision(state)
     completed = list(state.get("completed", []))
+    task_id = extract_task_id(session.chat_id)
 
     if decision is None or decision.mode == "ignore":
         return {}
 
-    # Check if this session has a registered scenario
-    scenario_cls = SCENARIO_REGISTRY.get(session.template)
-    if scenario_cls and session.game_state:
-        # Delegate entirely to the scenario's run() method
-        scenario = scenario_cls(session, session_store=session_store)
-        await scenario.run(bus_pool)
-        completed = list(decision.participants)
-    else:
-        # Generic pipeline dispatch (no game logic)
-        remaining = [e for e in decision.participants if e not in completed]
-        if not remaining:
-            return {"completed": completed}
+    async with step_record(
+        task_id, "dispatch",
+        input_summary=f"mode={decision.mode} participants={decision.participants}",
+    ):
+        # Check if this session has a registered scenario
+        scenario_cls = SCENARIO_REGISTRY.get(session.template)
+        if scenario_cls and session.game_state:
+            # Delegate entirely to the scenario's run() method
+            scenario = scenario_cls(session, session_store=session_store)
+            await scenario.run(bus_pool)
+            completed = list(decision.participants)
+        else:
+            # Generic pipeline dispatch (no game logic)
+            remaining = [e for e in decision.participants if e not in completed]
+            if not remaining:
+                return {"completed": completed}
 
-        mode = decision.mode
-        if mode == "single":
-            await pipe_sequential(session, [remaining[0]], bus_pool)
-            completed.append(remaining[0])
-        elif mode == "sequential":
-            spoken = await pipe_sequential(session, remaining, bus_pool)
-            completed.extend(spoken)
-        elif mode == "parallel":
-            await pipe_fanout(session, remaining, bus_pool)
-            completed.extend(remaining)
+            mode = decision.mode
+            if mode == "single":
+                await pipe_sequential(session, [remaining[0]], bus_pool)
+                completed.append(remaining[0])
+            elif mode == "sequential":
+                spoken = await pipe_sequential(session, remaining, bus_pool)
+                completed.extend(spoken)
+            elif mode == "parallel":
+                await pipe_fanout(session, remaining, bus_pool)
+                completed.extend(remaining)
 
-    await session_store.save(session)
+        await session_store.save(session)
 
-    return {
-        **_state_set_session(state, session),
-        "completed": completed,
-    }
+        return {
+            **_state_set_session(state, session),
+            "completed": completed,
+        }
 
 
 async def _conclude_node(
@@ -317,51 +375,68 @@ async def _conclude_node(
     """Generate summary and publish to group via project_manager."""
     session = _state_get_session(state)
     decision = _state_get_decision(state)
+    task_id = extract_task_id(session.chat_id)
+    is_task = is_task_chat(session.chat_id)
 
     if decision is None or decision.mode == "ignore":
         return {}
 
-    # Only summarize if more than 1 participant spoke
-    if len(state.get("completed", [])) <= 1 and decision.mode == "single":
-        session.status = "done"
-        await session_store.delete(session.id)
-        return _state_set_session(state, session)
+    async with step_record(
+        task_id, "conclude",
+        input_summary=f"completed={state.get('completed', [])}",
+    ):
+        # Only summarize if more than 1 participant spoke
+        if len(state.get("completed", [])) <= 1 and decision.mode == "single":
+            session.status = "done"
+            # Task 触发场景下保留 session 用于后续审计;群聊场景沿用旧逻辑
+            if not is_task:
+                await session_store.delete(session.id)
+            result = _state_set_session(state, session)
+        else:
+            history_text = _p.format_history(session.history)
 
-    history_text = _p.format_history(session.history)
+            # Pick the host (or fall back to project_manager) to do the summary
+            summarizer = session.host if session.host in EMPLOYEE_CONFIG else "project_manager"
 
-    # Pick the host (or fall back to project_manager) to do the summary
-    summarizer = session.host if session.host in EMPLOYEE_CONFIG else "project_manager"
+            req = SpeakRequest(
+                session_id=session.id,
+                chat_id=session.chat_id,
+                employee=summarizer,
+                history_text=history_text,
+                trigger_message_id=session.trigger_message_id,
+                summary_mode=True,
+                role_context=_p.build_summary_prompt(session),
+            )
+            await bus_pool.pub_bus.publish_speak_req(req)
 
-    req = SpeakRequest(
-        session_id=session.id,
-        chat_id=session.chat_id,
-        employee=summarizer,
-        history_text=history_text,
-        trigger_message_id=session.trigger_message_id,
-        summary_mode=True,
-        role_context=_p.build_summary_prompt(session),
-    )
-    await bus_pool.pub_bus.publish_speak_req(req)
+            responses = await _wait_for_responses(bus_pool, session.id, [summarizer], timeout=60.0)
+            resp = responses.get(summarizer)
+            if resp and resp.success:
+                session.summary = resp.content
+                _append_to_history(session, summarizer, resp.content)
 
-    responses = await _wait_for_responses(bus_pool, session.id, [summarizer], timeout=60.0)
-    resp = responses.get(summarizer)
-    if resp and resp.success:
-        session.summary = resp.content
-        _append_to_history(session, summarizer, resp.content)
+            # 将本次会话摘要写入所有参与员工的长期记忆
+            try:
+                from backend.repos import memory_repo
+                await memory_repo.save_session_summary(session)
+            except Exception as _mem_err:
+                log.warning("conclude_node: memory save failed session=%s err=%s",
+                            session.id[:8], _mem_err)
 
-    # 将本次会话摘要写入所有参与员工的长期记忆
-    try:
-        from backend.repos import memory_repo
-        await memory_repo.save_session_summary(session)
-    except Exception as _mem_err:
-        log.warning("conclude_node: memory save failed session=%s err=%s", session.id[:8], _mem_err)
+            session.status = "done"
+            if not is_task:
+                await session_store.delete(session.id)
 
-    session.status = "done"
-    await session_store.delete(session.id)
+            log.info("conclude_node: session=%s done, summary_len=%d task_id=%s",
+                     session.id, len(session.summary), task_id)
 
-    log.info("conclude_node: session=%s done, summary_len=%d", session.id, len(session.summary))
+            result = _state_set_session(state, session)
 
-    return _state_set_session(state, session)
+    # Task 触发场景:step_record 出栈后推进 in_progress → done
+    if task_id:
+        await mark_task_status(task_id, "done")
+
+    return result
 
 
 

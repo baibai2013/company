@@ -53,6 +53,19 @@ async def create_task(body: TaskCreate, db: AsyncSession = Depends(get_db)):
     db.add(task)
     await db.commit()
     await db.refresh(task)
+
+    # 触发 orchestrator 编排(失败仅 log,不阻断 task 创建)
+    try:
+        from backend.services.orchestration_bridge import trigger_for_task
+        await trigger_for_task(
+            task.id, task.title, task.description, task.requester or "CEO",
+        )
+    except Exception as exc:
+        import logging
+        logging.getLogger("api.tasks").warning(
+            "trigger_for_task failed task=%s err=%s", task.id, exc,
+        )
+
     return task
 
 
@@ -132,3 +145,28 @@ async def delete_task(task_id: str, db: AsyncSession = Depends(get_db)):
     await db.delete(task)
     await db.commit()
     return {"ok": True}
+
+
+@router.get("/{task_id}/steps", response_model=list[TaskStepRead])
+async def list_task_steps(task_id: str, db: AsyncSession = Depends(get_db)):
+    """返回 task_step 链路,按 started_at 排序。前端 Pipeline 视图数据源。"""
+    if not await db.get(Task, task_id):
+        raise HTTPException(status_code=404, detail="Task not found")
+    q = select(TaskStep).where(TaskStep.task_id == task_id).order_by(TaskStep.started_at)
+    rows = (await db.execute(q)).scalars().all()
+    out: list[TaskStepRead] = []
+    for r in rows:
+        duration_ms = None
+        if r.started_at and r.finished_at:
+            duration_ms = int((r.finished_at - r.started_at).total_seconds() * 1000)
+        out.append(TaskStepRead(
+            id=r.id,
+            step_name=r.step_name,
+            status=r.status,
+            input=r.input,
+            output=r.output,
+            started_at=r.started_at,
+            finished_at=r.finished_at,
+            duration_ms=duration_ms,
+        ))
+    return out

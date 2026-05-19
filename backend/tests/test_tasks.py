@@ -194,6 +194,22 @@ async def test_update_status_terminal_state_locked(client: AsyncClient):
     assert r.status_code == 422
 
 
+# ── T-A17: GET /steps 路由(B1.2) ───────────────────────────────────────────
+
+async def test_get_steps_returns_empty_initially(client: AsyncClient):
+    """T-A17: 新建任务 GET /{id}/steps 返回空列表(还没编排)"""
+    task = await create_task(client, title="编排前任务")
+    r = await client.get(f"/api/tasks/{task['id']}/steps")
+    assert r.status_code == 200
+    assert r.json() == []
+
+
+async def test_get_steps_for_nonexistent_task_returns_404(client: AsyncClient):
+    """T-A18: 不存在 task_id 返回 404"""
+    r = await client.get("/api/tasks/nope-12345/steps")
+    assert r.status_code == 404
+
+
 # ── T-A16: 删除任务 ───────────────────────────────────────────────────────────
 
 async def test_delete_task_and_detach_children(client: AsyncClient):

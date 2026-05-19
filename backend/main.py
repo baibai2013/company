@@ -11,6 +11,7 @@ from backend.api.routes.llm_stats import router as llm_stats_router
 from backend.api.routes.system_config import router as system_config_router
 from backend.api.routes.tasks import router as tasks_router
 from backend.chat.kanban_adapter import kanban_adapter
+from backend.chat.task_adapter import task_adapter
 from backend.chat.ws import router as ws_router
 from backend.services import registry
 
@@ -20,14 +21,20 @@ async def lifespan(app: FastAPI):
     await registry.warmup()
     registry.start_listener()
 
-    # 启动看板聊天适配器（连接 Redis 事件总线）
+    # 启动平台适配器（连接 Redis 事件总线）
     from group_chat.event_bus import GroupEventBusPool
     bus_pool = GroupEventBusPool()
     await bus_pool.connect()
     await kanban_adapter.start(bus_pool)
+    # B1.3: 任务级编排桥,订阅 speak_req:*:task:*,A2A 调员工 → publish speak_resp
+    task_bus_pool = GroupEventBusPool()
+    await task_bus_pool.connect()
+    await task_adapter.start(task_bus_pool)
 
     yield
 
+    await task_adapter.stop()
+    await task_bus_pool.disconnect()
     await kanban_adapter.stop()
     await bus_pool.disconnect()
     await registry.stop_listener()

@@ -15,11 +15,12 @@ import signal
 from .base import Scenario, SCENARIO_REGISTRY, register  # noqa: F401
 from . import guess_number  # noqa: F401
 from . import werewolf  # noqa: F401
+from . import robot_engineering  # noqa: F401
 
 _log = logging.getLogger(__name__)
 
 # 文件名 → 模块，新增 Scenario 在此注册即可被热重载
-_scenario_modules = [guess_number, werewolf]
+_scenario_modules = [guess_number, werewolf, robot_engineering]
 
 
 def reload_all():

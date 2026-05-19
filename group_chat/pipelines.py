@@ -20,6 +20,7 @@ if TYPE_CHECKING:
 
 from .models import ConversationMessage, EMPLOYEE_CONFIG, SpeakRequest, SpeakResponse
 from .prompts import build_role_context, format_history
+from .task_steps import extract_task_id, step_record
 
 log = logging.getLogger(__name__)
 
@@ -178,6 +179,7 @@ async def sequential(
     Returns:
         成功发言的员工 key 列表。
     """
+    task_id = extract_task_id(session.chat_id)
     completed = []
     for i, emp in enumerate(participants):
         if role_context_fn:
@@ -194,12 +196,13 @@ async def sequential(
             order=i,
             role_context=role_ctx,
         )
-        await bus_pool.pub_bus.publish_speak_req(req)
+        async with step_record(task_id, f"speak:{emp}", input_summary=role_ctx[:200]):
+            await bus_pool.pub_bus.publish_speak_req(req)
 
-        responses = await _wait_for_responses(bus_pool, session.id, [emp], timeout=timeout)
-        resp = responses.get(emp)
-        if resp and resp.success:
-            _append_to_history(session, emp, resp.content, visible_to=visible_to)
+            responses = await _wait_for_responses(bus_pool, session.id, [emp], timeout=timeout)
+            resp = responses.get(emp)
+            if resp and resp.success:
+                _append_to_history(session, emp, resp.content, visible_to=visible_to)
         completed.append(emp)
 
     return completed
@@ -227,37 +230,47 @@ async def fanout(
         员工 key → SpeakResponse 的字典。
     """
     history_text = format_history(session.history)
+    task_id = extract_task_id(session.chat_id)
 
-    for i, emp in enumerate(participants):
-        if role_context_fn:
-            role_ctx = role_context_fn(emp, session, i)
+    # 为每个 participant 开 step:speak。fanout 是真并行,所以用 contextlib.AsyncExitStack。
+    from contextlib import AsyncExitStack
+    async with AsyncExitStack() as stack:
+        step_handles = {}
+        for i, emp in enumerate(participants):
+            if role_context_fn:
+                role_ctx = role_context_fn(emp, session, i)
+            else:
+                role_ctx = build_role_context(emp, session)
+
+            await stack.enter_async_context(
+                step_record(task_id, f"speak:{emp}", input_summary=role_ctx[:200])
+            )
+            step_handles[emp] = role_ctx
+
+            req = SpeakRequest(
+                session_id=session.id,
+                chat_id=session.chat_id,
+                employee=emp,
+                history_text=history_text,
+                trigger_message_id=session.trigger_message_id,
+                order=i,
+                role_context=role_ctx,
+            )
+            await bus_pool.pub_bus.publish_speak_req(req)
+
+        if enable_gather:
+            responses = await _wait_for_responses(bus_pool, session.id, participants, timeout=timeout)
         else:
-            role_ctx = build_role_context(emp, session)
+            # 顺序等待，但所有人用相同的 history 快照（已在上面统一发请求）
+            responses = {}
+            for emp in participants:
+                r = await _wait_for_responses(bus_pool, session.id, [emp], timeout=timeout)
+                responses.update(r)
 
-        req = SpeakRequest(
-            session_id=session.id,
-            chat_id=session.chat_id,
-            employee=emp,
-            history_text=history_text,
-            trigger_message_id=session.trigger_message_id,
-            order=i,
-            role_context=role_ctx,
-        )
-        await bus_pool.pub_bus.publish_speak_req(req)
-
-    if enable_gather:
-        responses = await _wait_for_responses(bus_pool, session.id, participants, timeout=timeout)
-    else:
-        # 顺序等待，但所有人用相同的 history 快照（已在上面统一发请求）
-        responses = {}
         for emp in participants:
-            r = await _wait_for_responses(bus_pool, session.id, [emp], timeout=timeout)
-            responses.update(r)
-
-    for emp in participants:
-        resp = responses.get(emp)
-        if resp and resp.success:
-            _append_to_history(session, emp, resp.content)
+            resp = responses.get(emp)
+            if resp and resp.success:
+                _append_to_history(session, emp, resp.content)
 
     return responses
 
