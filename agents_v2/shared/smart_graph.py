@@ -429,8 +429,14 @@ def _cc_node(state: SmartState, employee_key: str, cc_prompt: str) -> dict:
     return {"cc": cc}
 
 
-def _decide_after_route(state: SmartState) -> Literal["chat", "plan"]:
-    return "chat" if state["route"] == "CHAT" else "plan"
+def _decide_after_route(state: SmartState) -> Literal["chat", "execute"]:
+    """阶段 9.6 起 WORK 路径不再走 plan 节点（langchain 闭眼出方案没工具支撑），
+    直接进 execute 让 claude code 自己用 TodoWrite 内化规划+查实情+执行。
+
+    旧 langchain backend（exec_backend=langchain）用 _build_with_static_prompt
+    那条独立路径，仍保留 plan 节点，与本函数无关。
+    """
+    return "chat" if state["route"] == "CHAT" else "execute"
 
 
 # ── claude code 后端 work 节点（阶段 6）──────────────────────────────────────
@@ -464,8 +470,10 @@ async def _cc_work_node(state: SmartState, employee_key: str) -> dict:
     thread_id = _runner.current_thread_id.get("")
 
     # prompt 拼装：
-    # - WORK 路径：plan 节点已出方案，作为 prompt prefix 让 claude 按方案执行
     # - CHAT 路径：闲聊语义提示，让 claude 简短回复，不要主动调工具
+    # - WORK 路径（无 plan，阶段 9.6 起删除 plan 节点）：任务模式提示，
+    #   让 claude 用 TodoWrite 先查实际情况再规划+执行
+    # - WORK 路径（有 plan，langchain backend 旧路径才会有）：plan 作 prefix
     if route == "CHAT":
         prompt = (
             "【对话模式】这是日常对话/简短问答，不是工作任务。\n"
@@ -477,7 +485,13 @@ async def _cc_work_node(state: SmartState, employee_key: str) -> dict:
     elif plan:
         prompt = f"执行方案：\n{plan}\n\n原始需求：\n{query}"
     else:
-        prompt = query
+        prompt = (
+            "【任务模式】这是要做的工作任务。\n"
+            "- 复杂任务请先用 TodoWrite 列出步骤（包含\"查实际情况\"作为第一步）\n"
+            "- 不要凭空想方案，先用 Bash / Read / Grep / Glob 查清现状再动手\n"
+            "- 边做边更新 TodoWrite，让用户在进度卡上看到推进\n\n"
+            f"用户需求：{query}"
+        )
 
     # CHAT 路径用 Sonnet + low effort（闲聊不要 Opus + thinking 那么慢）
     # WORK 路径用 Opus + high effort（重活值得）
@@ -551,7 +565,13 @@ def build_smart_agent(employee_key_or_prompt, checkpointer, cc_prompt: str = "",
 
     g = StateGraph(SmartState)
     g.add_node("route", partial(_route_node, employee_key=employee_key))
-    g.add_node("plan",  partial(_plan_node,  employee_key=employee_key))
+
+    # 阶段 9.6：cc 后端下不再用 plan 节点
+    # 理由：langchain Opus 闭眼出方案没工具支撑（用户："不是空想"）；claude code
+    # 自带 TodoWrite + Bash/Read/Grep，能在执行前先查实际情况再规划。删 plan
+    # 节点 → 减少一次 claude 子进程冷启 + 一次 LLM 调用。
+    if _exec_backend != "cc":
+        g.add_node("plan", partial(_plan_node, employee_key=employee_key))
 
     # 阶段 9.5：cc 后端下 CHAT 也走 claude code CLI（弃用 langchain react_chat）
     # 理由：langchain react_chat 多次出现"过度工具化"和"历史污染"问题
@@ -575,8 +595,17 @@ def build_smart_agent(employee_key_or_prompt, checkpointer, cc_prompt: str = "",
         g.add_node("execute", partial(_execute_node, employee_key=employee_key))
 
     g.add_edge(START, "route")
-    g.add_conditional_edges("route", _decide_after_route, {"chat": "chat", "plan": "plan"})
-    g.add_edge("plan", "execute")
+    if _exec_backend == "cc":
+        # cc 后端：route → chat / execute 直连（无 plan 节点）
+        g.add_conditional_edges("route", _decide_after_route, {"chat": "chat", "execute": "execute"})
+    else:
+        # langchain backend：保留旧 route → chat / plan → execute 流程
+        g.add_conditional_edges(
+            "route",
+            lambda s: "chat" if s["route"] == "CHAT" else "plan",
+            {"chat": "chat", "plan": "plan"},
+        )
+        g.add_edge("plan", "execute")
 
     if cc_prompt:
         g.add_node("cc", partial(_cc_node, employee_key=employee_key, cc_prompt=cc_prompt))
