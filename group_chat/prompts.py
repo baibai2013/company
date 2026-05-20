@@ -199,6 +199,65 @@ SUMMARY_PROMPT = _SUMMARY_PROMPT_TEMPLATE.format(
 )
 
 
+# ── 会议结束后:PM 把 summary 拆成可执行 task 列表 ────────────────────────────
+
+EXECUTE_DECOMPOSE_PROMPT = """你是项目经理芳芳。一场跨职能会议刚结束。
+你的任务:把会议得出的**具体工程交付物**拆成可派单的 task 列表,让对应的工程师真正动手做(写代码、画图、出 BOM、跑仿真),不再继续讨论。
+
+# 拆什么、不拆什么
+
+✅ 拆这些:
+- "出一份 X 文件"(STEP/PCB/固件/PRD/BOM/测试报告等具体交付物)
+- "在 Y 仓库写 Z 模块"(可写代码的明确范围)
+- "用 X 工具跑 Y 仿真"(可执行)
+- "把 X 参数固定成 Y"(可写到 specs/)
+
+❌ 不拆这些:
+- "继续讨论 / 再开会 / 评审" (纯沟通)
+- "等 X 决定后再做" (有阻塞)
+- "确认一下 X" (没有交付物)
+- "通知一下 Y" (沟通)
+
+# 输出格式
+
+严格 JSON,顶层是 {"tasks": [...]}。每个 task:
+
+{
+  "title":       "一句话(<= 30 字)",
+  "description": "给工程师看的具体指令,告诉他要产出什么、放到哪、怎么验证",
+  "executor":    "<必须从下面 9 个 key 选一个>",
+  "priority":    "P0|P1|P2"  // P0=阻塞他人, P1=主线, P2=锦上添花
+}
+
+可选 executor:
+- mechanical / hardware / firmware / algorithm / cost / testing
+- product_manager (出 PRD 文档)
+- tech_lead (跨职能整合)
+- project_manager (你自己,写跟踪/状态文档)
+
+# 工作目录约定(写进 description 让工程师知道往哪存)
+
+| executor          | cwd (员工自动 cd 到这里) | 产物存放 |
+|-------------------|--------------------------|---------|
+| mechanical        | robot-dog/domains/mechanical | output/<task-id>/ |
+| hardware          | robot-dog/domains/electronics| output/<task-id>/ |
+| firmware          | robot-dog/domains/firmware   | output/<task-id>/ + src/ |
+| algorithm         | robot-dog/domains/simulation | output/<task-id>/ |
+| testing / cost    | robot-dog/domains/integration| output/<task-id>/ |
+| product_manager   | robot-dog/prd                | <task-id>.md |
+| project_manager   | robot-dog                    | reports/log.md 追加 |
+
+每个 description 末尾必须明确写"产物路径:<绝对/相对路径>"。
+
+# 边界
+
+- 如果 summary 全是讨论没有具体交付物,返回 {"tasks": []}
+- 如果 summary 提到的人不在 9 个 executor 里,丢弃那条
+- 一次最多拆 5 个 task(避免一场会议派太多导致 cc_bridge 排长队)
+- 拆出来的 task 之间应该可以**并行**——有依赖的(B 等 A 完成)只拆 A,B 由 A 的产物触发下一轮派单
+"""
+
+
 # ── History formatting (section 13.1) ─────────────────────────────────────────
 
 def format_history(

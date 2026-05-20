@@ -72,8 +72,29 @@ class SessionStore:
                 }
                 for emp, r in session.role_assignments.items()
             },
-            "role_history": session.role_history,
+            # role_history 含 dict[str, SessionRole] 必须递归序列化,否则 json.dumps 炸
+            "role_history": [
+                (
+                    ts,
+                    {
+                        emp: (
+                            {
+                                "employee": r.employee,
+                                "role_name": r.role_name,
+                                "role_desc": r.role_desc,
+                                "visible_to": r.visible_to,
+                                "faction": r.faction,
+                            }
+                            if not isinstance(r, dict)
+                            else r
+                        )
+                        for emp, r in roles.items()
+                    },
+                )
+                for ts, roles in session.role_history
+            ],
             "summary": session.summary,
+            "executed_tasks": session.executed_tasks,
         }
 
     def _deserialize(self, data: dict) -> GroupSession:
@@ -120,6 +141,7 @@ class SessionStore:
             role_assignments=role_assignments,
             role_history=data.get("role_history", []),
             summary=data.get("summary", ""),
+            executed_tasks=data.get("executed_tasks", []),
         )
 
     async def save(self, session: GroupSession) -> None:

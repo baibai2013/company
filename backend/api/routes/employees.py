@@ -169,6 +169,7 @@ async def dispatch_to_employee(key: str, payload: dict = Body(...)) -> dict:
     from_employee = payload.get("from_employee", "")
     context_files = payload.get("context_files") or []
     chat_id = payload.get("chat_id", "")
+    trigger_message_id = payload.get("trigger_message_id", "")
 
     task_id = uuid.uuid4().hex[:12]
     # 给 task 加上来源标记，让目标员工知道是委托来的
@@ -194,6 +195,7 @@ async def dispatch_to_employee(key: str, payload: dict = Body(...)) -> dict:
                 "task_id": f"delegate_{task_id}",
                 "chat_id": chat_id,
                 "from_employee": from_employee,
+                "trigger_message_id": trigger_message_id,
             },
         },
     }

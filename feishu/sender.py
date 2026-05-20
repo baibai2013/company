@@ -10,6 +10,8 @@ from pathlib import Path
 
 import lark_oapi as lark
 from lark_oapi.api.im.v1 import (
+    CreateFileRequest,
+    CreateFileRequestBody,
     CreateImageRequest,
     CreateImageRequestBody,
     CreateMessageReactionRequest,
@@ -17,6 +19,7 @@ from lark_oapi.api.im.v1 import (
     CreateMessageRequest,
     CreateMessageRequestBody,
     Emoji,
+    GetMessageRequest,
     GetMessageResourceRequest,
     ListMessageRequest,
     PatchMessageRequest,
@@ -28,14 +31,21 @@ from lark_oapi.api.im.v1 import (
 log = logging.getLogger("feishu.sender")
 
 def make_client() -> lark.Client:
-    # 优先从 pydantic settings 读取（已从 infra/.env 加载），fallback 到 os.getenv
-    try:
-        from backend.core.config import settings as _s
-        app_id = _s.FEISHU_APP_ID or os.getenv("FEISHU_APP_ID", "")
-        app_secret = _s.FEISHU_APP_SECRET or os.getenv("FEISHU_APP_SECRET", "")
-    except Exception:
-        app_id = os.getenv("FEISHU_APP_ID", "")
-        app_secret = os.getenv("FEISHU_APP_SECRET", "")
+    # 优先级:EMPLOYEE_FEISHU_APP_ID(cc 子进程内员工凭证) > pydantic settings > FEISHU_APP_ID env
+    # 这样在 cc_executor 启动的 claude 子进程里调用,会自动用对应员工的 bot 凭证
+    # (员工 bot 才是真在群里的成员,默认 bot 可能不在群 → 230002 Bot can NOT be out of chat)
+    emp_app_id = os.getenv("EMPLOYEE_FEISHU_APP_ID", "")
+    emp_app_secret = os.getenv("EMPLOYEE_FEISHU_APP_SECRET", "")
+    if emp_app_id and emp_app_secret:
+        app_id, app_secret = emp_app_id, emp_app_secret
+    else:
+        try:
+            from backend.core.config import settings as _s
+            app_id = _s.FEISHU_APP_ID or os.getenv("FEISHU_APP_ID", "")
+            app_secret = _s.FEISHU_APP_SECRET or os.getenv("FEISHU_APP_SECRET", "")
+        except Exception:
+            app_id = os.getenv("FEISHU_APP_ID", "")
+            app_secret = os.getenv("FEISHU_APP_SECRET", "")
     return (
         lark.Client.builder()
         .app_id(app_id)
@@ -321,9 +331,22 @@ def send_rich_card(client: lark.Client, chat_id: str, title: str, content: str, 
         log.error("send_rich_card failed: %s %s", resp.code, resp.msg)
 
 
-def upload_image(client: lark.Client, image_path: str) -> str | None:
+# 飞书 image API 上限 10 MB(实测 234006 The file size exceed the max value)
+_IMAGE_MAX_BYTES = 10 * 1024 * 1024
+
+
+def upload_image(client: lark.Client, image_path: str) -> tuple[str | None, str]:
+    """上传图片到飞书,返回 (image_key, error_msg)。失败时 image_key=None,error_msg 含原因。"""
+    p = Path(image_path)
+    if not p.is_file():
+        return None, f"文件不存在: {image_path}"
+    size = p.stat().st_size
+    if size <= 0:
+        return None, f"文件为空: {image_path}"
+    if size > _IMAGE_MAX_BYTES:
+        return None, f"图片超过 10MB 上限 ({size/1024/1024:.1f}MB),飞书拒收。请压缩或缩放后重发"
     try:
-        with open(image_path, "rb") as f:
+        with open(p, "rb") as f:
             body = (
                 CreateImageRequestBody.builder()
                 .image_type("message")
@@ -333,18 +356,23 @@ def upload_image(client: lark.Client, image_path: str) -> str | None:
             req = CreateImageRequest.builder().request_body(body).build()
             resp = client.im.v1.image.create(req)
         if not resp.success():
-            log.error("upload_image failed: %s %s", resp.code, resp.msg)
-            return None
-        return resp.data.image_key
+            err = f"飞书 upload_image 失败: code={resp.code} msg={resp.msg}"
+            log.error(err)
+            return None, err
+        return resp.data.image_key, ""
     except Exception as exc:
-        log.error("upload_image error: %s", exc)
-        return None
+        err = f"upload_image 异常: {exc}"
+        log.error(err)
+        return None, err
 
 
-def send_image_file(client: lark.Client, chat_id: str, image_path: str) -> None:
-    image_key = upload_image(client, image_path)
+def send_image_file(client: lark.Client, chat_id: str, image_path: str) -> tuple[bool, str]:
+    """发图到飞书。返回 (是否成功, 错误原因)。
+    重要:旧版返回 None 静默吞错,导致 MCP 工具撒谎说成功。改成显式 bool + error_msg。
+    """
+    image_key, err = upload_image(client, image_path)
     if not image_key:
-        return
+        return False, err
     body = (
         CreateMessageRequestBody.builder()
         .receive_id(chat_id)
@@ -360,7 +388,10 @@ def send_image_file(client: lark.Client, chat_id: str, image_path: str) -> None:
     )
     resp = client.im.v1.message.create(req)
     if not resp.success():
-        log.error("send_image failed: %s %s", resp.code, resp.msg)
+        err = f"send_image 发消息失败: code={resp.code} msg={resp.msg}"
+        log.error(err)
+        return False, err
+    return True, ""
 
 
 def add_reaction(client: lark.Client, message_id: str, emoji_type: str = "THUMBSUP") -> None:
@@ -419,8 +450,58 @@ def reply_message(client: lark.Client, message_id: str, text: str) -> None:
         log.error("reply_message failed: %s %s", resp.code, resp.msg)
 
 
+def _extract_card_text(card_json: str) -> str:
+    """从飞书 v2 interactive 卡片 body.elements 里提取所有 markdown / plain_text 内容。
+    员工回复都是 interactive 卡片,fetch_recent_text 必须把这些也算进历史。
+    """
+    try:
+        card = json.loads(card_json) if isinstance(card_json, str) else card_json
+        if not isinstance(card, dict):
+            return ""
+        # 标题
+        title = ""
+        try:
+            t = card.get("header", {}).get("title", {})
+            title = t.get("content") or ""
+        except Exception:
+            pass
+        # body.elements
+        parts = []
+        if title:
+            parts.append(f"[{title}]")
+        elements = (card.get("body", {}) or {}).get("elements", []) or []
+        for el in elements:
+            if not isinstance(el, dict):
+                continue
+            tag = el.get("tag", "")
+            if tag == "markdown":
+                txt = (el.get("content", "") or "").strip()
+                if txt:
+                    parts.append(txt)
+            elif tag == "code_block":
+                txt = (el.get("text", "") or "").strip()
+                if txt:
+                    parts.append(f"```\n{txt}\n```")
+            elif tag == "table":
+                # 表格简化成"列名: 列值"
+                cols = el.get("columns", []) or []
+                rows = el.get("rows", []) or []
+                col_map = {c.get("name", ""): c.get("display_name", "") for c in cols}
+                for row in rows[:5]:  # 最多 5 行,避免历史太长
+                    cells = [f"{col_map.get(k, k)}: {v}" for k, v in row.items()]
+                    parts.append(" | ".join(cells))
+        joined = "\n".join(p for p in parts if p)
+        # 限长,单条卡片最多 800 字
+        return joined[:800]
+    except Exception:
+        return ""
+
+
 def fetch_recent_text(client: lark.Client, chat_id: str, limit: int = 20, within_secs: int = 3600) -> str:
-    """返回群聊近 within_secs 秒内最多 limit 条文字消息，格式化为历史字符串供 AI 参考。"""
+    """返回群聊近 within_secs 秒内最多 limit 条消息(text + interactive 卡片),格式化历史字符串。
+
+    重要: 员工的回复都是 interactive 卡片,必须包括,不然员工看不到"刚才同事说了什么"。
+    """
     import time
     try:
         req = (
@@ -440,14 +521,27 @@ def fetch_recent_text(client: lark.Client, chat_id: str, limit: int = 20, within
             if int(getattr(msg, "create_time", 0) or 0) < cutoff:
                 continue
             msg_type = getattr(msg, "msg_type", None) or getattr(msg, "message_type", None)
-            if msg_type != "text":
+            if msg_type not in ("text", "interactive", "post"):
                 continue
-            try:
-                text = json.loads(msg.body.content).get("text", "").strip()
-                text = re.sub(r'<at[^>]*>[^<]*</at>', '', text)
-                text = re.sub(r'@\S+', '', text).strip()
-            except Exception:
-                continue
+            content_raw = (getattr(msg, "body", None) and msg.body.content) or ""
+            text = ""
+            if msg_type == "text":
+                try:
+                    text = json.loads(content_raw).get("text", "").strip()
+                    text = re.sub(r'<at[^>]*>[^<]*</at>', '', text)
+                    text = re.sub(r'@\S+', '', text).strip()
+                except Exception:
+                    continue
+            elif msg_type == "interactive":
+                text = _extract_card_text(content_raw)
+            elif msg_type == "post":
+                try:
+                    pb = json.loads(content_raw)
+                    lang = pb.get("zh_cn") or pb.get("en_us") or pb
+                    blocks = [b for row in lang.get("content", []) for b in row]
+                    text = " ".join(b.get("text", "") for b in blocks if b.get("tag") == "text").strip()
+                except Exception:
+                    continue
             if not text:
                 continue
             sender_type = getattr(getattr(msg, "sender", None), "sender_type", "")
@@ -519,6 +613,134 @@ def download_image(client: lark.Client, message_id: str, image_key: str) -> tupl
     data = resp.file.read()
     media_type = "image/png" if data[:4] == b"\x89PNG" else "image/jpeg"
     return base64.b64encode(data).decode(), media_type
+
+
+# ── 文件上传 / 下载(file 消息类型,区别于 image) ─────────────────────────────
+
+# 飞书文件类型映射:扩展名 → file_type 字段(影响下载侧文件名/图标)
+# 飞书 file_type 取值: stream / opus / mp4 / pdf / doc / xls / ppt
+_FILE_TYPE_BY_EXT = {
+    ".pdf": "pdf",
+    ".doc": "doc", ".docx": "doc",
+    ".xls": "xls", ".xlsx": "xls", ".csv": "xls",
+    ".ppt": "ppt", ".pptx": "ppt",
+    ".mp4": "mp4", ".mov": "mp4",
+    ".opus": "opus",
+}
+# 飞书单 file 消息上限 30 MB(文档限制),超了直接报错而不是浪费一次上传
+_FILE_MAX_BYTES = 30 * 1024 * 1024
+
+
+def upload_file(client: lark.Client, file_path: str) -> str | None:
+    """把本地文件上传到飞书,返回 file_key(用于发 file 消息);失败返回 None。"""
+    p = Path(file_path)
+    if not p.is_file():
+        log.error("upload_file: 文件不存在 %s", file_path)
+        return None
+    size = p.stat().st_size
+    if size <= 0:
+        log.error("upload_file: 文件为空 %s", file_path)
+        return None
+    if size > _FILE_MAX_BYTES:
+        log.error("upload_file: 文件 %s 超过 30MB 上限 (%.1f MB)",
+                  p.name, size / 1024 / 1024)
+        return None
+    file_type = _FILE_TYPE_BY_EXT.get(p.suffix.lower(), "stream")
+    try:
+        with open(p, "rb") as f:
+            body = (
+                CreateFileRequestBody.builder()
+                .file_type(file_type)
+                .file_name(p.name)
+                .file(f)
+                .build()
+            )
+            req = CreateFileRequest.builder().request_body(body).build()
+            resp = client.im.v1.file.create(req)
+        if not resp.success() or not resp.data or not resp.data.file_key:
+            log.error("upload_file failed: code=%s msg=%s", resp.code, resp.msg)
+            return None
+        return resp.data.file_key
+    except Exception as exc:
+        log.error("upload_file error: %s", exc)
+        return None
+
+
+def send_file_msg(client: lark.Client, chat_id: str, file_path: str) -> bool:
+    """上传本地文件并以 file 消息发到群/单聊。返回是否成功。"""
+    file_key = upload_file(client, file_path)
+    if not file_key:
+        return False
+    body = (
+        CreateMessageRequestBody.builder()
+        .receive_id(chat_id)
+        .msg_type("file")
+        .content(json.dumps({"file_key": file_key}))
+        .build()
+    )
+    req = (
+        CreateMessageRequest.builder()
+        .receive_id_type("chat_id")
+        .request_body(body)
+        .build()
+    )
+    resp = client.im.v1.message.create(req)
+    if not resp.success():
+        log.error("send_file_msg failed: %s %s", resp.code, resp.msg)
+        return False
+    return True
+
+
+def get_message(client: lark.Client, message_id: str) -> dict | None:
+    """按 message_id 拉取一条飞书消息的完整 metadata + content。
+    返回 {"message_type":..., "body":{"content": json_str}, "message_id":...} 或 None。
+    用于"用户引用了某条历史消息"时,把被引用消息内容捞回来。
+    """
+    try:
+        req = GetMessageRequest.builder().message_id(message_id).build()
+        resp = client.im.v1.message.get(req)
+        if not resp.success() or not resp.data or not resp.data.items:
+            log.warning("get_message failed mid=%s code=%s msg=%s",
+                        message_id, getattr(resp, "code", None), getattr(resp, "msg", None))
+            return None
+        m = resp.data.items[0]
+        return {
+            "message_id": getattr(m, "message_id", ""),
+            "message_type": getattr(m, "msg_type", None) or getattr(m, "message_type", ""),
+            "body_content": (getattr(m, "body", None) and m.body.content) or "",
+        }
+    except Exception as exc:
+        log.warning("get_message error: %s", exc)
+        return None
+
+
+def download_file_resource(
+    client: lark.Client, message_id: str, file_key: str, save_path: str,
+) -> bool:
+    """下载飞书 file/image 资源到本地路径(覆盖)。返回是否成功。
+
+    用 GetMessageResourceRequest type='file' (image 走 download_image)。
+    """
+    p = Path(save_path)
+    p.parent.mkdir(parents=True, exist_ok=True)
+    req = (
+        GetMessageResourceRequest.builder()
+        .message_id(message_id)
+        .file_key(file_key)
+        .type("file")
+        .build()
+    )
+    try:
+        resp = client.im.v1.message_resource.get(req)
+        if not resp.success() or not resp.file:
+            log.error("download_file_resource failed: %s %s", resp.code, resp.msg)
+            return False
+        with open(p, "wb") as f:
+            f.write(resp.file.read())
+        return True
+    except Exception as exc:
+        log.error("download_file_resource error: %s", exc)
+        return False
 
 
 # ── 异步双卡片 helper（进度卡 patch 模式）────────────────────────────────────

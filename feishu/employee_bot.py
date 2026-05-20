@@ -46,9 +46,11 @@ from feishu.sender import (
     add_reaction,
     apatch_rich_card,
     areply_rich_card,
+    download_file_resource,
     download_image,
     fetch_recent_image,
     fetch_recent_text,
+    get_message,
     reply_message,
     reply_rich_card,
     send_card,
@@ -65,6 +67,11 @@ from group_chat.models import EMPLOYEE_CONFIG, ROLE_DESCRIPTIONS as _ROLE_DESCRI
 
 _processed: set[str] = set()
 
+# bot 启动时间(毫秒)。用于跳过启动前的历史消息——飞书 ws 重连会回放未 ack
+# 的消息,如果不过滤,bot 重启后会对历史消息再回一遍。
+import time as _bot_start_module
+_BOT_STARTED_MS = int(_bot_start_module.time() * 1000)
+
 # ── Redis client for group message forwarding (sync, used from WS thread) ─────
 _redis_client: redis.Redis | None = None
 
@@ -74,6 +81,85 @@ def _get_redis() -> redis.Redis:
     if _redis_client is None:
         _redis_client = redis.Redis.from_url("redis://localhost:6379/0", decode_responses=True)
     return _redis_client
+
+
+# ── 群聊历史记录(自维护,绕开飞书 v2 卡片 ListMessage 降级 bug)──
+# 飞书 ListMessage API 对 v2 卡片返回"请升级客户端"占位文本,拿不到员工真实回复内容。
+# 改方案: 员工每次完成回复时 LPUSH 一条 history,fetch 时从 redis list 取。
+# 用 list 而不是 zset:LPUSH+LTRIM 简单原子,LRANGE 取最新 N 条直接序排。
+_HISTORY_MAX_LEN = 100   # 单 chat 最多留 100 条历史
+_HISTORY_TTL = 7 * 86400 # 7 天 TTL,避免 redis 长期堆积
+
+
+def append_chat_history(chat_id: str, role: str, sender: str, content: str) -> None:
+    """记一条群聊历史到 redis。
+
+    role:    "user" | "employee" | "system"
+    sender:  显示名(用户=user,员工=员工 key 或 emoji+name)
+    content: 内容文本(超长截断到 1500)
+    """
+    if not chat_id or not content:
+        return
+    import json as _json
+    import time as _time
+    payload = _json.dumps({
+        "role": role,
+        "sender": sender[:50],
+        "content": content[:1500],
+        "ts": _time.time(),
+    }, ensure_ascii=False)
+    try:
+        r = _get_redis()
+        key = f"chat_msg_log:{chat_id}"
+        pipe = r.pipeline()
+        pipe.lpush(key, payload)
+        pipe.ltrim(key, 0, _HISTORY_MAX_LEN - 1)
+        pipe.expire(key, _HISTORY_TTL)
+        pipe.execute()
+    except Exception as exc:
+        log.warning("append_chat_history failed chat=%s: %s", chat_id, exc)
+
+
+def get_chat_history(chat_id: str, within_secs: int = 3600, limit: int = 30) -> str:
+    """从 redis 拉群聊历史,格式化成"角色: 内容"多行字符串。
+
+    返回时间正序(老 → 新),方便 LLM 读。
+    """
+    if not chat_id:
+        return ""
+    import json as _json
+    import time as _time
+    try:
+        r = _get_redis()
+        key = f"chat_msg_log:{chat_id}"
+        items = r.lrange(key, 0, _HISTORY_MAX_LEN - 1)  # 0 是最新
+        if not items:
+            return ""
+        cutoff = _time.time() - within_secs
+        lines = []
+        for raw in items:
+            try:
+                d = _json.loads(raw)
+                if d.get("ts", 0) < cutoff:
+                    continue
+                role = d.get("role", "?")
+                sender = d.get("sender", "")
+                content = d.get("content", "")
+                if role == "user":
+                    label = "用户"
+                elif role == "employee":
+                    label = f"员工[{sender}]"
+                else:
+                    label = role
+                lines.append(f"{label}: {content}")
+            except Exception:
+                continue
+        # lpush 的 list head 是最新,reverse 让老的在前
+        lines.reverse()
+        return "\n".join(lines[-limit:])
+    except Exception as exc:
+        log.warning("get_chat_history failed chat=%s: %s", chat_id, exc)
+        return ""
 
 
 def _publish_group_message(chat_id: str, message_id: str, text: str,
@@ -434,6 +520,142 @@ def _stringify_content(c) -> str:
     return str(c) if c is not None else ""
 
 
+# ── 文件下载 helper(file 消息 + text 引用 file 共用) ─────────────────────────
+
+_TEXT_FILE_EXTS = {
+    ".txt", ".md", ".json", ".yaml", ".yml", ".csv",
+    ".py", ".js", ".ts", ".tsx", ".jsx", ".go", ".rs",
+    ".java", ".kt", ".c", ".cpp", ".h", ".hpp",
+    ".sh", ".bash", ".zsh", ".sql", ".html", ".css",
+    ".xml", ".toml", ".ini", ".conf", ".log", ".dxf",
+}
+_IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".gif", ".webp", ".bmp"}
+_INLINE_BYTES_LIMIT = 16 * 1024
+
+
+def _describe_image(image_path: "Path") -> str:
+    """用 Haiku 4.5 vision 给图片生成中文描述,让 PM 走简化通道也能"看到"。
+    失败/超时返回空字符串,不阻塞主流程。
+
+    设计:
+    - 图片先压到 max 768px(JPEG 85),减少 base64 传输+vision 推理耗时
+    - 整体 30 秒硬超时,超时丢弃描述(返回空)
+    - 在子线程跑同步 invoke,主线程不被卡(但本函数仍同步等子线程结果)
+    """
+    import base64 as _b64
+    import io as _io
+    import threading as _th
+    from concurrent.futures import ThreadPoolExecutor as _Pool
+
+    def _do() -> str:
+        try:
+            from PIL import Image as _Image
+            from agents_v2.shared.claude_client import make_langchain_llm
+            from langchain_core.messages import HumanMessage, SystemMessage
+
+            # 压缩到 max 768px,vision 模型在小图上推理快得多
+            img = _Image.open(image_path).convert("RGB")
+            w, h = img.size
+            if max(w, h) > 768:
+                ratio = 768 / max(w, h)
+                img = img.resize((int(w * ratio), int(h * ratio)), _Image.LANCZOS)
+            buf = _io.BytesIO()
+            img.save(buf, format="JPEG", quality=85)
+            b64 = _b64.b64encode(buf.getvalue()).decode()
+
+            llm = make_langchain_llm("claude-haiku-4-5-20251001")
+            resp = llm.invoke([
+                SystemMessage("你看图片,用中文简述内容(150字内)。包含:看到什么、文字内容(若有)、关键细节、可能用途。"),
+                HumanMessage(content=[
+                    {"type": "text", "text": "请描述这张图片"},
+                    {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{b64}"}},
+                ]),
+            ])
+            return (resp.content or "").strip()
+        except Exception as exc:
+            log.warning("describe_image inner failed: %s", exc)
+            return ""
+
+    # 30 秒硬超时:LLM 偶发慢/卡住时不能阻死整条消息处理链
+    try:
+        with _Pool(max_workers=1) as pool:
+            fut = pool.submit(_do)
+            return fut.result(timeout=30)
+    except Exception as exc:
+        log.warning("describe_image timeout/error %s: %s", image_path.name, exc)
+        return ""
+
+
+def _ingest_uploaded_file(
+    client: lark.Client, source_message_id: str, chat_id: str, raw_content: str,
+) -> str:
+    """把一条 file 消息(自身或被引用的父消息)下载到 robot-dog/_inbox/...,
+    拼一段 text 描述返回(含路径 + 真实大小 + 文本类小文件 inline 内容)。
+
+    raw_content: 飞书 file 消息的 content JSON 字符串,含 file_key / file_name / file_size。
+    返回:成功 → 完整 text 段;失败 → 空字符串(调用方需自己兜底)。
+    """
+    from pathlib import Path as _Path
+
+    try:
+        meta = json.loads(raw_content)
+        file_key = meta.get("file_key", "")
+        file_name = meta.get("file_name", "") or "unnamed"
+        file_size_meta = meta.get("file_size", 0)
+    except Exception as exc:
+        log.warning("ingest: parse file meta failed: %s", exc)
+        return ""
+
+    if not file_key:
+        log.warning("ingest: file message without file_key")
+        return ""
+
+    inbox_root = _Path("/Users/liyijiang/work/robot-dog/_inbox")
+    chat_short = (chat_id or "")[-8:]
+    mid_short = (source_message_id or "")[-8:]
+    save_dir = inbox_root / chat_short / mid_short
+    save_path = save_dir / file_name
+
+    if not save_path.exists():
+        ok = download_file_resource(client, source_message_id, file_key, str(save_path))
+        if not ok:
+            log.warning("ingest: download_file_resource failed key=%s", file_key)
+            return ""
+
+    try:
+        real_size = save_path.stat().st_size
+    except Exception:
+        real_size = file_size_meta
+    log.info("ingest: file ready %s (%d bytes) → %s", file_name, real_size, save_path)
+
+    # 文本类小文件 inline 内容到 prompt;图片/二进制只给路径,
+    # 让员工走 cli 用 Read 工具自己看(claude code Read 工具支持图片,无需 vision 描述)
+    # (RFC feishu-cli-direct Phase 4: 删除 vision describe 同步阻塞,省 5s)
+    inline = ""
+    ext = save_path.suffix.lower()
+    if ext in _TEXT_FILE_EXTS and 0 < real_size <= _INLINE_BYTES_LIMIT * 4:
+        try:
+            raw = save_path.read_bytes()
+            txt = raw.decode("utf-8", errors="replace")
+            if len(txt.encode("utf-8")) > _INLINE_BYTES_LIMIT:
+                txt = txt[: _INLINE_BYTES_LIMIT // 2] + \
+                      "\n\n…（文件过长,仅显示前部分,完整内容请用 Read 工具读绝对路径）"
+            inline = f"\n\n【文件内容】\n```\n{txt}\n```"
+        except Exception as exc:
+            log.warning("ingest: inline read failed: %s", exc)
+    elif ext in _IMAGE_EXTS:
+        # 图片不再调 vision 描述(同步 LLM 5s 阻塞 ws 心跳),
+        # 路径已在 text 里,员工走 cli 时用 Read 工具直接读图(支持多模态)
+        inline = "\n\n【这是一张图片,请用 Read 工具读取上面的绝对路径直接看图】"
+
+    return (
+        f"【附带文件】{file_name} (大小 {real_size} bytes)\n"
+        f"已落盘到绝对路径: {save_path}\n"
+        f"如果内容已在下方,可以直接看;否则让对应员工用 Read 工具读绝对路径。"
+        f"{inline}"
+    )
+
+
 async def _handle(employee: str, task: str, chat_id: str, client: lark.Client,
                   image_base64: str = "", image_media_type: str = "image/jpeg",
                   message_id: str = "", chat_type: str = "p2p") -> None:
@@ -441,7 +663,7 @@ async def _handle(employee: str, task: str, chat_id: str, client: lark.Client,
 
     # 在原消息上贴表情表示收到
     if message_id:
-        add_reaction(client, message_id, "OK")
+        add_reaction(client, message_id, "Get")
 
     def _send_card_sync(title: str, content: str, color: str = "blue") -> None:
         """旧式单卡（CC 链路 / fallback 用）。"""
@@ -450,23 +672,28 @@ async def _handle(employee: str, task: str, chat_id: str, client: lark.Client,
         else:
             send_rich_card(client, chat_id, title, content, color)
 
-    # 大群：拉近期聊天记录注入上下文，让 agent 了解来龙去脉
+    # 大群:拉近期聊天记录注入上下文,让 agent 了解来龙去脉。
+    # 优先用 redis 自维护的 chat_msg_log(含员工真实回复),
+    # fallback 飞书 ListMessage(只能拿 user 消息,interactive 卡片是降级视图)。
     if chat_type == "group":
-        history = fetch_recent_text(client, chat_id, limit=20, within_secs=3600)
+        history = get_chat_history(chat_id, within_secs=3600, limit=30)
+        if not history:
+            history = fetch_recent_text(client, chat_id, limit=20, within_secs=3600)
         task_with_ctx = (
-            f"【近期群聊记录（供参考，理解上下文）】\n{history}\n\n【当前消息】{task}"
+            f"【近期群聊记录(供参考,理解上下文)】\n{history}\n\n【当前消息】{task}"
             if history else task
         )
     else:
         task_with_ctx = task
 
-    # P2P 单聊：用 chat_id 做 thread，同一对话共享 LangGraph 历史
-    # 群聊：每条消息独立 thread，避免历史累积超长
+    # P2P 单聊 / 群聊单 @ 都用 chat_id 做 thread,跨消息池化命中,
+    # claude session --resume 自然累积上下文(RFC feishu-cli-direct Phase 1)。
+    # 旧版群聊用 message_id 让每条消息独立 thread,导致每条都冷启,体验差。
     if chat_type == "p2p":
         thread_id = f"feishu_p2p_{chat_id}"
         source = "feishu_p2p"
     else:
-        thread_id = message_id or f"{chat_id}_{id(task)}"
+        thread_id = f"feishu_chat_{chat_id}"
         source = "feishu_group"
 
     # ── 进度卡（cc_bridge 风格：累积步骤流）──
@@ -583,7 +810,8 @@ async def _handle(employee: str, task: str, chat_id: str, client: lark.Client,
     try:
         data = await handle_dispatch(employee, task_with_ctx, task_id=thread_id, chat_id=chat_id,
                                      image_base64=image_base64, image_media_type=image_media_type,
-                                     session_config={"source": source})
+                                     session_config={"source": source},
+                                     trigger_message_id=message_id)
     except Exception as exc:
         stop_evt.set()
         listener.cancel()
@@ -608,11 +836,26 @@ async def _handle(employee: str, task: str, chat_id: str, client: lark.Client,
     # cc 全员启用：任何员工回复后，data["cc"] 里有专家就展开补充意见
     cc = data.get("cc", []) or []
 
-    # ── 结果卡 ──
-    if route == "CHAT":
+    # ── 结果卡 / 短回复 ──
+    # CHAT 路由 + 内容 ≤ 120 字 → 用 reply_message 纯文本短气泡(轻量),
+    # 不发大卡片。WORK 任务 / CHAT 长回复 → 走原 _send_card_sync 卡片。
+    short_chat = (route == "CHAT" and len(result) <= 120)
+    if short_chat and message_id:
+        try:
+            reply_message(client, message_id, f"{emoji} {result.strip()}")
+        except Exception as exc:
+            log.warning("short text reply failed, fallback to card: %s", exc)
+            _send_card_sync(f"{emoji} {name} 回复", result[:2000], "blue")
+    elif route == "CHAT":
         _send_card_sync(f"{emoji} {name} 回复", result[:2000], "blue")
     else:
         _send_card_sync(f"{emoji} {name} · 完成", result[:2000], "blue")
+
+    # 记本员工回复到群聊历史(让其他员工/自己下次问"刚才你说了啥"能看到)
+    try:
+        append_chat_history(chat_id, "employee", f"{emoji} {name}", result)
+    except Exception as _exc:
+        log.debug("history log emp-reply failed: %s", _exc)
 
     # CC：依次让专家补充专业意见（PM 单聊 / 项目经理头脑风暴）
     if cc:
@@ -647,12 +890,25 @@ def make_on_message(employee: str, client: lark.Client, bot_open_id: str):
 
     def on_message(data: P2ImMessageReceiveV1) -> None:
         msg = data.event.message if data.event else None
-        log.info("RAW employee=%s type=%s chat_type=%s event=%s",
+        log.info("RAW employee=%s type=%s chat_type=%s parent_id=%r root_id=%r event=%s",
                  employee,
                  getattr(msg, "message_type", None),
                  getattr(msg, "chat_type", None),
+                 getattr(msg, "parent_id", None),
+                 getattr(msg, "root_id", None),
                  data.event is not None)
         if not msg or msg.chat_type not in ("group", "p2p"):
+            return
+
+        # 跳过启动前的历史消息(防止 ws 重连回放导致 bot 重启后对旧消息重答一遍)
+        # 给 5s 容差,避免边界毛刺
+        try:
+            ct = int(getattr(msg, "create_time", 0) or 0)
+        except Exception:
+            ct = 0
+        if ct and ct < _BOT_STARTED_MS - 5000:
+            log.info("skip stale msg mid=%s create_time=%d (bot_started=%d, gap=%ds)",
+                     msg.message_id, ct, _BOT_STARTED_MS, (_BOT_STARTED_MS - ct) // 1000)
             return
 
         mid = msg.message_id or ""
@@ -662,7 +918,7 @@ def make_on_message(employee: str, client: lark.Client, bot_open_id: str):
         if len(_processed) > 2000:
             _processed.clear()
 
-        if msg.message_type not in ("text", "image", "post"):
+        if msg.message_type not in ("text", "image", "post", "file"):
             return
 
         raw_content = msg.content or ""
@@ -717,6 +973,20 @@ def make_on_message(employee: str, client: lark.Client, bot_open_id: str):
             except Exception as exc:
                 log.warning("parse post failed: %s", exc)
 
+        elif msg.message_type == "file":
+            # 用户直接上传文件 → 下载到 _inbox + inline 文本内容
+            # 路由 + 去重:file 消息一般无 mentions → 上面 group 路由检查让只有
+            # PM(is_default=True) bot 进到这里,所以不会重复下载。
+            ingested = _ingest_uploaded_file(client, msg.message_id, msg.chat_id, raw_content)
+            if not ingested:
+                send_text(client, msg.chat_id, f"❌ 文件下载失败,请重发或联系管理员")
+                return
+            # 强制 [@project_manager] 让 orchestrator 路由对人(否则常被派给 sysadmin)
+            text = (
+                "[@project_manager] 用户上传了一个新文件,请芳芳判断如何处理。\n\n"
+                f"{ingested}"
+            )
+
         else:  # text
             try:
                 text = json.loads(raw_content).get("text", "")
@@ -728,28 +998,78 @@ def make_on_message(employee: str, client: lark.Client, bot_open_id: str):
             if has_at_all:
                 text = f"[全员] {text}" if text else "[全员]"
             else:
-                # 从 msg.mentions 取显示名，映射到员工 key，注入 [@key] 前缀
-                # 飞书 text 字段里的 @_user_1 是内部占位 ID，不可靠，要用 mentions 数组
+                # 从 msg.mentions 映射员工 key，注入 [@key] 前缀给 orchestrator 看。
+                # 优先用 open_id(精确稳定),fallback 显示名(兼容历史)。
+                # 飞书 text 字段里的 @_user_1 是内部占位 ID,不可靠。
                 _NAME_TO_EMP = {
                     "项目经理芳芳": "project_manager", "芳芳": "project_manager",
-                    "Dave": "mechanical",
-                    "大法师": "hardware",
-                    "小布丁": "firmware",
-                    "喵喵球": "algorithm",
-                    "狐妖": "testing",
-                    "兔子精": "cost",
-                    "小米": "product_manager",
-                    "胖虎": "tech_lead",
+                    "机械师dave": "mechanical", "Dave": "mechanical",
+                    "硬件大法师": "hardware", "大法师": "hardware",
+                    "固件小布丁": "firmware", "小布丁": "firmware",
+                    "算法喵喵球": "algorithm", "喵喵球": "algorithm",
+                    "测试狐妖": "testing", "狐妖": "testing",
+                    "成本兔子精": "cost", "兔子精": "cost",
+                    "产品小米": "product_manager", "小米": "product_manager",
+                    "技术胖虎": "tech_lead", "胖虎": "tech_lead",
+                    "电脑管理员零": "sysadmin", "电脑管家零": "sysadmin", "零": "sysadmin",
+                }
+                _OPEN_ID_TO_EMP = {
+                    "ou_cbda0e035efddd928884cfa249b2aaf1": "mechanical",
+                    "ou_e485fa3ae980258606173d58c2a3267d": "hardware",
+                    "ou_1c9800f0c05d462120b2debd6483ed04": "firmware",
+                    "ou_4b7825f99046236994661a5f1cef3c2f": "algorithm",
+                    "ou_6ef761e9fc380ff07833189492094b0f": "cost",
+                    "ou_830593006fc2a764f180ab08fe61d712": "testing",
+                    "ou_f3616bb1e25a3529b32a37c96e9933d4": "product_manager",
+                    "ou_c4cb6e0e53fb05010437c07d5f1109b3": "project_manager",
+                    "ou_ba1ca54d49cef0f56819856b37f60ff0": "tech_lead",
+                    "ou_4c02bb278b833ed4d43f0e3c545a4d53": "sysadmin",
                 }
                 mention_keys = []
                 for m in (msg.mentions or []):
+                    open_id = getattr(getattr(m, "id", None), "open_id", "") or ""
                     display = getattr(m, "name", None) or getattr(getattr(m, "id", None), "name", None) or ""
-                    emp_key = _NAME_TO_EMP.get(display)
+                    emp_key = _OPEN_ID_TO_EMP.get(open_id) or _NAME_TO_EMP.get(display)
                     if emp_key:
                         mention_keys.append(emp_key)
                 if mention_keys:
                     tags = " ".join(f"[@{k}]" for k in mention_keys)
                     text = f"{tags} {text}".strip()
+            # 引用消息:用户在飞书"引用"了一条历史消息再发文字。
+            # 飞书引用可能填 parent_id 或 root_id(thread/reply 不同),两个都查。
+            # 父消息可能是 file 或 image,都尝试 ingest。
+            quote_id = (getattr(msg, "parent_id", None) or
+                        getattr(msg, "root_id", None) or "")
+            if quote_id:
+                quoted = get_message(client, quote_id)
+                qtype = quoted.get("message_type") if quoted else None
+                qbody = quoted.get("body_content") if quoted else ""
+                log.info("text msg has quote_id=%s, parent_type=%s body_len=%d",
+                         quote_id, qtype, len(qbody))
+                if quoted and qtype in ("file", "image") and qbody:
+                    if qtype == "image":
+                        # image 类型的"引用"——构造一个 file-like meta 直接复用 ingest
+                        # 飞书 image 消息 body 是 {"image_key": "..."},没 file_name,
+                        # 自己拼一个并把 image_key 当作 file_key
+                        try:
+                            img_meta = json.loads(qbody)
+                            fake_meta = json.dumps({
+                                "file_key": img_meta.get("image_key", ""),
+                                "file_name": f"quoted_image_{quote_id[-8:]}.jpg",
+                                "file_size": 0,
+                            }, ensure_ascii=False)
+                            ingested = _ingest_uploaded_file(
+                                client, quote_id, msg.chat_id, fake_meta,
+                            )
+                        except Exception as exc:
+                            log.warning("quote image fake_meta failed: %s", exc)
+                            ingested = ""
+                    else:
+                        ingested = _ingest_uploaded_file(
+                            client, quote_id, msg.chat_id, qbody,
+                        )
+                    if ingested:
+                        text = f"{text}\n\n{ingested}".strip()
             # 群里文字消息：查最近 2 分钟是否有图片
             if msg.chat_type == "group" and not image_base64:
                 image_base64, image_media_type = fetch_recent_image(client, msg.chat_id)
@@ -761,17 +1081,44 @@ def make_on_message(employee: str, client: lark.Client, bot_open_id: str):
         log.info("employee=%s chat_type=%s text=%.60s image=%s",
                  employee, msg.chat_type, text, bool(image_base64))
 
-        # 大群消息：转发到 EventBus，由 GroupOrchestrator 统一调度，不再本地处理
-        if msg.chat_type == "group":
-            _publish_group_message(
-                chat_id, mid, text,
-                image_base64=image_base64,
-                mentions=[getattr(getattr(m, "id", None), "open_id", "")
-                          for m in (msg.mentions or [])],
-            )
-            return
+        # 记一条用户消息到 redis 群聊历史(SETNX 跨 9 个 bot 去重,避免每个 bot 都 append)
+        try:
+            r = _get_redis()
+            dedup_key = f"history_logged:{mid}"
+            if r.set(dedup_key, "1", nx=True, ex=300):
+                hist_text = text or ("[用户上传了文件]" if image_base64 else "")
+                if hist_text:
+                    append_chat_history(chat_id, "user", "user", hist_text)
+        except Exception as _exc:
+            log.debug("history log user-msg failed: %s", _exc)
 
-        # 单聊消息：保持原有逻辑不变
+        # ── 群聊路由(RFC feishu-cli-direct Phase 1)──
+        # 单 @ 员工(包含精确 @ 我 / 无 @ PM 兜底) → 直接走 _handle(cli 通道,有工具),
+        # 不再绕 orchestrator → group_listener Haiku。延迟 ↓ 70%,有工具,跨消息记忆。
+        # @所有人 / @全员 / 接龙关键词 → 仍 publish 给 orchestrator,走多人编排路径。
+        if msg.chat_type == "group":
+            mentions_raw = msg.mentions or []
+            is_all = _is_all_mention(mentions_raw, raw_content)
+            # 接龙关键词:让 sequential 路径接管,不让 PM 一个人代笔
+            is_relay = any(kw in (text or "") for kw in
+                           ("接龙", "接力", "轮流", "依次", "按顺序发言", "排队发言"))
+            # 共享文档并发编辑:全员 fanout 走 concurrent_doc_edit scenario
+            is_concurrent_doc = any(kw in (text or "") for kw in
+                                    ("共享文档", "共编", "同写", "共同编辑",
+                                     "协同编辑", "并发编辑", "同时编辑"))
+            if is_all or is_relay or is_concurrent_doc:
+                # 多人协调路径 → orchestrator(原行为)
+                _publish_group_message(
+                    chat_id, mid, text,
+                    image_base64=image_base64,
+                    mentions=[getattr(getattr(m, "id", None), "open_id", "")
+                              for m in mentions_raw],
+                )
+                return
+            # 单 @ 我 / PM 兜底 → 走 direct cli
+            # (走到这里的 bot 一定是该响应的: 精确 @ 我 / 无 @ + is_default)
+
+        # 单聊 + 群聊单 @ 都走 _handle(cli 通道)
         threading.Thread(
             target=_run_async,
             args=(_handle(employee, text, chat_id, client,
@@ -900,27 +1247,98 @@ def _start_group_listener(employee: str, client: lark.Client, app_id: str = "", 
             log.info("group_listener(%s): received speak_req session=%s summary=%s",
                      employee, session_id, summary_mode)
 
-            # Fast Haiku channel for group speak
+            # speak_req 走 cli (RFC feishu-cli-direct Phase 2)
+            # 让员工有完整工具能力(Read/Write/Bash/vision),跟单 @ 路径一致。
+            # cli 失败时 fallback 到 langchain Haiku 当 break-glass。
+            content = ""
             try:
-                llm = make_langchain_llm("claude-haiku-4-5-20251001")
+                # 拉群聊历史:优先 redis 自维护,fallback 飞书 list
+                recent = ""
+                if not summary_mode and chat_id:
+                    try:
+                        recent = await asyncio.to_thread(
+                            get_chat_history, chat_id, 3600, 30,
+                        )
+                        if not recent:
+                            recent = await asyncio.to_thread(
+                                fetch_recent_text, client, chat_id, 30, 3600,
+                            )
+                    except Exception as exc:
+                        log.warning("group_listener(%s) chat_history failed: %s",
+                                    employee, exc)
 
                 if summary_mode:
-                    # Use the full role_context (SUMMARY_PROMPT with format rules)
-                    system = role_context if role_context else f"你是{emoji} {name}，请根据讨论内容做简短总结，200字以内。"
+                    cli_prompt = (
+                        f"{role_context if role_context else '请根据讨论内容做简短总结,200字以内,不调工具。'}\n\n"
+                        f"【会议历史】\n{history_text}"
+                    )
                 else:
                     persona = get_persona_prompt(employee)
-                    system = (
+                    history_block = (
+                        f"【近期群聊记录(供你理解上下文)】\n{recent}\n\n"
+                        if recent else ""
+                    )
+                    cli_prompt = (
                         f"{persona}\n\n"
                         f"{GROUP_SPEAK_PREFIX}\n\n"
-                        f"{role_context}"
+                        f"{role_context}\n\n"
+                        f"{history_block}"
+                        f"【当前对话片段】\n{history_text}\n\n"
+                        f"请根据角色发言。可以用 Read 工具读取群里上传的文件(如 /Users/liyijiang/work/robot-dog/_inbox/...),"
+                        f"或 Bash 查看仓库现状。1-3 段话即可,别过长。"
                     )
 
-                human = history_text
-                resp = await llm.ainvoke([
-                    SystemMessage(system),
-                    HumanMessage(human),
-                ])
-                content = resp.content[:2000]
+                # 走 cc_executor cli 通道(走池化,跨消息复用进程)
+                from agents_v2.shared.cc_executor import run_cc_node, CCExecutorFailed
+                from backend.services import registry as _registry
+                cfg = _registry.get_effective_sync(employee)
+                if not cfg:
+                    raise RuntimeError(f"employee {employee} 未注册")
+
+                # summary 模式用 sonnet+low(只是收尾摘要,不需要 opus 思考),
+                # 普通发言用 opus+high(走池化跨消息复用 PM 子进程)
+                if summary_mode:
+                    cli_model, cli_effort = "claude-sonnet-4-6", "low"
+                else:
+                    cli_model, cli_effort = "claude-opus-4-7", "high"
+
+                content, _new_sid, _ = await run_cc_node(
+                    employee_key=employee,
+                    query=cli_prompt,
+                    cwd=cfg.cwd,
+                    chat_id=chat_id,            # oc_xxx → 池化 key feishu_chat:{emp}:{chat_id}
+                    thread_id=f"feishu_chat_{chat_id}",
+                    feishu_app_id=cfg.feishu_app_id or "",
+                    feishu_app_secret=cfg.feishu_app_secret or "",
+                    agent_port=cfg.agent_port or "",
+                    model=cli_model, effort=cli_effort,
+                )
+                content = (content or "")[:2000]
+                log.info("group_listener(%s): cli speak_req done len=%d", employee, len(content))
+
+            except Exception as exc:
+                # cli 故障 → fallback 到 langchain Haiku
+                log.warning("group_listener(%s) cli failed: %s — fallback Haiku",
+                            employee, type(exc).__name__)
+                try:
+                    llm = make_langchain_llm("claude-haiku-4-5-20251001")
+                    if summary_mode:
+                        system = role_context or f"你是{emoji} {name},请根据讨论内容做简短总结,200字以内。"
+                    else:
+                        persona = get_persona_prompt(employee)
+                        system = f"{persona}\n\n{GROUP_SPEAK_PREFIX}\n\n{role_context}"
+                    human = (
+                        f"【近期群聊记录】\n{recent}\n\n【当前对话】\n{history_text}"
+                        if recent else history_text
+                    )
+                    resp = await llm.ainvoke([SystemMessage(system), HumanMessage(human)])
+                    content = (resp.content or "")[:2000]
+                except Exception as exc2:
+                    log.error("group_listener(%s) fallback Haiku also failed: %s",
+                              employee, exc2)
+                    content = f"❌ 暂时无法响应({type(exc).__name__})"
+
+            try:
 
                 # Reply to the trigger message thread
                 log.info("group_listener(%s): trigger_mid=%r content_len=%d",
@@ -932,6 +1350,11 @@ def _start_group_listener(employee: str, client: lark.Client, app_id: str = "", 
                         content, "blue",
                     )
                     log.info("group_listener(%s): reply_rich_card sent", employee)
+                    # 记到群聊历史:让下次 fetch 能看到自己/同事的发言
+                    try:
+                        append_chat_history(chat_id, "employee", f"{emoji} {name}", content)
+                    except Exception as _exc:
+                        log.debug("history log group_listener-reply failed: %s", _exc)
                 else:
                     log.warning("group_listener(%s): skipped reply — trigger_mid=%r content_len=%d",
                                 employee, trigger_message_id, len(content))

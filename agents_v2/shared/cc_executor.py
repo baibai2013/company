@@ -56,6 +56,7 @@ async def run_cc_node(
     callbacks: _Callbacks | None = None,
     model: str = "claude-opus-4-7",
     effort: str = "high",
+    trigger_message_id: str = "",
 ) -> tuple[str, str | None, list[str]]:
     """跑一次 claude code CLI 完成员工的 WORK 任务。
 
@@ -78,7 +79,7 @@ async def run_cc_node(
     """
     cb = callbacks or _Callbacks()
 
-    # 1) 构造 MCP config（每次内联生成，含 chat_id / thread_id / 凭证）
+    # 1) 构造 MCP config（每次内联生成，含 chat_id / thread_id / 凭证 / trigger）
     mcp_cfg = build_mcp_config(
         employee_key=employee_key,
         agent_port=agent_port,
@@ -86,14 +87,20 @@ async def run_cc_node(
         thread_id=thread_id,
         feishu_app_id=feishu_app_id,
         feishu_app_secret=feishu_app_secret,
+        trigger_message_id=trigger_message_id,
     )
     mcp_cli_arg = to_cli_arg(mcp_cfg)
 
-    # 2) 额外 CLI 参数：MCP 注入 + 自动接受写文件（员工后台跑不能卡 prompt）
+    # 2) 额外 CLI 参数：MCP 注入 + 后台自动放权
+    #
+    # permission-mode 选 bypassPermissions:员工是后台守护进程,不能卡在交互
+    # 授权弹窗。安全靠下面的 cmd_wrapper(sandbox-exec)物理限制 claude 子进程
+    # 只能写自己 cwd 内的文件,即使 bypass 也跳不出沙箱。这是 macOS native
+    # 沙箱,比 acceptEdits + allowedTools 白名单更可靠。
     extra_args = [
         "--mcp-config", mcp_cli_arg,
         "--strict-mcp-config",
-        "--permission-mode", "acceptEdits",
+        "--permission-mode", "bypassPermissions",
     ]
 
     # 3) cmd_wrapper：把 claude argv 套上 sandbox-exec
@@ -101,13 +108,27 @@ async def run_cc_node(
         return wrap_command(argv, cwd, employee_key=employee_key)
 
     # 4) 阶段 11：优先走热进程池（同 thread 5 分钟内复用），CLAUDE_POOL=off 时退回 spawn-per-task
+    #
+    # 池化 key 选择(2026-05-21 RFC feishu-cli-direct Phase 1):
+    # - chat_id "task:..."  → "task_pool:{employee}"     同员工跨 task 复用
+    # - chat_id "oc_..."    → "feishu_chat:{employee}:{chat_id}"  同员工同群跨消息复用
+    # - chat_id "p2p_..."   → "feishu_p2p:{employee}:{chat_id}"   同员工同单聊跨消息复用
+    # - 其他(看板/测试)     → thread_id 原值
+    # 同员工同会话复用同进程 → claude session 自然累积上下文,跨消息记忆免做。
     pool = get_pool()
-    if pool.enabled and thread_id:
+    pool_thread = thread_id
+    if chat_id.startswith("task:"):
+        pool_thread = f"task_pool:{employee_key}"
+    elif chat_id.startswith("oc_"):
+        pool_thread = f"feishu_chat:{employee_key}:{chat_id}"
+    elif chat_id.startswith("p2p_") or chat_id.startswith("feishu_p2p_"):
+        pool_thread = f"feishu_p2p:{employee_key}:{chat_id}"
+    if pool.enabled and pool_thread:
         spawn_args = SpawnArgs(
             cwd=cwd, model=model, effort=effort,
             extra_cli_args=extra_args, cmd_wrapper=_wrap,
         )
-        pool_key = (employee_key, cwd, thread_id, model, effort)
+        pool_key = (employee_key, cwd, pool_thread, model, effort)
         runner_obj = None
         try:
             runner_obj = await pool.acquire(pool_key, spawn_args)

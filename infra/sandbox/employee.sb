@@ -50,6 +50,12 @@
 ;;   project_manager → ~/work/robot-dog/roadmap/ + system/
 ${DOMAIN_WRITES}
 
+;; ── 共享空间(2026-05-21): 所有员工都能写,跨员工协作用 ──
+;; ~/work/robot-dog/shared/ — 共享笔记/讨论/草稿/共识决策
+;; ~/work/robot-dog/_inbox/ — 用户上传的文件落地点(任何员工要读改)
+(allow file-write* (subpath "${HOME}/work/robot-dog/shared"))
+(allow file-write* (subpath "${HOME}/work/robot-dog/_inbox"))
+
 ;; macOS 回收站（员工删文件按"丢回收站"约定，不直接删）
 (allow file-write* (subpath "${HOME}/.Trash"))
 

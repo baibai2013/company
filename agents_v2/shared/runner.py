@@ -24,6 +24,10 @@ current_feishu_chat_id: ContextVar[str] = ContextVar("feishu_chat_id", default="
 # 当前对话的 LangGraph thread_id —— 供 recall_history 工具读取
 current_thread_id: ContextVar[str] = ContextVar("thread_id", default="")
 
+# 当前用户原消息 message_id —— 供员工 cli MCP 工具(reply_feishu_short / send_feishu_*)
+# 决定是否用 reply 而非 create。让员工的卡片/短回复挂在用户消息 thread 下。
+current_trigger_message_id: ContextVar[str] = ContextVar("trigger_message_id", default="")
+
 
 class SessionConfig(TypedDict, total=False):
     system_prompt: str          # 覆盖 employee 的全局 system_prompt
@@ -87,11 +91,12 @@ async def run_with_events(
     image_base64 = ctx.get("image_base64", "")
     image_media_type = ctx.get("image_media_type", "image/jpeg")
 
-    # 注入 ContextVar：chat_id / thread_id / session_config
+    # 注入 ContextVar：chat_id / thread_id / session_config / trigger_message_id
     _chat_token = current_feishu_chat_id.set(ctx.get("chat_id", ""))
     _thread = config.get("configurable", {}).get("thread_id", task_id)
     _thread_token = current_thread_id.set(_thread)
     _session_token = current_session_config.set(ctx.get("session_config", {}))  # type: ignore[arg-type]
+    _trigger_token = current_trigger_message_id.set(ctx.get("trigger_message_id", ""))
 
     # 压缩图片到 Claude 推荐的最大尺寸（避免超 token 限制）
     if image_base64:
@@ -266,6 +271,7 @@ async def run_with_events(
     current_session_config.reset(_session_token)
     current_feishu_chat_id.reset(_chat_token)
     current_thread_id.reset(_thread_token)
+    current_trigger_message_id.reset(_trigger_token)
     return result_data
 
 

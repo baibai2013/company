@@ -100,26 +100,190 @@ def list_scheduled_tasks() -> str:
 
 # ── 工具：消息发送 ────────────────────────────────────────────────────────────
 
-@mcp.tool()
-def send_feishu_message(content: str, title: str = "通知", feishu_chat_id: str = "") -> str:
-    """发送富文本卡片到飞书（单聊或群聊）。
-
-    feishu_chat_id: 目标 chat_id。定时任务触发时由环境提供；当前会话默认填空，
-    内部会回退到 EMPLOYEE_CHAT_ID env 或员工默认群。
+def _reply_or_send_card(title: str, content: str, color: str, feishu_chat_id: str) -> str:
+    """优先 reply 到 EMPLOYEE_TRIGGER_MESSAGE_ID(让员工卡片挂在用户消息 thread 下)。
+    没有 trigger 时回退到普通 send_card 创建新消息。
     """
+    trigger = os.environ.get("EMPLOYEE_TRIGGER_MESSAGE_ID", "") or ""
+    if trigger:
+        try:
+            from feishu.sender import make_client, reply_rich_card
+            reply_rich_card(make_client(), trigger, title, content, color)
+            return f"✅ 已回复({trigger[-8:]})"
+        except Exception as exc:
+            return f"❌ reply 失败: {exc}"
+    # fallback 普通发送
     if not feishu_chat_id:
         feishu_chat_id = os.environ.get("EMPLOYEE_CHAT_ID", "") or ""
     return _send_feishu_message.invoke({
-        "content": content,
-        "title": title,
-        "feishu_chat_id": feishu_chat_id,
+        "content": content, "title": title, "feishu_chat_id": feishu_chat_id,
     })
+
+
+@mcp.tool()
+def send_feishu_message(content: str, title: str = "通知", feishu_chat_id: str = "") -> str:
+    """发送富文本卡片到飞书(单聊或群聊)。
+
+    优先级:
+    - 如有 EMPLOYEE_TRIGGER_MESSAGE_ID env(用户原消息 id) → 用 reply 挂 thread 下
+    - 否则 → 普通 create 发到 chat_id
+
+    feishu_chat_id: 目标 chat_id。空则回退 EMPLOYEE_CHAT_ID env。
+    """
+    color_for_title = "blue"
+    return _reply_or_send_card(title, content, color_for_title, feishu_chat_id)
+
+
+@mcp.tool()
+def reply_feishu_short(content: str) -> str:
+    """给用户回一个**短气泡纯文本**(不发卡片),挂在原消息 thread 下。
+    适合"OK"、"收到"、"已完成"等极简反馈,不刷屏。
+
+    要求 EMPLOYEE_TRIGGER_MESSAGE_ID env 已注入(用户消息 id),
+    否则回退到 send_feishu_message 卡片。
+
+    content: 短文本(建议 ≤ 60 字)
+    """
+    trigger = os.environ.get("EMPLOYEE_TRIGGER_MESSAGE_ID", "") or ""
+    if not trigger:
+        # 没 trigger 走卡片兜底
+        return _reply_or_send_card("回复", content, "blue", "")
+    try:
+        from feishu.sender import make_client, reply_message
+        reply_message(make_client(), trigger, content[:300])
+        return f"✅ 短回复已发送({trigger[-8:]})"
+    except Exception as exc:
+        return f"❌ 短回复失败: {exc}"
+
+
+@mcp.tool()
+def react_emoji(emoji_type: str = "Get", message_id: str = "") -> str:
+    """给一条飞书消息贴一个表情反应(reaction),不发任何文字/卡片。
+
+    极致轻量反馈,适合:接龙签到完成、收到指令、确认理解、点赞同事发言等
+    "我看到了/做完了"场景。比 reply_feishu_short 还少噪音(不占新消息位)。
+
+    Args:
+        emoji_type: 飞书表情代码(大小写敏感)。常用:
+            Get(收到 - 小人举GET牌,默认)
+            OK / DONE / CheckMark / LGTM / OnIt / OneSecond / Yes
+            THUMBSUP / THANKS / SALUTE / HEART
+            完整 ~150 个清单见 飞书 API 文档
+        message_id: 目标消息 id。空则用 EMPLOYEE_TRIGGER_MESSAGE_ID env(用户原消息)
+
+    Returns:
+        '✅ 已贴 <emoji>' 或 '❌ 失败原因'
+    """
+    target = (message_id or "").strip() or \
+        os.environ.get("EMPLOYEE_TRIGGER_MESSAGE_ID", "") or ""
+    if not target:
+        return "❌ 没有目标 message_id(EMPLOYEE_TRIGGER_MESSAGE_ID env 未注入)"
+    try:
+        from feishu.sender import make_client, add_reaction
+        add_reaction(make_client(), target, emoji_type)
+        return f"✅ 已贴 [{emoji_type}] 到 {target[-8:]}"
+    except Exception as exc:
+        return f"❌ 贴 emoji 失败: {exc}"
 
 
 @mcp.tool()
 def send_group_chat_message(content: str) -> str:
     """发送消息到看板群聊（前端实时显示）。飞书不可用时的备用渠道。"""
     return _send_group_chat_message.invoke({"content": content})
+
+
+# ── 工具:图片 / 文件上行(把本地产物发回飞书群) ────────────────────────────
+
+@mcp.tool()
+def send_feishu_image(image_path: str, feishu_chat_id: str = "") -> str:
+    """把本地 PNG/JPG 图片上传到飞书并以 image 消息发到群里。
+
+    用法场景:
+    - 截屏后把截图发给用户(macOS 用 `screencapture -x /tmp/xxx.png`)
+    - 渲染了 STEP/PCB/曲线图,把 PNG 发出来
+    - 任何想"贴张图"给用户看的场景
+
+    Args:
+        image_path: 本地图片绝对路径。建议放 cwd 内或 /tmp 下。
+        feishu_chat_id: 目标群 chat_id。空则回退 EMPLOYEE_CHAT_ID env(当前对话)。
+
+    Returns:
+        成功:"✅ 图片已发送 (xxx.png, NNN KB)"
+        失败:"❌ 失败原因"
+    """
+    from pathlib import Path
+    from feishu.sender import make_client, send_image_file
+    p = Path(image_path)
+    if not p.is_file():
+        return f"❌ 文件不存在: {image_path}"
+    size_kb = p.stat().st_size / 1024
+    if size_kb <= 0:
+        return f"❌ 文件为空: {image_path}"
+    if not feishu_chat_id:
+        feishu_chat_id = os.environ.get("EMPLOYEE_CHAT_ID", "") or ""
+    if not feishu_chat_id or feishu_chat_id.startswith("task:"):
+        # task: 前缀是 _execute_node 派单用的 pseudo chat_id,不是真飞书群
+        # 回退到 .env 里的默认群
+        from dotenv import load_dotenv
+        load_dotenv("/Users/liyijiang/work/company/infra/.env")
+        feishu_chat_id = os.environ.get("FEISHU_CHAT_ID", "") or ""
+    if not feishu_chat_id:
+        return "❌ 没有可用的 feishu_chat_id (EMPLOYEE_CHAT_ID/FEISHU_CHAT_ID 都为空)"
+    try:
+        client = make_client()
+        ok, err = send_image_file(client, feishu_chat_id, str(p))
+        if ok:
+            return f"✅ 图片已发送 ({p.name}, {size_kb:.0f} KB)"
+        return f"❌ {err}"
+    except Exception as exc:
+        return f"❌ 发送失败: {exc}"
+
+
+@mcp.tool()
+def send_feishu_file(file_path: str, feishu_chat_id: str = "") -> str:
+    """把本地任意文件上传到飞书并以 file 消息发到群里(单文件 ≤30MB)。
+
+    用法场景:
+    - 把生成的 STEP / DXF / Excel / PDF / zip 作为附件发给用户
+    - 把日志、报告、CSV 直接送回群里,免得用户去 git pull
+
+    支持类型:任何二进制文件均可。常见扩展会自动识别 file_type
+    (pdf/doc/xls/ppt/mp4),其他走 stream。
+
+    Args:
+        file_path: 本地文件绝对路径。
+        feishu_chat_id: 目标群 chat_id。空则回退 EMPLOYEE_CHAT_ID env。
+
+    Returns:
+        成功:"✅ 文件已发送 (xxx.step, NNN KB)"
+        失败:"❌ 失败原因"(超 30MB / 文件不存在 / 上传失败等)
+    """
+    from pathlib import Path
+    from feishu.sender import make_client, send_file_msg
+    p = Path(file_path)
+    if not p.is_file():
+        return f"❌ 文件不存在: {file_path}"
+    size_kb = p.stat().st_size / 1024
+    if size_kb <= 0:
+        return f"❌ 文件为空: {file_path}"
+    if size_kb > 30 * 1024:
+        return f"❌ 文件 {p.name} 超过 30MB ({size_kb / 1024:.1f} MB),请压缩或拆分"
+    if not feishu_chat_id:
+        feishu_chat_id = os.environ.get("EMPLOYEE_CHAT_ID", "") or ""
+    if not feishu_chat_id or feishu_chat_id.startswith("task:"):
+        from dotenv import load_dotenv
+        load_dotenv("/Users/liyijiang/work/company/infra/.env")
+        feishu_chat_id = os.environ.get("FEISHU_CHAT_ID", "") or ""
+    if not feishu_chat_id:
+        return "❌ 没有可用的 feishu_chat_id"
+    try:
+        client = make_client()
+        ok = send_file_msg(client, feishu_chat_id, str(p))
+        if ok:
+            return f"✅ 文件已发送 ({p.name}, {size_kb:.0f} KB)"
+        return f"❌ 上传或发送失败,看 logs/cc_bridge.log"
+    except Exception as exc:
+        return f"❌ 发送失败: {exc}"
 
 
 # ── 工具：跨员工委托（阶段 6.5）──────────────────────────────────────────────
@@ -147,6 +311,8 @@ def delegate_to_employee(
     import httpx
     from_employee = os.environ.get("EMPLOYEE_KEY", "")
     chat_id = os.environ.get("EMPLOYEE_CHAT_ID", "")
+    # 透传 trigger_message_id,让目标员工的卡片/短回复也能挂在用户原消息 thread 下
+    trigger_message_id = os.environ.get("EMPLOYEE_TRIGGER_MESSAGE_ID", "")
     try:
         resp = httpx.post(
             f"http://localhost:8000/api/employees/{target_employee}/dispatch",
@@ -155,6 +321,7 @@ def delegate_to_employee(
                 "context_files": context_files,
                 "from_employee": from_employee,
                 "chat_id": chat_id,
+                "trigger_message_id": trigger_message_id,
             },
             timeout=10,
         )

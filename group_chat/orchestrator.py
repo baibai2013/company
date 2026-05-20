@@ -43,7 +43,13 @@ from .pipelines import (
 from . import prompts as _p  # 模块级引用，支持 watchdog 热重载后自动使用新值
 from .scenarios import SCENARIO_REGISTRY
 from .session import SessionStore
-from .task_steps import extract_task_id, is_task_chat, mark_task_status, step_record
+from .task_steps import (
+    create_tasks_from_decompose,
+    extract_task_id,
+    is_task_chat,
+    mark_task_status,
+    step_record,
+)
 
 log = logging.getLogger("group_chat.orchestrator")
 
@@ -201,6 +207,90 @@ async def _decide_node(
                     "mode": "parallel",
                     "participants": participants,
                     "reason": "matched robot_engineering scenario",
+                }, ensure_ascii=False),
+            }
+
+    # Fast path (RFC feishu-cli-direct Phase 3):
+    # employee_bot 已经把 mentions 解析成 [@key] tags 注入到 text。
+    # 解析这些 tags 直接路由,免跑 2-3 次 Haiku LLM(省 4-5s)。
+    # 没命中再 fallback LLM 决策。
+    import re as _re_fast
+    fast_tags = _re_fast.findall(r"\[@([a-z_]+)\]", event.text or "")
+    fast_valid = [t for t in fast_tags
+                  if (len(EMPLOYEE_CONFIG) == 0 or t in EMPLOYEE_CONFIG)
+                  and t != "user"]
+    is_all_marker = "[全员]" in (event.text or "")
+    # 接龙关键词:用户期望按顺序每人各发一条消息(纯群聊,不写共享文件)
+    # 命中 → sequential 模式,每人收到前一个同事的发言再接力
+    text_lower = (event.text or "")
+    is_relay = any(kw in text_lower for kw in
+                   ("接龙", "接力", "轮流", "依次", "按顺序发言", "排队发言"))
+    # 共享文档并发编辑:全员同时改同一文件,每人改自己 section,flock 防冲突
+    is_concurrent_doc = any(kw in text_lower for kw in
+                            ("共享文档", "共编", "同写", "共同编辑",
+                             "协同编辑", "并发编辑", "同时编辑"))
+
+    if is_all_marker or fast_valid or is_relay or is_concurrent_doc:
+        async with step_record(task_id, "decide",
+                               input_summary=f"[fast-path] tags={fast_valid} all={is_all_marker} relay={is_relay} concurrent={is_concurrent_doc} text={event.text[:120]}"):
+            if is_concurrent_doc:
+                # 共享文档并发编辑: 走 scenario, fanout 真并发
+                participants = list(EMPLOYEE_CONFIG.keys()) if EMPLOYEE_CONFIG else (fast_valid or [])
+                participants = [p for p in participants if p != "user"]
+                session.template = "concurrent_doc_edit"
+                session.host = "project_manager"
+                session.mode = "parallel"
+                session.participants = participants
+                session.pending = list(participants)
+                # 把用户原文当 activity_rules 传给 scenario.initialize
+                scenario_cls = SCENARIO_REGISTRY.get("concurrent_doc_edit")
+                if scenario_cls:
+                    scenario = scenario_cls(session, session_store=session_store)
+                    session.game_state = scenario.initialize(event.text or "") or {}
+                await session_store.save(session)
+                log.info("decide_node[fast]: scenario=concurrent_doc_edit participants=%s",
+                         participants)
+                return {
+                    **_state_set_session(state, session),
+                    "decision_json": json.dumps({
+                        "mode": "parallel",
+                        "participants": participants,
+                        "reason": "concurrent_doc keyword → scenario fanout",
+                    }, ensure_ascii=False),
+                }
+            if is_relay:
+                # 接龙优先匹配: 全员 sequential
+                participants = list(EMPLOYEE_CONFIG.keys()) if EMPLOYEE_CONFIG else (fast_valid or [])
+                participants = [p for p in participants if p != "user"]
+                mode = "sequential"
+                reason = "relay keyword → all employees sequential"
+            elif is_all_marker:
+                participants = list(EMPLOYEE_CONFIG.keys()) if EMPLOYEE_CONFIG else fast_valid
+                # 排除 user
+                participants = [p for p in participants if p != "user"]
+                mode = "parallel"
+                reason = "[全员] marker → all employees parallel"
+            elif len(fast_valid) == 1:
+                participants = fast_valid
+                mode = "single"
+                reason = f"[@{fast_valid[0]}] explicit single mention"
+            else:
+                participants = fast_valid
+                mode = "parallel"
+                reason = f"explicit multi mentions {fast_valid}"
+
+            session.mode = mode
+            session.participants = participants
+            session.pending = list(participants)
+            await session_store.save(session)
+            log.info("decide_node[fast]: mode=%s participants=%s reason=%s",
+                     mode, participants, reason)
+            return {
+                **_state_set_session(state, session),
+                "decision_json": json.dumps({
+                    "mode": mode,
+                    "participants": participants,
+                    "reason": reason,
                 }, ensure_ascii=False),
             }
 
@@ -439,6 +529,161 @@ async def _conclude_node(
     return result
 
 
+# ── Execute node:把会议 summary 拆成可执行 task,派给员工真干活 ──────────────
+
+async def _execute_node(
+    state: OrchestratorState,
+    session_store: SessionStore,
+    bus_pool: GroupEventBusPool,
+) -> dict:
+    """会议结束后,让 PM 把 summary 拆成 task list → 落库 → 异步派单到员工 cc_bridge。
+
+    设计要点:
+    - fire-and-forget 派单:不阻塞 graph,每个 dispatch 自己负责更新 task.status
+    - 闲聊兜底:summary 太短或 LLM 拆出空 list 时直接返回,不浪费 cc_bridge
+    - 防重:session.executed_tasks 已有内容时跳过(orchestrator 同一 chat 的多轮消息会复用 session)
+    - 派单走 handle_dispatch(已有的 A2A 调用)→ smart_graph._cc_work_node → ClaudeRunner
+    """
+    session = _state_get_session(state)
+    decision = _state_get_decision(state)
+
+    if decision is None or decision.mode == "ignore":
+        return {}
+
+    # 跳过条件 1:会议没产生 summary(单人模式或异常)
+    summary = (session.summary or "").strip()
+    if len(summary) < 50:
+        log.info("execute_node: skip — summary too short (len=%d)", len(summary))
+        return {}
+
+    # 跳过条件 2:本场会议已经派过单(防止 orchestrator 多轮触发重复派)
+    already_executed = getattr(session, "executed_tasks", None) or []
+    if already_executed:
+        log.info("execute_node: skip — session already executed %d tasks",
+                 len(already_executed))
+        return {}
+
+    # ── 1. PM 拆解 summary(走 cli Opus 4.7,自动进池化复用) ────────────────
+    # 为什么走 cli 而不是 langchain API:
+    #   - 经过 lumos 代理的 langchain 路径偶发 404/超时,影响整个 _execute_node
+    #   - cli 走本地账户认证,稳定;Opus 4.7 推理质量明显优于 Haiku(更不会乱拆)
+    #   - cli 自然进 ClaudePool,跨多次会议复用同一 PM 子进程,省冷启
+    history_compact = _p.format_history(session.history)[-8000:]
+    pm_prompt = (
+        f"{_p.EXECUTE_DECOMPOSE_PROMPT}\n\n"
+        f"---\n\n"
+        f"# 本场会议讨论(history)\n{history_compact}\n\n"
+        f"# 会议小结(summary,芳芳已发布)\n{summary}\n\n"
+        f"按上面的 EXECUTE_DECOMPOSE_PROMPT 规则拆出 task 列表,只输出 JSON 对象,"
+        f"不要任何工具调用,不要 markdown 代码块包裹,不要前后说明文字。"
+    )
+
+    items: list[dict] = []
+    try:
+        from agents_v2.shared import cc_executor as _cc
+        from backend.services import registry as _registry
+        pm_cfg = _registry.get_effective_sync("project_manager")
+        pm_cwd = (pm_cfg.cwd if pm_cfg else "") or "/Users/liyijiang/work/robot-dog"
+        # chat_id 用 "task:pm-decompose-{session_id}" 触发池化路径
+        # → pool_thread = "task_pool:project_manager",同员工跨会议复用
+        pm_chat_id = f"task:pm-decompose-{session.id}"
+        pm_thread_id = f"pm_decompose_{session.id}"
+
+        text, _new_sid, _logs = await _cc.run_cc_node(
+            employee_key="project_manager",
+            query=pm_prompt,
+            cwd=pm_cwd,
+            chat_id=pm_chat_id,
+            thread_id=pm_thread_id,
+            feishu_app_id=(pm_cfg.feishu_app_id if pm_cfg else "") or "",
+            feishu_app_secret=(pm_cfg.feishu_app_secret if pm_cfg else "") or "",
+            agent_port=(pm_cfg.agent_port if pm_cfg else "") or "",
+            model="claude-opus-4-7",
+            effort="high",
+        )
+        import re as _re
+        m = _re.search(r"\{.*\}", text or "", _re.DOTALL)
+        data = json.loads(m.group()) if m else {}
+        items = data.get("tasks", []) if isinstance(data, dict) else []
+        log.info("execute_node: PM(cli opus-4-7) decomposed %d tasks", len(items))
+    except Exception as exc:
+        log.warning("execute_node: PM cli decompose failed err=%s — fallback to Haiku API", exc)
+        # 兜底:cli 失败(沙箱/认证/账户问题)走 Haiku API,保证 _execute_node 不被一棒打死
+        try:
+            llm = make_langchain_llm("claude-haiku-4-5-20251001")
+            resp = await llm.ainvoke([
+                SystemMessage(_p.EXECUTE_DECOMPOSE_PROMPT),
+                HumanMessage(pm_prompt),
+            ])
+            import re as _re
+            m = _re.search(r"\{.*\}", resp.content, _re.DOTALL)
+            data = json.loads(m.group()) if m else {}
+            items = data.get("tasks", []) if isinstance(data, dict) else []
+        except Exception as exc2:
+            log.warning("execute_node: fallback Haiku also failed err=%s", exc2)
+            items = []
+
+    if not items:
+        log.info("execute_node: PM decomposed 0 tasks (probably pure discussion), skip")
+        return {}
+
+    # ── 2. 落库 ───────────────────────────────────────────────────────────
+    requester = f"group_chat:{session.chat_id[:20]}"
+    task_ids = await create_tasks_from_decompose(items, requester=requester)
+    if not task_ids:
+        log.warning("execute_node: 0 tasks persisted (all dropped by validator)")
+        return {}
+
+    # ── 3. fire-and-forget 派单到员工 cc_bridge ───────────────────────────
+    from feishu.commands.dispatch import handle_dispatch as _dispatch
+
+    async def _dispatch_one(tid: str, item: dict) -> None:
+        executor = item.get("executor", "")
+        title = item.get("title", "")
+        desc = item.get("description", "")
+        prompt = f"# 任务 {tid[:8]}\n## {title}\n\n{desc}"
+        try:
+            await mark_task_status(tid, "in_progress")
+            log.info("execute_node: dispatching task=%s -> %s", tid[:8], executor)
+            result = await _dispatch(
+                employee=executor,
+                task=prompt,
+                task_id=tid,
+                chat_id=f"task:{tid}",
+            )
+            ok = bool(result.get("result"))
+            await mark_task_status(tid, "done" if ok else "failed")
+            log.info("execute_node: task=%s done=%s result_len=%d",
+                     tid[:8], ok, len(result.get("result", "")))
+        except Exception as exc:
+            log.warning("execute_node: dispatch failed task=%s err=%s", tid[:8], exc)
+            try:
+                await mark_task_status(tid, "failed")
+            except Exception:
+                pass
+
+    valid_items = [it for it in items
+                   if (it.get("executor") or "") in {
+                       "mechanical", "hardware", "firmware", "algorithm",
+                       "testing", "cost", "product_manager",
+                       "project_manager", "tech_lead",
+                   } and (it.get("title") or "").strip()]
+    paired = list(zip(task_ids, valid_items[:len(task_ids)]))
+
+    for tid, item in paired:
+        asyncio.create_task(_dispatch_one(tid, item))
+
+    # 把 task_id 写到 session,顺手存盘(防重)
+    try:
+        session.executed_tasks = list(task_ids)  # type: ignore[attr-defined]
+        await session_store.save(session)
+    except Exception as exc:
+        log.debug("execute_node: session.executed_tasks save best-effort: %s", exc)
+
+    log.info("execute_node: dispatched %d tasks -> %s",
+             len(paired), [(tid[:8], it.get("executor")) for tid, it in paired])
+
+    return _state_set_session(state, session)
 
 
 # ── Conditional edge ──────────────────────────────────────────────────────────
@@ -468,6 +713,9 @@ def _build_graph(session_store: SessionStore, bus_pool: GroupEventBusPool, cp):
     g.add_node("conclude", partial(
         _conclude_node, session_store=session_store, bus_pool=bus_pool,
     ))
+    g.add_node("execute", partial(
+        _execute_node, session_store=session_store, bus_pool=bus_pool,
+    ))
 
     g.add_edge(START, "receive")
     g.add_edge("receive", "decide")
@@ -476,7 +724,8 @@ def _build_graph(session_store: SessionStore, bus_pool: GroupEventBusPool, cp):
         "conclude": "conclude",
     })
     g.add_edge("dispatch", "conclude")
-    g.add_edge("conclude", END)
+    g.add_edge("conclude", "execute")
+    g.add_edge("execute", END)
 
     return g.compile(checkpointer=cp)
 

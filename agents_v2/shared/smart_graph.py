@@ -474,6 +474,7 @@ async def _cc_work_node(state: SmartState, employee_key: str) -> dict:
 
     chat_id = _runner.current_feishu_chat_id.get("")
     thread_id = _runner.current_thread_id.get("")
+    trigger_message_id = _runner.current_trigger_message_id.get("")
 
     # prompt 拼装：
     # - CHAT 路径：闲聊语义提示，让 claude 简短回复，不要主动调工具
@@ -524,6 +525,7 @@ async def _cc_work_node(state: SmartState, employee_key: str) -> dict:
             callbacks=callbacks,
             model=cc_model,
             effort=cc_effort,
+            trigger_message_id=trigger_message_id,
         )
     except CCExecutorFailed as exc:
         log.warning("[%s] cc_work_node fallback to langchain: %s", employee_key, exc)

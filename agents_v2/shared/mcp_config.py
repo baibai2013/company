@@ -27,11 +27,13 @@ def build_mcp_config(
     thread_id: str = "",
     feishu_app_id: str = "",
     feishu_app_secret: str = "",
+    trigger_message_id: str = "",
 ) -> dict:
     """生成传给 claude --mcp-config 的 JSON 字典。
 
     包含一个 server "company"，stdio 启动 mcp_servers.company_tools.server，
-    通过 env 注入运行时上下文（员工身份、对话 chat_id、thread_id、飞书凭证）。
+    通过 env 注入运行时上下文（员工身份、对话 chat_id、thread_id、飞书凭证、
+    trigger_message_id 让 reply_feishu_short / send_feishu_* 工具决定是否 reply）。
     """
     env = {
         "EMPLOYEE_KEY": employee_key,
@@ -46,6 +48,8 @@ def build_mcp_config(
         env["EMPLOYEE_FEISHU_APP_ID"] = feishu_app_id
     if feishu_app_secret:
         env["EMPLOYEE_FEISHU_APP_SECRET"] = feishu_app_secret
+    if trigger_message_id:
+        env["EMPLOYEE_TRIGGER_MESSAGE_ID"] = trigger_message_id
 
     return {
         "mcpServers": {

@@ -51,6 +51,7 @@ class GroupSession:
     role_assignments: dict[str, SessionRole] = field(default_factory=dict)
     role_history: list[tuple[float, dict]] = field(default_factory=list)
     summary: str = ""
+    executed_tasks: list[str] = field(default_factory=list)  # task_id 列表,防止 _execute_node 重复派单
 
 
 @dataclass

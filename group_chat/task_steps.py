@@ -18,9 +18,69 @@ from datetime import datetime, timezone
 from sqlalchemy import select
 
 from backend.core.db import AsyncSessionLocal
-from backend.models.task import TaskStep
+from backend.models.task import Task, TaskStep
 
 log = logging.getLogger(__name__)
+
+
+_VALID_EXECUTORS = frozenset({
+    "mechanical", "hardware", "firmware", "algorithm",
+    "testing", "cost", "product_manager", "project_manager", "tech_lead",
+})
+
+
+async def create_tasks_from_decompose(
+    items: list[dict],
+    *,
+    requester: str = "group_chat",
+    parent_id: str | None = None,
+) -> list[str]:
+    """把 PM 拆解出的 task list 批量落库。
+
+    每条 item 形如 {"title", "description", "executor", "priority"}。
+    校验 executor 在白名单内,否则丢弃并 log。
+    返回成功落库的 task_id 列表。
+
+    失败仅 log 不抛——orchestrator graph 不应该因为落库失败而崩溃。
+    """
+    if not items:
+        return []
+
+    created: list[str] = []
+    try:
+        async with AsyncSessionLocal() as db:
+            for it in items:
+                if not isinstance(it, dict):
+                    continue
+                executor = (it.get("executor") or "").strip()
+                if executor not in _VALID_EXECUTORS:
+                    log.warning("decompose: drop task — executor=%r not in whitelist", executor)
+                    continue
+                title = (it.get("title") or "").strip()[:200]
+                if not title:
+                    continue
+                desc = (it.get("description") or "").strip()
+                priority = it.get("priority") or "P1"
+                if priority not in ("P0", "P1", "P2"):
+                    priority = "P1"
+                tid = str(uuid.uuid4())
+                db.add(Task(
+                    id=tid,
+                    parent_id=parent_id,
+                    title=title,
+                    description=desc,
+                    priority=priority,
+                    status="pending",
+                    requester=requester,
+                    executor=executor,
+                ))
+                created.append(tid)
+            await db.commit()
+        log.info("create_tasks_from_decompose: created %d tasks (out of %d items)",
+                 len(created), len(items))
+    except Exception as exc:
+        log.warning("create_tasks_from_decompose: bulk insert failed err=%s", exc)
+    return created
 
 _TASK_CHAT_PREFIX = "task:"
 
