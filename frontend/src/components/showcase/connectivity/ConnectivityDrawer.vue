@@ -56,6 +56,25 @@ const showCad = computed(() => {
   if (!props.node) return false
   return props.node.kind === 'cad_part' || props.node.kind === 'actuator_cross_domain'
 })
+// algorithm / firmware:跳源代码;pcb:跳 .kicad_pcb 源 + 顶层 SVG
+const showAlgo = computed(() => {
+  if (!props.node) return false
+  return props.node.kind === 'algorithm' || props.node.kind === 'firmware'
+})
+const showPcb = computed(() => props.node?.kind === 'pcb')
+
+// PCB 顶层 SVG 路径推断:my-board.kicad_pcb → my-board-pcb-top.svg(同目录)
+const pcbTopSvgPath = computed<string | null>(() => {
+  const sb = props.node?.ref?.schematic_block
+  if (!sb) return null
+  // schematic_block 形如 "domains/electronics/leg-driver.kicad_pcb"
+  // 顶层 SVG 由 KiCad 自动化导出脚本写到 cad/exports/leg-driver-pcb-top.svg
+  const lower = sb.toLowerCase()
+  if (!lower.endsWith('.kicad_pcb')) return null
+  const dir = sb.includes('/') ? sb.slice(0, sb.lastIndexOf('/') + 1) : ''
+  const base = sb.slice(dir.length, -'.kicad_pcb'.length)
+  return `${dir}cad/exports/${base}-pcb-top.svg`
+})
 
 const ownerInf = computed(() => (props.node ? ownerInfo(props.node.owner) : { emoji: '📦', label: '' }))
 
@@ -227,7 +246,38 @@ const headerStyle = computed(() => {
             </li>
           </template>
 
-          <li v-if="!showElectronics && !showCad">
+          <template v-if="showAlgo">
+            <li v-if="node.ref?.part_meta">
+              <button class="link-btn primary" @click="jumpToResource(node.ref!.part_meta!)">
+                <span class="ico">📜</span>查看源代码
+                <span class="hint truncate">{{ node.ref.part_meta }}</span>
+              </button>
+            </li>
+            <li v-else><span class="empty">未登记源文件路径(ref.part_meta)</span></li>
+          </template>
+
+          <template v-if="showPcb">
+            <li v-if="node.ref?.schematic_block">
+              <button class="link-btn" @click="jumpToResource(node.ref!.schematic_block!)">
+                <span class="ico">⚡</span>打开 .kicad_pcb 源
+                <span class="hint truncate">{{ node.ref.schematic_block }}</span>
+              </button>
+            </li>
+            <li v-if="pcbTopSvgPath">
+              <button class="link-btn primary" @click="jumpToResource(pcbTopSvgPath!)">
+                <span class="ico">🟦</span>查看 PCB 顶层 SVG
+                <span class="hint truncate">{{ pcbTopSvgPath }}</span>
+              </button>
+            </li>
+            <li v-if="node.ref?.step">
+              <button class="link-btn" @click="downloadFile(node.ref!.step!)">
+                <span class="ico">⬇</span>下载 PCB 3D STEP
+                <span class="hint truncate">{{ node.ref.step }}</span>
+              </button>
+            </li>
+          </template>
+
+          <li v-if="!showElectronics && !showCad && !showAlgo && !showPcb">
             <span class="empty">该节点无登记资源</span>
           </li>
         </ul>
@@ -268,15 +318,18 @@ const headerStyle = computed(() => {
   color: #1e293b;
 }
 .drawer-head {
-  padding: 12px 16px;
-  background: #f8fafc;
+  padding: 14px 18px;
+  background: linear-gradient(180deg, #f8fafc 0%, #f1f5f9 100%);
   border-bottom: 1px solid #e2e8f0;
   display: flex;
   align-items: center;
   justify-content: space-between;
   border-left: 4px solid #94a3b8;
+  position: sticky;
+  top: 0;
+  z-index: 1;
 }
-.head-title { font-size: 15px; font-weight: 600; }
+.head-title { font-size: 15px; font-weight: 600; line-height: 1.3; }
 .close-btn {
   background: transparent;
   border: none;

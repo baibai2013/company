@@ -27,6 +27,10 @@ export const kindColors: Record<NodeKind, string> = {
   module: '#475569',                 // 灰深
   display: '#475569',                // 灰深
   generic: '#475569',                // 灰深
+  // B2-connectivity-view 扩展(2026-05-20)
+  algorithm: '#10b981',              // 绿(算法节点 — IK/FK/控制环)
+  pcb: '#0c4a6e',                    // 深青(PCB 板,与 mcu 区分)
+  firmware: '#0ea5e9',               // 蓝(固件节点)
 }
 
 export function kindColor(kind: string): string {
@@ -44,6 +48,9 @@ export const kindLabels: Record<NodeKind, string> = {
   module: 'Module',
   display: 'Display',
   generic: 'Generic',
+  algorithm: 'Algorithm',
+  pcb: 'PCB',
+  firmware: 'Firmware',
 }
 
 export function kindLabel(kind: string): string {

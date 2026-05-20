@@ -121,6 +121,7 @@ export interface PipelineSnapshot {
 export type NodeKind =
   | 'mcu' | 'sensor' | 'actuator' | 'power' | 'module' | 'display'
   | 'cad_part' | 'actuator_cross_domain' | 'generic'
+  | 'algorithm' | 'pcb' | 'firmware'  // B2-connectivity-view 扩展
 
 export type EdgeKind = 'mechanical' | 'power' | 'data'
 export type InterfaceKind = 'data' | 'power' | 'mechanical'

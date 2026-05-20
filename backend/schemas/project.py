@@ -220,6 +220,8 @@ class PipelineSnapshot(BaseModel):
 NodeKind = Literal[
     "mcu", "sensor", "actuator", "power", "module", "display",
     "cad_part", "actuator_cross_domain", "generic",
+    # B2-connectivity-view 扩展(2026-05-20):算法 / PCB 板 / 固件
+    "algorithm", "pcb", "firmware",
 ]
 EdgeKind = Literal["mechanical", "power", "data"]
 InterfaceKind = Literal["data", "power", "mechanical"]

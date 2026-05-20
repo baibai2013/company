@@ -12,7 +12,7 @@
     - foo.kicad_pcb   → base = foo
 -->
 <script setup lang="ts">
-import { ref, watch, computed, onBeforeUnmount, nextTick, defineAsyncComponent } from 'vue'
+import { ref, watch, computed, onBeforeUnmount, nextTick, defineAsyncComponent, reactive } from 'vue'
 import axios from 'axios'
 import svgPanZoom from 'svg-pan-zoom'
 import { ElButton, ElTabs, ElTabPane } from 'element-plus'
@@ -20,6 +20,18 @@ import { useProjectStore } from '@/stores/project'
 
 const props = defineProps<{ path: string }>()
 const store = useProjectStore()
+
+// 文件存在性 HEAD 探测(B2-connectivity-view §A 反馈:bot.svg / glb / gerbers 经常缺失)
+// 缺失时:tab 隐藏,下载按钮变灰,顶层 SVG 仍可看
+const exists = reactive<{ top: boolean; bot: boolean; glb: boolean; gerbers: boolean; src: boolean }>({
+  top: false, bot: false, glb: false, gerbers: false, src: false,
+})
+async function probe(p: string): Promise<boolean> {
+  try {
+    await axios.head(store.fileUrl(p))
+    return true
+  } catch { return false }
+}
 
 // Cad3DPreview 由 B2.3 subagent 写,可能尚未存在 → 异步占位
 const Cad3DPreview = defineAsyncComponent({
@@ -54,7 +66,7 @@ const meta = computed(() => {
   }
 })
 
-// 根据 path 后缀决定默认 tab
+// 根据 path 后缀决定默认 tab(若推断的 tab 文件缺失,后续 watch 里会回退到 top)
 function defaultTabFor(p: string): 'top' | 'bot' | '3d' {
   const l = p.toLowerCase()
   if (l.endsWith('-pcb-bot.svg')) return 'bot'
@@ -104,11 +116,20 @@ function resetTabs() {
   botLoaded.value = false
 }
 
-watch(() => props.path, (p) => {
+watch(() => props.path, async (p) => {
   if (!p) return
   resetTabs()
-  activeTab.value = defaultTabFor(p)
-  // 等 v-if 渲染完再 ensure
+  // 并发探测 5 个相关文件
+  const m = meta.value
+  const [t, b, g, gz, s] = await Promise.all([
+    probe(m.top), probe(m.bot), probe(m.glb), probe(m.gerbers), probe(m.src),
+  ])
+  exists.top = t; exists.bot = b; exists.glb = g; exists.gerbers = gz; exists.src = s
+  // 默认 tab:若推断的 tab 缺失,降级到第一个存在的(优先 top → bot → 3d)
+  let want = defaultTabFor(p)
+  const has = { top: exists.top, bot: exists.bot, '3d': exists.glb }
+  if (!has[want]) want = (exists.top ? 'top' : exists.bot ? 'bot' : exists.glb ? '3d' : 'top')
+  activeTab.value = want
   nextTick(() => ensureTab(activeTab.value))
 }, { immediate: true })
 
@@ -127,29 +148,31 @@ const srcName = computed(() => meta.value.src.split('/').pop() ?? '')
     <header class="bar">
       <span class="filename">🟦 PCB — {{ meta.base }}</span>
       <span class="actions">
-        <a :href="srcUrl" :download="srcName">
+        <a v-if="exists.src" :href="srcUrl" :download="srcName">
           <el-button size="small" plain>⬇ 源 (.kicad_pcb)</el-button>
         </a>
-        <a :href="gerbersUrl" :download="gerbersName">
+        <el-button v-else size="small" plain disabled title="未生成 .kicad_pcb 源文件">⬇ 源 (.kicad_pcb)</el-button>
+        <a v-if="exists.gerbers" :href="gerbersUrl" :download="gerbersName">
           <el-button size="small" type="primary" plain>⬇ Gerber zip</el-button>
         </a>
+        <el-button v-else size="small" type="primary" plain disabled title="尚未导出 Gerber 制造文件">⬇ Gerber zip(未生成)</el-button>
       </span>
     </header>
 
     <el-tabs v-model="activeTab" class="pcb-tabs">
-      <el-tab-pane label="顶层" name="top">
+      <el-tab-pane v-if="exists.top" label="顶层" name="top">
         <div class="canvas">
           <div ref="topRef" class="svg-host" />
           <div v-if="error && activeTab === 'top'" class="state error">❌ {{ error }}</div>
         </div>
       </el-tab-pane>
-      <el-tab-pane label="底层" name="bot">
+      <el-tab-pane v-if="exists.bot" label="底层" name="bot">
         <div class="canvas">
           <div ref="botRef" class="svg-host" />
           <div v-if="error && activeTab === 'bot'" class="state error">❌ {{ error }}</div>
         </div>
       </el-tab-pane>
-      <el-tab-pane label="3D" name="3d">
+      <el-tab-pane v-if="exists.glb" label="3D" name="3d">
         <div class="canvas dark">
           <component
             :is="Cad3DPreview"
@@ -159,6 +182,9 @@ const srcName = computed(() => meta.value.src.split('/').pop() ?? '')
         </div>
       </el-tab-pane>
     </el-tabs>
+    <div v-if="!exists.top && !exists.bot && !exists.glb" class="state empty-all">
+      🚧 PCB 视图尚未生成 — 暂无顶层 SVG / 底层 SVG / 3D 模型可显示
+    </div>
   </div>
 </template>
 
@@ -209,6 +235,15 @@ const srcName = computed(() => meta.value.src.split('/').pop() ?? '')
   background: rgba(15,23,42,.85);
 }
 .state.error { color: #ef4444; }
+.state.empty-all {
+  position: relative;
+  padding: 40px 20px;
+  color: #94a3b8;
+  font-size: 13px;
+  text-align: center;
+  background: #1e293b;
+  border-top: 1px solid #334155;
+}
 
 .placeholder {
   height: 100%;

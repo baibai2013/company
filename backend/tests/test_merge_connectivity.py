@@ -185,6 +185,102 @@ def test_validate_passes_on_clean_doc():
     assert mc._validate(nodes, edges) == []
 
 
+# ── 扩展节点(algorithm / pcb / firmware) ──────────────────────────────────
+
+def test_pcb_node_attaches_to_bom_components(proj):
+    """domains/electronics/*.kicad_pcb → 1 个 PCB 节点 + 边连承载的 BOM 元件"""
+    _write_bom(proj, [
+        {"id": "esp32_main", "category": "microcontroller", "name": "ESP32",
+         "qty": 1, "unit_price": 1, "total": 1,
+         "vendors": [{"name": "A", "url": "", "price_cny": 1, "tier": "pro"},
+                     {"name": "B", "url": "", "price_cny": 1, "tier": "budget"}],
+         "interfaces": [{"id": "GPIO13", "kind": "data"}]},
+        {"id": "imu", "category": "sensor", "name": "IMU",
+         "qty": 1, "unit_price": 1, "total": 1,
+         "vendors": [{"name": "A", "url": "", "price_cny": 1, "tier": "pro"},
+                     {"name": "B", "url": "", "price_cny": 1, "tier": "budget"}],
+         "interfaces": [{"id": "sda", "kind": "data"}]},
+    ])
+    (proj / "domains/electronics/leg-driver.kicad_pcb").write_text("(kicad_pcb ...)")
+
+    doc = mc.merge(proj)
+    pcbs = [n for n in doc["nodes"] if n["kind"] == "pcb"]
+    assert len(pcbs) == 1
+    assert pcbs[0]["id"] == "pcb_leg_driver"
+    assert pcbs[0]["owner"] == "hardware"
+    # PCB 接 2 个元件 → 2 个 mechanical 边
+    pcb_edges = [e for e in doc["edges"] if e["from"].startswith("pcb_leg_driver:")]
+    assert len(pcb_edges) == 2
+    # 元件被加了 board_seat 端口
+    esp32 = next(n for n in doc["nodes"] if n["id"] == "esp32_main")
+    assert any(i["id"] == "board_seat" for i in esp32["interfaces"])
+
+
+def test_algorithm_nodes_from_algo_dir(proj):
+    """domains/firmware/algo/*.py → 算法节点(每文件一个),__init__.py 跳过"""
+    algo_dir = proj / "domains/firmware/algo"
+    algo_dir.mkdir(parents=True, exist_ok=True)
+    (algo_dir / "ik_2dof.py").write_text("def ik(...): pass")
+    (algo_dir / "fk_2dof.py").write_text("def fk(...): pass")
+    (algo_dir / "__init__.py").write_text("")
+    (algo_dir / "_helpers.py").write_text("# private")  # 下划线开头跳过
+
+    doc = mc.merge(proj)
+    algos = [n for n in doc["nodes"] if n["kind"] == "algorithm"]
+    assert {n["id"] for n in algos} == {"algo_ik_2dof", "algo_fk_2dof"}
+    for a in algos:
+        assert a["owner"] == "algorithm"
+        # 应有 input/output 两个端口
+        iface_ids = {i["id"] for i in a["interfaces"]}
+        assert iface_ids == {"input", "output"}
+
+
+def test_firmware_node_from_src_files(proj):
+    """domains/firmware/src/*.c → 1 个 firmware 节点 + 接 mcu 控制流边"""
+    src = proj / "domains/firmware/src"
+    src.mkdir(parents=True, exist_ok=True)
+    (src / "leg_pwm.c").write_text("/* main */")
+    # 加配套 BOM 让 esp32_main:GPIO13 存在
+    _write_bom(proj, [
+        {"id": "esp32_main", "category": "microcontroller", "name": "ESP",
+         "qty": 1, "unit_price": 1, "total": 1,
+         "vendors": [{"name": "A", "url": "", "price_cny": 1, "tier": "pro"},
+                     {"name": "B", "url": "", "price_cny": 1, "tier": "budget"}],
+         "interfaces": [{"id": "GPIO13", "kind": "data"}]},
+    ])
+    doc = mc.merge(proj)
+    fws = [n for n in doc["nodes"] if n["kind"] == "firmware"]
+    assert len(fws) == 1
+    assert fws[0]["id"] == "fw_main"
+    assert fws[0]["owner"] == "firmware"
+    # firmware → mcu 控制流边
+    deploy_edges = [e for e in doc["edges"] if e["from"] == "fw_main:to_mcu"]
+    assert len(deploy_edges) == 1
+    assert deploy_edges[0]["to"] == "esp32_main:GPIO13"
+
+
+def test_algo_to_fw_edge_when_both_exist(proj):
+    """algorithm 输出 → fw_main:algo_in;若没 firmware 节点,这条边被剥掉(防引用悬空)"""
+    algo_dir = proj / "domains/firmware/algo"
+    algo_dir.mkdir(parents=True, exist_ok=True)
+    (algo_dir / "ik.py").write_text("# ik")
+    src = proj / "domains/firmware/src"
+    src.mkdir(parents=True, exist_ok=True)
+    (src / "main.c").write_text("/* */")
+    _write_bom(proj, [
+        {"id": "esp32_main", "category": "microcontroller", "name": "ESP",
+         "qty": 1, "unit_price": 1, "total": 1,
+         "vendors": [{"name": "A", "url": "", "price_cny": 1, "tier": "pro"},
+                     {"name": "B", "url": "", "price_cny": 1, "tier": "budget"}],
+         "interfaces": [{"id": "GPIO13", "kind": "data"}]},
+    ])
+    doc = mc.merge(proj)
+    # algorithm 节点存在,fw_main 存在 → 中间有边
+    algo_to_fw = [e for e in doc["edges"] if e["from"].startswith("algo_") and e["to"].startswith("fw_main:")]
+    assert len(algo_to_fw) == 1
+    assert algo_to_fw[0]["kind"] == "data"
+
+
 # ── 端到端 ──────────────────────────────────────────────────────────────
 
 def test_full_main_writes_connectivity_json(proj):

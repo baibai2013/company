@@ -51,6 +51,12 @@ const ownerDisplay = computed(() => node.value.owner_label || ownerInf.value.lab
 
 const subtitle = computed(() => `${kindLabel(node.value.kind)} · ${node.value.domain}`)
 
+// 端口数量上限:PCB 节点 seat_<id> 可能有 10+ 个,卡牌一行放不下
+// 超出时显示"+N more"占位,详情请打开抽屉看完整列表
+const MAX_VISIBLE_PORTS = 6
+const visiblePorts = computed(() => node.value.interfaces.slice(0, MAX_VISIBLE_PORTS))
+const hiddenPortsCount = computed(() => Math.max(0, node.value.interfaces.length - MAX_VISIBLE_PORTS))
+
 // 输入 / 输出端口都用 same id;vue-flow Handle 默认 type='target'/'source' 二选一,
 // 我们让每个 interface 同时支持 source+target(用 type='source' 即可,边方向由 edge 指定即可)。
 // 简化: 全部 Handle 都给 source(顶部)+ target(底部)双形态,通过 position 自动适配。
@@ -84,12 +90,13 @@ function portColor(kind: string): string {
       />
     </template>
 
-    <!-- 头部: emoji + owner_label -->
+    <!-- 头部: emoji + owner_label + kind 标签 -->
     <div class="part-header">
       <span class="owner-badge">
         <span class="owner-emoji">{{ ownerInf.emoji }}</span>
         <span class="owner-label">{{ ownerDisplay }}</span>
       </span>
+      <span class="kind-pill">{{ kindLabel(node.kind) }}</span>
     </div>
 
     <!-- 主标题 + 副标 -->
@@ -101,7 +108,7 @@ function portColor(kind: string): string {
     <!-- interfaces 端口圆点(底部条,可视化) -->
     <div class="part-ports" v-if="node.interfaces.length">
       <div
-        v-for="iface in node.interfaces"
+        v-for="iface in visiblePorts"
         :key="iface.id"
         class="port-chip"
         :title="`${iface.id} (${iface.kind})`"
@@ -109,6 +116,9 @@ function portColor(kind: string): string {
         <span class="port-dot" :style="{ background: portColor(iface.kind) }" />
         <span class="port-id">{{ iface.id }}</span>
       </div>
+      <span v-if="hiddenPortsCount > 0" class="port-chip more" :title="`还有 ${hiddenPortsCount} 个端口,双击查看详情`">
+        +{{ hiddenPortsCount }} more
+      </span>
     </div>
   </div>
 </template>
@@ -127,15 +137,33 @@ function portColor(kind: string): string {
   display: flex;
   flex-direction: column;
   overflow: hidden;
+  cursor: grab;
+  transition: box-shadow 160ms ease, transform 160ms ease;
 }
+.part-node:hover {
+  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.55), 0 0 0 1px rgba(255, 255, 255, 0.08) inset;
+  transform: translateY(-1px);
+}
+.part-node:active { cursor: grabbing; }
 
 .part-header {
   padding: 6px 10px;
   background: rgba(0, 0, 0, 0.32);
   display: flex;
   align-items: center;
+  justify-content: space-between;
   gap: 6px;
   font-size: 11px;
+}
+.kind-pill {
+  background: rgba(255, 255, 255, 0.18);
+  padding: 1px 7px;
+  border-radius: 8px;
+  font-size: 10px;
+  letter-spacing: 0.3px;
+  font-weight: 500;
+  text-transform: uppercase;
+  white-space: nowrap;
 }
 .owner-badge {
   display: inline-flex;
@@ -196,6 +224,11 @@ function portColor(kind: string): string {
   overflow: hidden;
   text-overflow: ellipsis;
   max-width: 60px;
+}
+.port-chip.more {
+  background: rgba(255, 255, 255, 0.06);
+  font-style: italic;
+  opacity: 0.85;
 }
 
 /* 真正承担 vue-flow 连边的 Handle 隐藏起来,只保留功能不显示 */
