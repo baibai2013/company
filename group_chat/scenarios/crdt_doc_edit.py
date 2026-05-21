@@ -56,7 +56,10 @@ class CrdtDocEditScenario(Scenario):
         structure = _detect_structure(activity_rules)
         chat_short = (self.session.chat_id or "")[-8:] or "global"
         doc_id = f"crdt-{structure}-{chat_short}-{ts}"
-        emps = [k for k in EMPLOYEE_CONFIG.keys() if k != "user"]
+        # sections 跟 session.participants 一致,这样 @ 部分人时只建那部分 section
+        emps = [p for p in (self.session.participants or []) if p != "user"]
+        if not emps:
+            emps = [k for k in EMPLOYEE_CONFIG.keys() if k != "user"]
         return {
             "phase": "init",
             "doc_id": doc_id,
@@ -76,16 +79,27 @@ class CrdtDocEditScenario(Scenario):
         task_text = state.get("task_text", "")
         sections = state.get("sections", [])
 
-        emps = [k for k in EMPLOYEE_CONFIG.keys() if k != "user"]
+        # 优先用 session.participants(orchestrator 已根据 @mention 过滤),
+        # 兜底用全员。这样既支持"@2-3 人头脑风暴",也支持"@all 全员协作"。
+        emps = [p for p in (session.participants or []) if p != "user"]
+        if not emps:
+            emps = [k for k in EMPLOYEE_CONFIG.keys() if k != "user"]
         if not emps:
             log.warning("crdt_doc_edit: no employees, abort")
             return
 
         # 1. 创建文档(在 scenario 一处,避免多 cli 竞争 first-create)
         ds = DocStore()
+        # 标题用用户原文(去掉 [全员]/[@xxx] 等路由 marker),最多 200 字
+        clean_title = task_text
+        for marker in ("[全员]", "[@all]"):
+            clean_title = clean_title.replace(marker, "")
+        # 去掉 [@key] tags
+        import re as _re
+        clean_title = _re.sub(r"\[@[a-z_]+\]", "", clean_title).strip()
         meta = ds.create(
             doc_id,
-            title=f"{structure} 协作: {task_text[:40]}",
+            title=clean_title[:200] or f"{structure} 协作",
             structure=structure,
             sections=sections if structure == "sectioned" else None,
             creator="orchestrator",
@@ -146,3 +160,59 @@ class CrdtDocEditScenario(Scenario):
         session.game_state["phase"] = "done"
         session.game_state["completed"] = success
         log.info("crdt_doc_edit: done %d/%d ok, doc=%s", success, len(emps), doc_id)
+
+        # 4. 仅当用户明示要发文件时,scenario 才把 markdown 发回飞书群
+        # 关键词命中: "发我 / 发给我 / 发文件 / 文件发 / 发出来 / 把文件 / 把结果"
+        send_file_keywords = (
+            "发我", "发给我", "发文件", "文件发", "发出来",
+            "把文件", "把结果", "结果发", "把这个发",
+            "把文档发", "文档发", "发个文件", "发份文件",
+        )
+        wants_file = any(kw in (task_text or "") for kw in send_file_keywords)
+
+        if not wants_file:
+            log.info("crdt_doc_edit: 用户未要求发文件,跳过 send_file (text=%r)",
+                     (task_text or "")[:60])
+            return
+
+        try:
+            import os
+            from pathlib import Path as _Path
+            from backend.services import registry as _reg
+            from feishu.sender import (
+                make_client as _make_client,
+                send_file_msg as _send_file_msg,
+                send_rich_card as _send_rich_card,
+            )
+            md = ds.render_markdown(doc_id)
+            shared = _Path("/Users/liyijiang/work/robot-dog/shared")
+            shared.mkdir(parents=True, exist_ok=True)
+            md_path = shared / f"{doc_id}.md"
+            md_path.write_text(md, encoding="utf-8")
+            log.info("crdt_doc_edit: scenario dumped md %s (%d bytes)",
+                     md_path.name, md_path.stat().st_size)
+
+            pm_cfg = _reg.get_effective_sync("project_manager")
+            if pm_cfg and pm_cfg.feishu_app_id and session.chat_id and \
+               not session.chat_id.startswith("task:") and \
+               not session.chat_id.startswith("oc_test"):
+                old_app = os.environ.get("EMPLOYEE_FEISHU_APP_ID", "")
+                old_secret = os.environ.get("EMPLOYEE_FEISHU_APP_SECRET", "")
+                os.environ["EMPLOYEE_FEISHU_APP_ID"] = pm_cfg.feishu_app_id or ""
+                os.environ["EMPLOYEE_FEISHU_APP_SECRET"] = pm_cfg.feishu_app_secret or ""
+                try:
+                    client = _make_client()
+                    _send_rich_card(
+                        client, session.chat_id,
+                        f"📋 {meta.title}",
+                        f"完成 {success}/{len(emps)} 人,文件附下:",
+                        "blue",
+                    )
+                    ok = _send_file_msg(client, session.chat_id, str(md_path))
+                    log.info("crdt_doc_edit: send_feishu_file ok=%s file=%s",
+                             ok, md_path.name)
+                finally:
+                    os.environ["EMPLOYEE_FEISHU_APP_ID"] = old_app
+                    os.environ["EMPLOYEE_FEISHU_APP_SECRET"] = old_secret
+        except Exception as exc:
+            log.warning("crdt_doc_edit: post-fanout send file failed: %s", exc)

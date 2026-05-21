@@ -1250,6 +1250,15 @@ def _start_group_listener(employee: str, client: lark.Client, app_id: str = "", 
             log.info("group_listener(%s): received speak_req session=%s summary=%s",
                      employee, session_id, summary_mode)
 
+            # 立即贴 Get 表情反馈"收到了,处理中"(避免用户以为消息丢了)。
+            # 多 fanout 员工同时贴会聚合成 "N 个 Get" 计数,体验自然。
+            if trigger_message_id and not summary_mode:
+                try:
+                    await asyncio.to_thread(add_reaction, client, trigger_message_id, "Get")
+                except Exception as exc:
+                    log.debug("group_listener(%s) add_reaction failed: %s",
+                              employee, exc)
+
             # speak_req 走 cli (RFC feishu-cli-direct Phase 2)
             # 让员工有完整工具能力(Read/Write/Bash/vision),跟单 @ 路径一致。
             # cli 失败时 fallback 到 langchain Haiku 当 break-glass。

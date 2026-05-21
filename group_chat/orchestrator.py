@@ -241,8 +241,14 @@ async def _decide_node(
                                input_summary=f"[fast-path] tags={fast_valid} all={is_all_marker} relay={is_relay} flock={is_concurrent_doc} crdt={is_crdt_doc} text={event.text[:120]}"):
             if is_crdt_doc:
                 # CRDT 真并发文档协作 → crdt_doc_edit scenario
-                participants = list(EMPLOYEE_CONFIG.keys()) if EMPLOYEE_CONFIG else (fast_valid or [])
-                participants = [p for p in participants if p != "user"]
+                # 支持两种模式:
+                #  - 用户 @ 了 N 个员工(fast_valid 非空) → 只让那 N 人协作
+                #  - 用户没 @ 具体人 / @所有人 → 全员协作
+                if fast_valid and not is_all_marker:
+                    participants = [p for p in fast_valid if p != "user"]
+                else:
+                    participants = list(EMPLOYEE_CONFIG.keys()) if EMPLOYEE_CONFIG else []
+                    participants = [p for p in participants if p != "user"]
                 session.template = "crdt_doc_edit"
                 session.host = "project_manager"
                 session.mode = "parallel"
