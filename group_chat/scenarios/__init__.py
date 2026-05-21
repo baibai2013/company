@@ -17,11 +17,12 @@ from . import guess_number  # noqa: F401
 from . import werewolf  # noqa: F401
 from . import robot_engineering  # noqa: F401
 from . import concurrent_doc_edit  # noqa: F401
+from . import crdt_doc_edit  # noqa: F401
 
 _log = logging.getLogger(__name__)
 
 # 文件名 → 模块，新增 Scenario 在此注册即可被热重载
-_scenario_modules = [guess_number, werewolf, robot_engineering, concurrent_doc_edit]
+_scenario_modules = [guess_number, werewolf, robot_engineering, concurrent_doc_edit, crdt_doc_edit]
 
 
 def reload_all():

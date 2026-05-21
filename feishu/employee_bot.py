@@ -1102,11 +1102,14 @@ def make_on_message(employee: str, client: lark.Client, bot_open_id: str):
             # 接龙关键词:让 sequential 路径接管,不让 PM 一个人代笔
             is_relay = any(kw in (text or "") for kw in
                            ("接龙", "接力", "轮流", "依次", "按顺序发言", "排队发言"))
-            # 共享文档并发编辑:全员 fanout 走 concurrent_doc_edit scenario
-            is_concurrent_doc = any(kw in (text or "") for kw in
-                                    ("共享文档", "共编", "同写", "共同编辑",
-                                     "协同编辑", "并发编辑", "同时编辑"))
-            if is_all or is_relay or is_concurrent_doc:
+            # 共享文档相关(B flock 或 D CRDT 都走 publish 给 orchestrator 编排)
+            is_doc_kw = any(kw in (text or "") for kw in
+                            ("共享文档", "共编", "同写", "共同编辑",
+                             "协同编辑", "并发编辑", "同时编辑",
+                             "CRDT", "crdt", "flock",
+                             "头脑风暴", "脑暴", "评审留言", "提问留言",
+                             "需求拆解", "分工协作"))
+            if is_all or is_relay or is_doc_kw:
                 # 多人协调路径 → orchestrator(原行为)
                 _publish_group_message(
                     chat_id, mid, text,

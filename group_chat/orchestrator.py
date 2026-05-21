@@ -225,14 +225,45 @@ async def _decide_node(
     text_lower = (event.text or "")
     is_relay = any(kw in text_lower for kw in
                    ("接龙", "接力", "轮流", "依次", "按顺序发言", "排队发言"))
-    # 共享文档并发编辑:全员同时改同一文件,每人改自己 section,flock 防冲突
+    # 共享文档并发编辑(B 方案 flock):全员同时改同一文件,每人改自己 section
     is_concurrent_doc = any(kw in text_lower for kw in
-                            ("共享文档", "共编", "同写", "共同编辑",
-                             "协同编辑", "并发编辑", "同时编辑"))
+                            ("共享文档(b)", "flock"))
+    # CRDT 真并发协作(D 方案):基于 pycrdt + redis stream,无锁字符级合并
+    # 触发关键词覆盖 5 大场景:头脑风暴/拆解/评审/留言/Q&A
+    is_crdt_doc = any(kw in text_lower for kw in
+                      ("共享文档", "共编", "同写", "共同编辑", "协同编辑",
+                       "并发编辑", "同时编辑", "CRDT", "crdt",
+                       "头脑风暴", "脑暴", "评审留言", "提问留言",
+                       "需求拆解", "分工协作"))
 
-    if is_all_marker or fast_valid or is_relay or is_concurrent_doc:
+    if is_all_marker or fast_valid or is_relay or is_concurrent_doc or is_crdt_doc:
         async with step_record(task_id, "decide",
-                               input_summary=f"[fast-path] tags={fast_valid} all={is_all_marker} relay={is_relay} concurrent={is_concurrent_doc} text={event.text[:120]}"):
+                               input_summary=f"[fast-path] tags={fast_valid} all={is_all_marker} relay={is_relay} flock={is_concurrent_doc} crdt={is_crdt_doc} text={event.text[:120]}"):
+            if is_crdt_doc:
+                # CRDT 真并发文档协作 → crdt_doc_edit scenario
+                participants = list(EMPLOYEE_CONFIG.keys()) if EMPLOYEE_CONFIG else (fast_valid or [])
+                participants = [p for p in participants if p != "user"]
+                session.template = "crdt_doc_edit"
+                session.host = "project_manager"
+                session.mode = "parallel"
+                session.participants = participants
+                session.pending = list(participants)
+                scenario_cls = SCENARIO_REGISTRY.get("crdt_doc_edit")
+                if scenario_cls:
+                    scenario = scenario_cls(session, session_store=session_store)
+                    session.game_state = scenario.initialize(event.text or "") or {}
+                await session_store.save(session)
+                log.info("decide_node[fast]: scenario=crdt_doc_edit doc_id=%s structure=%s",
+                         session.game_state.get("doc_id"),
+                         session.game_state.get("structure"))
+                return {
+                    **_state_set_session(state, session),
+                    "decision_json": json.dumps({
+                        "mode": "parallel",
+                        "participants": participants,
+                        "reason": "crdt_doc keyword → fanout CRDT scenario",
+                    }, ensure_ascii=False),
+                }
             if is_concurrent_doc:
                 # 共享文档并发编辑: 走 scenario, fanout 真并发
                 participants = list(EMPLOYEE_CONFIG.keys()) if EMPLOYEE_CONFIG else (fast_valid or [])
