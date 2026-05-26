@@ -27,3 +27,9 @@ watchdog>=4.0  # scenarios/ 目录热重载
 # pgvector — 向量存储与语义检索
 pgvector>=0.3          # SQLAlchemy Vector 类型
 openai>=1.0            # text-embedding-3-small（需配置 OPENAI_API_KEY）
+
+# OpenTelemetry — 全链路追踪（提案 4 §5.1）
+# 未配 OTEL_EXPORTER_OTLP_ENDPOINT 时全部退化为 NoOp,无副作用
+opentelemetry-api>=1.27
+opentelemetry-sdk>=1.27
+opentelemetry-exporter-otlp-proto-grpc>=1.27

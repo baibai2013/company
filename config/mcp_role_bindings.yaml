@@ -1,0 +1,26 @@
+# 提案 4 §2.3 — MCP server 按角色装载白名单。
+#
+# 用法:agents_v2/shared/claude_pool.py 的 _build_mcp_config(employee_key) 读取本表,
+# 为每个员工生成只挂载白名单 server 的 .mcp.json,降 prompt 噪音 + 收紧权限。
+#
+# 5 个 server:messaging / docs / scheduling / orchestration / verification
+# 取舍说明:
+#   - 工程层(机械/硬件/固件/算法/成本)只能写文档 + 发飞书,不能派活
+#   - testing 多挂 verification(后续要调 ground truth checker)
+#   - tech_lead 是唯一能用 verification 的员工(除 testing)
+#   - PM/TechLead 能派活;project_manager 不派活只跟进进度
+
+employees:
+  pm:                [scheduling, docs, messaging, orchestration]
+  tech_lead:         [scheduling, docs, messaging, orchestration, verification]
+  mechanical:        [docs, messaging]
+  hardware:          [docs, messaging]
+  firmware:          [docs, messaging]
+  algorithm:         [docs, messaging]
+  testing:           [docs, messaging, verification]
+  cost:              [docs, messaging]
+  project_manager:   [scheduling, docs, messaging]
+
+# 全局 deny:任何员工都不能调用,删除类操作走人审
+global_deny:
+  - delete_*

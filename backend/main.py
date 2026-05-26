@@ -1,3 +1,5 @@
+import asyncio
+import logging
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
@@ -14,11 +16,18 @@ from backend.api.routes.tasks import router as tasks_router
 from backend.chat.kanban_adapter import kanban_adapter
 from backend.chat.task_adapter import task_adapter
 from backend.chat.ws import router as ws_router
+from backend.core.otel import init_tracer
 from backend.services import registry
+from backend.services.delegation_supervisor import run_supervisor_loop
+
+log = logging.getLogger("backend.main")
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    # OTel 优先 init:env OTEL_EXPORTER_OTLP_ENDPOINT 没设时退化 NoOp,无副作用
+    init_tracer()
+
     await registry.warmup()
     registry.start_listener()
 
@@ -32,7 +41,20 @@ async def lifespan(app: FastAPI):
     await task_bus_pool.connect()
     await task_adapter.start(task_bus_pool)
 
+    # 提案 1 派活状态机的守护协程:每 30s 扫一次 in-flight delegations,nudge / escalate
+    supervisor_task = asyncio.create_task(
+        run_supervisor_loop(interval_seconds=30),
+        name="delegation_supervisor",
+    )
+
     yield
+
+    supervisor_task.cancel()
+    try:
+        await supervisor_task
+    except (asyncio.CancelledError, Exception) as exc:  # noqa: BLE001
+        if not isinstance(exc, asyncio.CancelledError):
+            log.warning("supervisor 任务关闭异常: %s", exc)
 
     await task_adapter.stop()
     await task_bus_pool.disconnect()

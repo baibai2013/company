@@ -48,6 +48,9 @@ class SpawnArgs:
     effort: str
     extra_cli_args: list[str] = field(default_factory=list)
     cmd_wrapper: object = None    # callable: argv → argv，给外部包 sandbox-exec 用
+    # ── Wave 1 集成新增字段(默认 None,旧调用方不受影响)──────────────────
+    env_extra: dict[str, str] | None = None  # 注入子进程 env(MCP 中间件依赖 EMPLOYEE_KEY/TASK_ID)
+    employee_key: str | None = None          # 给 OTel employee_span 用
 
 
 class PersistentRunner:
@@ -82,13 +85,22 @@ class PersistentRunner:
         log.debug("PersistentRunner spawn cwd=%s model=%s effort=%s",
                   self.spawn_args.cwd, self.spawn_args.model, self.spawn_args.effort)
 
+        # limit=32MB: 工具响应偶尔会很大(读 mp4/png base64、长 STEP/JSON 等),
+        # 4MB 实测会被超(2026-05-23: 小米读 5.3MB mp4 触发 LimitOverrunError 整池 fallback)。
+        # 32MB 单行远超任何合理 stream-json 事件,加上 parse_stream_loop 的 graceful skip,基本兜住。
+        sub_env = None
+        if self.spawn_args.env_extra:
+            sub_env = os.environ.copy()
+            sub_env.update(self.spawn_args.env_extra)
+
         self._process = await asyncio.create_subprocess_exec(
             *cmd,
             stdin=asyncio.subprocess.PIPE,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
             cwd=self.spawn_args.cwd,
-            limit=4 * 1024 * 1024,
+            limit=32 * 1024 * 1024,
+            env=sub_env,
         )
 
     @property
@@ -123,15 +135,24 @@ class PersistentRunner:
             except Exception as exc:
                 raise RuntimeError(f"写 stdin 失败（子进程可能已挂）: {exc}") from exc
 
-            # 读 stream-json 到 result 事件
-            state = await parse_stream_loop(
-                self._process.stdout,
-                on_text=on_text, on_thinking=on_thinking,
-                on_tool_start=on_tool_start, on_tool_result=on_tool_result,
-                on_chunk=on_chunk,
-                stop_on_result=True,
-                timeout=MAX_TIMEOUT,
-            )
+            # ── OTel 包裹(只对走过 spawn_for_task 的 runner 生效;旧路径 NoOp)──
+            from agents_v2.shared.otel import llm_call_span
+            with llm_call_span(
+                self.spawn_args.model,
+                **{
+                    "employee.key": self.spawn_args.employee_key or "unknown",
+                    "llm.session_id": self.session_id or "<new>",
+                },
+            ):
+                # 读 stream-json 到 result 事件
+                state = await parse_stream_loop(
+                    self._process.stdout,
+                    on_text=on_text, on_thinking=on_thinking,
+                    on_tool_start=on_tool_start, on_tool_result=on_tool_result,
+                    on_chunk=on_chunk,
+                    stop_on_result=True,
+                    timeout=MAX_TIMEOUT,
+                )
 
             self.last_used_at = time.monotonic()
             if state.new_session_id:
@@ -328,3 +349,109 @@ def get_pool() -> ClaudePool:
     if _pool is None:
         _pool = ClaudePool()
     return _pool
+
+
+# ── Wave 1 集成入口 ──────────────────────────────────────────────────────────
+# 旧调用方继续直接 acquire/release;新调用方走 spawn_for_task 拿到带 MCP 角色绑定 +
+# 上下文 preamble 的 runner。两条路径并存,Wave 2/3 把员工逐个迁过来。
+
+_MCP_BINDINGS_PATH = Path(__file__).resolve().parent.parent.parent / "config" / "mcp_role_bindings.yaml"
+
+
+def _build_mcp_config(employee_key: str) -> str | None:
+    """读 config/mcp_role_bindings.yaml,生成只挂载白名单 server 的临时 .mcp.json。
+
+    返回临时文件路径(给 claude code 的 --mcp-config 用);
+    若 yaml 不存在或员工没配置,返回 None(调用方退化到默认 mcp 配置)。
+
+    新 server 包名约定:`mcp_servers.<name>.server`(stream B 落地)。
+    """
+    import tempfile
+
+    try:
+        import yaml
+    except ImportError:
+        log.warning("[pool] 缺 pyyaml,_build_mcp_config 退化")
+        return None
+
+    if not _MCP_BINDINGS_PATH.exists():
+        log.debug("[pool] mcp_role_bindings.yaml 不存在,退化默认配置")
+        return None
+
+    try:
+        bindings = yaml.safe_load(_MCP_BINDINGS_PATH.read_text(encoding="utf-8")) or {}
+    except Exception as exc:
+        log.warning("[pool] 读 mcp_role_bindings.yaml 失败: %s", exc)
+        return None
+
+    servers = bindings.get("employees", {}).get(employee_key)
+    if not servers:
+        log.debug("[pool] employee=%s 未在 yaml 配置,退化默认", employee_key)
+        return None
+
+    config = {
+        "mcpServers": {
+            name: {
+                "command": "python",
+                "args": ["-m", f"mcp_servers.{name}.server"],
+            }
+            for name in servers
+        }
+    }
+
+    fd, path = tempfile.mkstemp(prefix=f"mcp_{employee_key}_", suffix=".json")
+    with os.fdopen(fd, "w", encoding="utf-8") as f:
+        json.dump(config, f, ensure_ascii=False)
+    return path
+
+
+async def spawn_for_task(
+    *,
+    employee_key: str,
+    task_id: str | None,
+    cwd: str,
+    thread_id: str,
+    model: str,
+    effort: str,
+) -> tuple[PersistentRunner, PoolKey, str | None]:
+    """Wave 1 集成入口:封装 _build_mcp_config + 子进程 env + 上下文预言生成。
+
+    与原 acquire 的差异:
+      - 自动挂载 MCP 按角色绑定(`config/mcp_role_bindings.yaml`)
+      - 注入 EMPLOYEE_KEY / TASK_ID 给子进程 env(MCP trace 中间件依赖)
+      - 调 backend.services.context_builder.build_context_preamble 生成上下文段
+      - PersistentRunner.submit() 自动包 OTel llm_call_span(employee_key 已传入)
+
+    返回:(runner, pool_key, preamble_or_none)
+      - preamble 由调用方自行 prepend 到首次 prompt,本函数不替你 prepend
+        (给上层留余地决定 system 段还是 user 段)
+      - 用完仍需 pool.release(pool_key, runner)
+    """
+    mcp_config_path = _build_mcp_config(employee_key)
+    extra_args = ["--mcp-config", mcp_config_path] if mcp_config_path else []
+
+    env_extra: dict[str, str] = {"EMPLOYEE_KEY": employee_key}
+    if task_id:
+        env_extra["TASK_ID"] = task_id
+
+    spawn_args = SpawnArgs(
+        cwd=cwd,
+        model=model,
+        effort=effort,
+        extra_cli_args=extra_args,
+        env_extra=env_extra,
+        employee_key=employee_key,
+    )
+
+    pool_key: PoolKey = (employee_key, cwd, thread_id, model, effort)
+    runner = await get_pool().acquire(pool_key, spawn_args)
+
+    # 上下文预言失败不阻塞 spawn(预言可选,且 dev pg 不可用时不挂)
+    preamble: str | None = None
+    try:
+        from backend.services.context_builder import build_context_preamble
+        preamble = await build_context_preamble(employee_key, task_id) or None
+    except Exception as exc:
+        log.warning("[pool] build_context_preamble 失败,跳过预言: %s", exc)
+
+    return runner, pool_key, preamble

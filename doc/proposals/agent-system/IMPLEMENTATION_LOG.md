@@ -13,7 +13,7 @@
 | Wave | 内容 | 状态 | 起止 |
 |---|---|---|---|
 | **Wave 0** | 数据底座(4 提案 schema) | ✅ 完成 | 2026-05-26(同日) |
-| **Wave 1** | 骨干起步 + MCP/OTel | ⚪ 未开始 | — |
+| **Wave 1** | 骨干起步 + MCP/OTel | ✅ 完成 | 2026-05-26(同日) |
 | **Wave 2** | 验证 + RAG + 看板 | ⚪ 未开始 | — |
 | **Wave 3** | 学习 + 多 agent 编排 | ⚪ 未开始 | — |
 | **Wave 4** | 系统工程收尾(CI/沙箱/灾备) | ⚪ 未开始 | — |
@@ -59,12 +59,36 @@
 
 ## Wave 1 · 骨干起步 + 横切 P0
 
-> 待 Wave 0 验收后启动
+### 派活(2026-05-26)
 
-**计划 stream**:
-- 提案 1 主路径:`context_builder` + delegations 状态机
-- 提案 4 §2:MCP 拆 5 个 server + 中间件
-- 提案 4 §5.1:OpenTelemetry 接入
+| Stream | Sub-agent | 范围 | 产出文件 |
+|---|---|---|---|
+| **W1-A** | general-purpose | 提案 1 主路径(context_builder + delegations 状态机 + memory_summarizer) | `backend/repos/{task_context,delegation}_repo.py`<br>`backend/services/{context_builder,delegation_service,delegation_supervisor,memory_summarizer}.py`<br>`backend/tests/test_{context_builder,delegation_service}.py` |
+| **W1-B** | general-purpose | 提案 4 §2(MCP 拆 5 个 server + middleware + 角色绑定) | `mcp_servers/_shared/{middleware,db}.py`<br>`mcp_servers/{messaging,docs,scheduling,orchestration,verification}/server.py`<br>`config/mcp_role_bindings.yaml`<br>`mcp_servers/_shared/tests/test_middleware.py` |
+| **W1-C** | general-purpose | 提案 4 §5.1(OpenTelemetry SDK + 三层 span 命名) | `agents_v2/shared/otel.py`<br>`backend/core/otel.py`<br>`backend/tests/test_otel.py` |
+
+**约定**:
+- W1-B **不动**老 `mcp_servers/company_tools/server.py`(主进程后续 cutover)
+- W1-A **不动** `agents_v2/shared/claude_pool.py` 与 `feishu/sender.py`(主进程集成)
+- W1-C **不 instrument** `claude_pool.py` / `cc_executor.py` / `main.py`(主进程集成)
+- 3 个 sub-agent 各自跑测试但**不 commit**
+
+### 集成 checklist(主进程做)
+
+- [x] 3 个 stream 文件齐备(8+16+3 共 27 个新文件)
+- [x] `claude_pool.spawn_for_task(employee_key, task_id)` 接 `build_context_preamble` + `_build_mcp_config` + `llm_call_span`(submit 自动包 OTel)
+- [ ] ~~`company_tools/server.py` 加 trace 中间件~~ — **延后到 Wave 2/3 cutover**:老工具是 sync def,中间件是 async,直接挂会引入 sync→async 转换坑;Wave 2 把员工切到新 server 后,老 server 自然落幕
+- [x] `backend/main.py` 启动 OTel SDK + supervisor loop(lifespan 头部 init_tracer + asyncio.create_task)
+- [x] `requirements.txt` 加 opentelemetry-api/sdk/exporter-otlp-proto-grpc(W1-C 在 venv 装了但未登记)
+- [x] `pytest backend/tests/ mcp_servers/_shared/tests/` → 145 passed
+- [x] git commit
+
+### Wave 1 验收成果
+
+- 145/145 测试全过(原 109 + Wave 0 schema 10 + Wave 1 提案1 13 + OTel 10 + middleware 3)
+- `python -c "import backend.main"`、`import agents_v2.shared.claude_pool` 全无副作用
+- `_build_mcp_config('mechanical')` 实测产出 [docs, messaging] 临时 .mcp.json,正确按 yaml 白名单
+- `init_tracer()` 没配 OTLP endpoint 时静默 NoOp,不影响现有跑通路径
 
 ---
 
