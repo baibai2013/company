@@ -1,14 +1,19 @@
-"""派活状态机服务层 — 提案 1 §4.2 / §5.2。
+"""派活状态机服务层 — 提案 1 §4.2 / §5.2 + 提案 2 §6.2(Wave 2 集成 verifier)。
 
-包装 delegation_repo 的状态转移,加一层"副作用 hook"。本 wave 副作用只做:
-  - 落 DelegationEvent(已经在 repo 层做了原子写)
+包装 delegation_repo 的状态转移,加一层"副作用 hook"。本 wave 副作用:
+  - 落 DelegationEvent(repo 层做了原子写)
+  - complete_delegation 完成后 fire-and-forget 触发 verifier_orchestrator
   - log.info 提示后续主进程该做什么(飞书通知 / claude_pool spawn 提示)
 
-后续 Wave / 主进程会把这里的 log 替换成真正的飞书 send_delegation_card
-和 prompt 队列推送。
+⚠️ verifier 触发是 fire-and-forget(asyncio.create_task),失败只 log,不
+阻塞 done 主路径。原因:本 wave verifier 仍是规则 stub,真业务 LLM 接入
+在 Wave 4+;状态机暂未引入 'verifying' 中间态(见 verifier_orchestrator
+docstring 的 TODO),所以这里仍是 in_progress→done 转移,verifier 只
+落 verifier_run + 可能 gate_approval 记录,不再回退 delegation 状态。
 """
 from __future__ import annotations
 
+import asyncio
 import logging
 from datetime import datetime, timedelta, timezone
 
@@ -152,12 +157,35 @@ async def complete_delegation(
         payload={"summary": artifacts.get("summary") if isinstance(artifacts, dict) else None},
         artifacts=artifacts,
     )
-    # TODO(主进程集成): 通知派活方"活回来了" + 触发 verifier(提案 2)
     log.info(
         "delegation_service: done id=%s by=%s artifacts_keys=%s",
         row.id, cur.to_employee, list(artifacts.keys()) if isinstance(artifacts, dict) else "?",
     )
+
+    # 提案 2 三闸 — fire-and-forget,失败只 log,不阻塞 done 主路径
+    asyncio.create_task(_trigger_verifier_safe(delegation_id))
     return row
+
+
+async def _trigger_verifier_safe(delegation_id: str) -> None:
+    """fire-and-forget 触发 verifier_orchestrator,任何异常吞掉只 log。
+
+    单独抽函数是为了:
+      1. 让 asyncio.create_task 拿到一个有 name 的 Task
+      2. 集中 try/except,避免污染 complete_delegation 主路径
+    """
+    try:
+        from backend.services import verifier_orchestrator
+        result = await verifier_orchestrator.on_delegation_done(delegation_id)
+        log.info(
+            "verifier triggered for delegation=%s → %s",
+            delegation_id, result.get("final_verdict"),
+        )
+    except Exception as exc:  # noqa: BLE001
+        log.warning(
+            "verifier 触发失败,delegation=%s 已 done 但未验证: %s",
+            delegation_id, exc,
+        )
 
 
 # ── 撤回 ───────────────────────────────────────────────────────────

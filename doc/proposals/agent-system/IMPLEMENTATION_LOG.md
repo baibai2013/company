@@ -14,7 +14,7 @@
 |---|---|---|---|
 | **Wave 0** | 数据底座(4 提案 schema) | ✅ 完成 | 2026-05-26(同日) |
 | **Wave 1** | 骨干起步 + MCP/OTel | ✅ 完成 | 2026-05-26(同日) |
-| **Wave 2** | 验证 + RAG + 看板 | ⚪ 未开始 | — |
+| **Wave 2** | 验证 + RAG + 看板 | ✅ 完成 | 2026-05-26(同日) |
 | **Wave 3** | 学习 + 多 agent 编排 | ⚪ 未开始 | — |
 | **Wave 4** | 系统工程收尾(CI/沙箱/灾备) | ⚪ 未开始 | — |
 
@@ -94,12 +94,42 @@
 
 ## Wave 2 · 验证 + RAG + 看板
 
-> 待 Wave 1 验收后启动
+### 派活(2026-05-26)
 
-**计划 stream**:
-- 提案 2:三闸(LLM verifier / ground truth / human gate)
-- 提案 4 §1:RAG L2 入库流水线 + 召回嵌入 prompt
-- 提案 4 §5.2:Grafana SLO 看板
+| Stream | Sub-agent | 范围 | 产出文件 |
+|---|---|---|---|
+| **W2-A** | general-purpose | 提案 2 三闸(LLM verifier + 通用 checker 框架 + orchestrator) | `backend/repos/{verifier_run,acceptance_check,gate_approval}_repo.py`<br>`backend/services/llm_verifier.py`<br>`backend/services/checkers/{__init__,runner,build123d_executable,output_artifacts}.py`<br>`backend/services/verifier_orchestrator.py`<br>`backend/tests/test_{verifier,checkers}.py` |
+| **W2-B** | general-purpose | 提案 4 §1 RAG L2/L3 入库 + 召回 | `backend/services/{embeddings,kb_ingest,kb_retrieve}.py`<br>`backend/repos/kb_repo.py`<br>`scripts/kb_{import_domain,backfill}.py`<br>`backend/tests/test_{kb_ingest,kb_retrieve}.py` |
+| **W2-C** | general-purpose | 提案 4 §5.2 Grafana SLO 看板 | `infra/grafana/datasources/*.yaml`<br>`infra/grafana/dashboards/{agent_system_health,proposal_1_state,proposal_2_verification}.json`<br>`infra/grafana/README.md` |
+
+**约定**:
+- W2-A 不接飞书 gate 闭环(留 Wave 3),不动 mcp_servers
+- W2-B 不动 context_builder.py(主进程接),embedding 测试用 stub 不真调 OpenAI
+- W2-C 只产配置文件,不写 Python
+- 3 个 sub-agent 各自跑测试但不 commit
+
+### 集成 checklist(主进程做)
+
+- [x] `mcp_servers/verification/server.py` 替换 stub 为 `run_acceptance_check` + `list_recent_verifier_runs`
+- [x] `context_builder.build_context_preamble` 接 W2-B 的 `retrieve_kb` 拼 RAG L2/L3 段(带 `has_domain_keyword` 触发 + 整段失败降级)
+- [x] `delegation_service.complete_delegation` fire-and-forget 触发 `verifier_orchestrator.on_delegation_done`(失败只 log)
+- [x] `pytest backend/tests/ mcp_servers/_shared/tests/` → 184 passed
+- [x] git commit
+
+### Wave 2 验收成果
+
+- 184/184 测试全过(Wave 1 末 145 + W2-A 三闸 16 + W2-B RAG 23)
+- W2-A 落地 11 个文件:LLM verifier 规则 stub + 通用 checker 框架 + orchestrator;Wave 4+ 接 Haiku
+- W2-B 落地 9 个文件:embeddings(SHA256 伪向量降级)+ kb_ingest/retrieve/repo + scripts;真 OpenAI 路径预留
+- W2-C 落地 5 个文件:Postgres datasource + 3 dashboard JSON(13 panel / 14 query)+ README
+- 集成入口都已串通:context_builder 拼 6 段(L1/L2chunk/RAG-L2/RAG-L3/out/in),delegation_service done 后 fire-and-forget verifier
+
+⚠️ Wave 2 折衷继续生效(到 Wave 3+ 闭环):
+- LLM verifier 仍是规则 stub(auto_pass / force_human / fail_marker),Wave 4+ 接 Haiku
+- 状态机暂未引入 'verifying' 中间态,verifier 只落 verifier_run + 可选 gate_approval pending,不回退 delegation 状态;反馈链(给接活方"打回")留 Wave 3
+- RAG embedding 在 dev 走 SHA256 伪向量(OPENAI_BASE_URL 当前指 chat 端点),区分度弱仅适合 dev/test;真 OpenAI 接入留主进程后续切环境
+- 飞书 gate callback(`feishu/cc_bridge/gate_callback.py`)未挂,`handle_gate_decision` 接口已就位等 Wave 3
+- Grafana 数据真正流入要等"切员工到新 mcp server"完成(老 company_tools 还没 cutover)
 
 ---
 

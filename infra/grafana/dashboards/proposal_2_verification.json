@@ -1,0 +1,214 @@
+{
+  "annotations": {
+    "list": [
+      {
+        "builtIn": 1,
+        "datasource": { "type": "grafana", "uid": "-- Grafana --" },
+        "enable": true,
+        "hide": true,
+        "iconColor": "rgba(0, 211, 255, 1)",
+        "name": "Annotations & Alerts",
+        "type": "dashboard"
+      }
+    ]
+  },
+  "description": "提案 2 三闸验证健康度 — verifier_runs verdict 分布 / gate 审批耗时 / per-checker 通过率 / 7d 验证趋势。",
+  "editable": true,
+  "fiscalYearStartMonth": 0,
+  "graphTooltip": 1,
+  "id": null,
+  "uid": "proposal-2-verification",
+  "title": "提案 2 · 三闸验证通过率与延迟",
+  "tags": ["agent", "proposal-2", "verifier", "gate"],
+  "timezone": "browser",
+  "schemaVersion": 39,
+  "version": 1,
+  "refresh": "5m",
+  "time": { "from": "now-7d", "to": "now" },
+  "templating": {
+    "list": [
+      {
+        "name": "interval",
+        "type": "interval",
+        "label": "聚合粒度",
+        "auto": true,
+        "auto_count": 60,
+        "auto_min": "1h",
+        "query": "1h,6h,1d",
+        "current": { "text": "auto", "value": "$__auto_interval_interval" }
+      }
+    ]
+  },
+  "panels": [
+    {
+      "id": 1,
+      "type": "piechart",
+      "title": "verifier_runs verdict 分布",
+      "description": "过去 7 天 verifier_runs 的 final_verdict 分布;NULL(未结案)与 fail/pass 三类占比。",
+      "datasource": { "type": "postgres", "uid": "company_pg" },
+      "gridPos": { "h": 9, "w": 12, "x": 0, "y": 0 },
+      "options": {
+        "pieType": "donut",
+        "displayLabels": ["name", "percent"],
+        "legend": { "displayMode": "table", "placement": "right", "values": ["value", "percent"] },
+        "tooltip": { "mode": "single", "sort": "desc" },
+        "reduceOptions": { "values": true, "calcs": ["lastNotNull"], "fields": "" }
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "color": { "mode": "palette-classic" }
+        },
+        "overrides": [
+          {
+            "matcher": { "id": "byName", "options": "pass" },
+            "properties": [{ "id": "color", "value": { "mode": "fixed", "fixedColor": "green" } }]
+          },
+          {
+            "matcher": { "id": "byName", "options": "fail" },
+            "properties": [{ "id": "color", "value": { "mode": "fixed", "fixedColor": "red" } }]
+          },
+          {
+            "matcher": { "id": "byName", "options": "(null)" },
+            "properties": [{ "id": "color", "value": { "mode": "fixed", "fixedColor": "gray" } }]
+          }
+        ]
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": { "type": "postgres", "uid": "company_pg" },
+          "format": "table",
+          "rawQuery": true,
+          "rawSql": "SELECT COALESCE(final_verdict, '(null)') AS metric, count(*) AS value FROM verifier_runs WHERE $__timeFilter(started_at) GROUP BY final_verdict ORDER BY 2 DESC"
+        }
+      ]
+    },
+    {
+      "id": 2,
+      "type": "heatmap",
+      "title": "gate_approvals 审批耗时分布",
+      "description": "gate_approvals 中已决策记录的 created_at→decided_at 耗时(分钟)直方分布。SLO P95 < 60min。",
+      "datasource": { "type": "postgres", "uid": "company_pg" },
+      "gridPos": { "h": 9, "w": 12, "x": 12, "y": 0 },
+      "options": {
+        "calculate": false,
+        "yAxis": { "axisLabel": "耗时(分钟)", "decimals": 0, "unit": "m" },
+        "color": { "mode": "scheme", "scheme": "Oranges", "steps": 64 },
+        "tooltip": { "show": true, "yHistogram": true },
+        "legend": { "show": true },
+        "exemplars": { "color": "rgba(255,0,255,0.7)" }
+      },
+      "fieldConfig": {
+        "defaults": { "custom": { "scaleDistribution": { "type": "linear" } } },
+        "overrides": []
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": { "type": "postgres", "uid": "company_pg" },
+          "format": "time_series",
+          "rawQuery": true,
+          "rawSql": "SELECT $__timeGroupAlias(created_at, $interval) AS time, EXTRACT(EPOCH FROM (decided_at - created_at)) / 60.0 AS \"耗时分钟\" FROM gate_approvals WHERE decided_at IS NOT NULL AND $__timeFilter(created_at) ORDER BY 1"
+        }
+      ]
+    },
+    {
+      "id": 3,
+      "type": "table",
+      "title": "per-checker 通过率",
+      "description": "acceptance_checks 按 check_name 分组的累计通过/失败次数,用于发现常态卡壳的检查器。",
+      "datasource": { "type": "postgres", "uid": "company_pg" },
+      "gridPos": { "h": 10, "w": 12, "x": 0, "y": 9 },
+      "options": {
+        "showHeader": true,
+        "cellHeight": "sm",
+        "footer": { "show": false, "reducer": ["sum"], "fields": "" }
+      },
+      "fieldConfig": {
+        "defaults": { "custom": { "align": "auto", "displayMode": "auto" } },
+        "overrides": [
+          {
+            "matcher": { "id": "byName", "options": "通过率" },
+            "properties": [
+              { "id": "unit", "value": "percentunit" },
+              { "id": "custom.displayMode", "value": "gradient-gauge" },
+              { "id": "min", "value": 0 },
+              { "id": "max", "value": 1 },
+              {
+                "id": "thresholds",
+                "value": {
+                  "mode": "absolute",
+                  "steps": [
+                    { "color": "red", "value": null },
+                    { "color": "yellow", "value": 0.7 },
+                    { "color": "green", "value": 0.95 }
+                  ]
+                }
+              }
+            ]
+          },
+          {
+            "matcher": { "id": "byName", "options": "failed" },
+            "properties": [{ "id": "custom.displayMode", "value": "color-text" }, { "id": "color", "value": { "mode": "fixed", "fixedColor": "red" } }]
+          }
+        ]
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": { "type": "postgres", "uid": "company_pg" },
+          "format": "table",
+          "rawQuery": true,
+          "rawSql": "SELECT check_name, count(*) FILTER (WHERE ok) AS passed, count(*) FILTER (WHERE NOT ok) AS failed, (count(*) FILTER (WHERE ok))::float / NULLIF(count(*), 0) AS \"通过率\" FROM acceptance_checks GROUP BY check_name ORDER BY 4 ASC, 1"
+        }
+      ]
+    },
+    {
+      "id": 4,
+      "type": "timeseries",
+      "title": "过去 7 天验证发起趋势",
+      "description": "verifier_runs.started_at 按时间分桶,叠加 final_verdict 拆分,观察验证活动节奏。",
+      "datasource": { "type": "postgres", "uid": "company_pg" },
+      "gridPos": { "h": 10, "w": 12, "x": 12, "y": 9 },
+      "options": {
+        "legend": { "displayMode": "table", "placement": "right", "calcs": ["sum", "lastNotNull"] },
+        "tooltip": { "mode": "multi", "sort": "desc" }
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "min": 0,
+          "custom": {
+            "drawStyle": "bars",
+            "fillOpacity": 80,
+            "stacking": { "mode": "normal" }
+          }
+        },
+        "overrides": [
+          {
+            "matcher": { "id": "byName", "options": "pass" },
+            "properties": [{ "id": "color", "value": { "mode": "fixed", "fixedColor": "green" } }]
+          },
+          {
+            "matcher": { "id": "byName", "options": "fail" },
+            "properties": [{ "id": "color", "value": { "mode": "fixed", "fixedColor": "red" } }]
+          },
+          {
+            "matcher": { "id": "byName", "options": "(null)" },
+            "properties": [{ "id": "color", "value": { "mode": "fixed", "fixedColor": "gray" } }]
+          }
+        ]
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": { "type": "postgres", "uid": "company_pg" },
+          "format": "time_series",
+          "rawQuery": true,
+          "rawSql": "SELECT $__timeGroupAlias(started_at, $interval), COALESCE(final_verdict, '(null)') AS metric, count(*) AS value FROM verifier_runs WHERE $__timeFilter(started_at) GROUP BY 1, final_verdict ORDER BY 1"
+        }
+      ]
+    }
+  ]
+}

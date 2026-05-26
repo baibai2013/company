@@ -1,0 +1,216 @@
+{
+  "annotations": {
+    "list": [
+      {
+        "builtIn": 1,
+        "datasource": { "type": "grafana", "uid": "-- Grafana --" },
+        "enable": true,
+        "hide": true,
+        "iconColor": "rgba(0, 211, 255, 1)",
+        "name": "Annotations & Alerts",
+        "type": "dashboard"
+      }
+    ]
+  },
+  "description": "提案 1 派活状态机健康度 — delegations 状态分布 / 超时率 / 24h 创建-完成趋势 / 事件类型分布。",
+  "editable": true,
+  "fiscalYearStartMonth": 0,
+  "graphTooltip": 1,
+  "id": null,
+  "uid": "proposal-1-state",
+  "title": "提案 1 · 派活状态机健康度",
+  "tags": ["agent", "proposal-1", "delegations", "state-machine"],
+  "timezone": "browser",
+  "schemaVersion": 39,
+  "version": 1,
+  "refresh": "1m",
+  "time": { "from": "now-24h", "to": "now" },
+  "templating": {
+    "list": [
+      {
+        "name": "interval",
+        "type": "interval",
+        "label": "聚合粒度",
+        "auto": true,
+        "auto_count": 60,
+        "auto_min": "5m",
+        "query": "5m,15m,1h,6h",
+        "current": { "text": "auto", "value": "$__auto_interval_interval" }
+      }
+    ]
+  },
+  "panels": [
+    {
+      "id": 1,
+      "type": "piechart",
+      "title": "delegations 当前状态分布",
+      "description": "全部 delegations 按 status 分布(实时快照,不带时间过滤)。",
+      "datasource": { "type": "postgres", "uid": "company_pg" },
+      "gridPos": { "h": 9, "w": 8, "x": 0, "y": 0 },
+      "options": {
+        "pieType": "donut",
+        "displayLabels": ["name", "percent"],
+        "legend": { "displayMode": "table", "placement": "right", "values": ["value", "percent"] },
+        "tooltip": { "mode": "single", "sort": "desc" },
+        "reduceOptions": { "values": true, "calcs": ["lastNotNull"], "fields": "" }
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "mappings": [],
+          "color": { "mode": "palette-classic" }
+        },
+        "overrides": [
+          {
+            "matcher": { "id": "byName", "options": "escalated" },
+            "properties": [{ "id": "color", "value": { "mode": "fixed", "fixedColor": "red" } }]
+          },
+          {
+            "matcher": { "id": "byName", "options": "done" },
+            "properties": [{ "id": "color", "value": { "mode": "fixed", "fixedColor": "green" } }]
+          }
+        ]
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": { "type": "postgres", "uid": "company_pg" },
+          "format": "table",
+          "rawQuery": true,
+          "rawSql": "SELECT status AS metric, count(*) AS value FROM delegations GROUP BY status ORDER BY 2 DESC"
+        }
+      ]
+    },
+    {
+      "id": 2,
+      "type": "stat",
+      "title": "超时率(>2h 仍 in_progress)",
+      "description": "状态为 in_progress 但 created_at 早于 now() - 2h 的 delegations 数量。SLO < 5 条。",
+      "datasource": { "type": "postgres", "uid": "company_pg" },
+      "gridPos": { "h": 9, "w": 8, "x": 8, "y": 0 },
+      "options": {
+        "reduceOptions": { "values": false, "calcs": ["lastNotNull"], "fields": "" },
+        "orientation": "auto",
+        "textMode": "value_and_name",
+        "colorMode": "background",
+        "graphMode": "area",
+        "justifyMode": "auto"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "green", "value": null },
+              { "color": "yellow", "value": 5 },
+              { "color": "red", "value": 20 }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": { "type": "postgres", "uid": "company_pg" },
+          "format": "table",
+          "rawQuery": true,
+          "rawSql": "SELECT count(*) AS \"超时数\" FROM delegations WHERE status = 'in_progress' AND created_at < now() - interval '2 hours'"
+        }
+      ]
+    },
+    {
+      "id": 3,
+      "type": "timeseries",
+      "title": "过去 24h 派活创建/完成趋势",
+      "description": "created(按 created_at)与 completed(按 done_at)的双线对比;两线长期发散即代表积压。",
+      "datasource": { "type": "postgres", "uid": "company_pg" },
+      "gridPos": { "h": 9, "w": 24, "x": 0, "y": 9 },
+      "options": {
+        "legend": { "displayMode": "list", "placement": "bottom", "calcs": ["sum"] },
+        "tooltip": { "mode": "multi", "sort": "desc" }
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "min": 0,
+          "custom": {
+            "drawStyle": "bars",
+            "barAlignment": -1,
+            "fillOpacity": 60,
+            "spanNulls": false,
+            "stacking": { "mode": "none" }
+          }
+        },
+        "overrides": [
+          {
+            "matcher": { "id": "byName", "options": "completed" },
+            "properties": [{ "id": "color", "value": { "mode": "fixed", "fixedColor": "green" } }]
+          },
+          {
+            "matcher": { "id": "byName", "options": "created" },
+            "properties": [{ "id": "color", "value": { "mode": "fixed", "fixedColor": "blue" } }]
+          }
+        ]
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": { "type": "postgres", "uid": "company_pg" },
+          "format": "time_series",
+          "rawQuery": true,
+          "rawSql": "SELECT $__timeGroupAlias(created_at, $interval), 'created' AS metric, count(*) AS value FROM delegations WHERE $__timeFilter(created_at) GROUP BY 1 ORDER BY 1"
+        },
+        {
+          "refId": "B",
+          "datasource": { "type": "postgres", "uid": "company_pg" },
+          "format": "time_series",
+          "rawQuery": true,
+          "rawSql": "SELECT $__timeGroupAlias(done_at, $interval), 'completed' AS metric, count(*) AS value FROM delegations WHERE done_at IS NOT NULL AND $__timeFilter(done_at) GROUP BY 1 ORDER BY 1"
+        }
+      ]
+    },
+    {
+      "id": 4,
+      "type": "bargauge",
+      "title": "delegation_events 类型分布(过去 24h)",
+      "description": "事件流按 event_type(created/claimed/progress_update/nudged/escalated/done/reopened)分组。",
+      "datasource": { "type": "postgres", "uid": "company_pg" },
+      "gridPos": { "h": 9, "w": 24, "x": 0, "y": 18 },
+      "options": {
+        "displayMode": "gradient",
+        "orientation": "horizontal",
+        "showUnfilled": true,
+        "valueMode": "color",
+        "reduceOptions": { "values": true, "calcs": ["lastNotNull"], "fields": "" }
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "min": 0,
+          "color": { "mode": "palette-classic" }
+        },
+        "overrides": [
+          {
+            "matcher": { "id": "byName", "options": "escalated" },
+            "properties": [{ "id": "color", "value": { "mode": "fixed", "fixedColor": "red" } }]
+          },
+          {
+            "matcher": { "id": "byName", "options": "nudged" },
+            "properties": [{ "id": "color", "value": { "mode": "fixed", "fixedColor": "orange" } }]
+          }
+        ]
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": { "type": "postgres", "uid": "company_pg" },
+          "format": "table",
+          "rawQuery": true,
+          "rawSql": "SELECT event_type AS metric, count(*) AS value FROM delegation_events WHERE $__timeFilter(created_at) GROUP BY event_type ORDER BY 2 DESC"
+        }
+      ]
+    }
+  ]
+}

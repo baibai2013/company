@@ -1,0 +1,33 @@
+# Grafana 数据源 provisioning · Postgres (company_app)
+#
+# 这份 yaml 会被 Grafana 启动时自动加载(provisioning/datasources)。
+# 部署时请把 ${POSTGRES_URL} env 注入容器,格式参考 backend/core/config.py 的
+# database_url_sync,但 Grafana 用的是同步驱动:
+#   POSTGRES_URL=postgres://admin:<pwd>@postgres:5432/company_app?sslmode=disable
+#
+# 数据源名固定为 company_pg,本目录下所有 dashboard panel 都通过这个名字引用。
+# Grafana 11.x 起 native postgres 插件即默认 datasource type=postgres。
+apiVersion: 1
+
+datasources:
+  - name: company_pg
+    type: postgres
+    access: proxy
+    # ${POSTGRES_URL} 的形式如 host:5432/db?sslmode=disable
+    # 这里只填 host:port/db,登录信息由 user / secureJsonData.password 给
+    url: $POSTGRES_URL
+    user: $POSTGRES_USER
+    database: $POSTGRES_DB
+    isDefault: true
+    editable: false
+    jsonData:
+      sslmode: disable
+      postgresVersion: 1500
+      timescaledb: false
+      # 用占位:Grafana 不强制要求 maxOpenConns,这里给个安全值
+      maxOpenConns: 10
+      maxIdleConns: 2
+      connMaxLifetime: 14400
+    secureJsonData:
+      password: $POSTGRES_PASSWORD
+    version: 1
