@@ -16,9 +16,9 @@
 | **Wave 1** | 骨干起步 + MCP/OTel | ✅ 完成 | 2026-05-26(同日) |
 | **Wave 2** | 验证 + RAG + 看板 | ✅ 完成 | 2026-05-26(同日) |
 | **Wave 3** | 学习 + 多 agent 编排 | ✅ 完成 | 27 文件;backend/agents_v2 224 测试全过 |
-| **Wave 4** | 系统工程收尾(CI/沙箱/灾备) | ⚪ 未开始 | — |
+| **Wave 4** | 系统工程收尾(CI/沙箱/灾备) | ✅ 完成 | 44 文件;全量 322 测试全过 |
 
-**Goal**:全部提案完成且测试通过。
+**Goal**:✅ 达成 — 4 篇提案 schema → backbone → 验证/RAG → 学习/编排 → 系统工程收尾五波闭合;`pytest backend/tests/ mcp_servers/_shared/tests/ agents_v2/tests/` 322 passed。
 
 ---
 
@@ -173,12 +173,45 @@
 
 ## Wave 4 · 系统工程收尾
 
-> 待 Wave 3 验收后启动
+✅ 已完成(2026-05-26)。3 个并行子 agent + 主进程集成。全量 322 测试全过。
 
-**计划**:
-- 提案 4 §5.3:CI evals gate
-- 提案 4 §5.4:沙箱 + 资源边界
-- 提案 4 §5.5:灾备(postgres 跨机备份 + 飞书幂等)
+### W4-A · CI evals gate + 沙箱 + 资源边界(7 文件,§5.3 + §5.4)
+- `backend/services/sandbox.py` — docker subprocess 包装,`SANDBOX_BACKEND=docker|subprocess|disabled`,docker 不可用降级 subprocess + log.warning
+- `backend/services/resource_limits.py` — `@with_resource_budget(cpu_seconds, mem_mb)` decorator(async/sync 双路径),`RESOURCE_LIMITS=off` 全局禁用
+- `scripts/evals_ci.py` — CI 入口,读最新 batch < 阈值 exit 1;DB 不可用 / 无数据走 db_err 路径放行(避免新仓阻塞)
+- `.github/workflows/evals_gate.yml` — pull_request + push to main 触发,起 pgvector:pg16 service + alembic upgrade + 跑 evals_ci
+- 22/22 测试全过
+
+### W4-B · 真 LLM verifier(Haiku)+ 飞书 gate 闭环 + 反馈链(6 文件,提案 2 §5+§6 收尾)
+- 替换 `backend/services/llm_verifier.py`(rule stub → `claude-haiku-4-5-20251001` AsyncAnthropic);三档降级:无 API key / SDK 异常 / 非白名单 verdict 都 fallback rule stub,verifier 主入口绝不 raise
+- 新建 `feishu/cc_bridge/gate_callback.py` — 飞书审批 webhook 入口,调 `verifier_orchestrator.handle_gate_decision`;签名校验留 stub(主进程 FastAPI 路由层做)
+- 新建 `feishu/cc_bridge/feedback_handler.py` — verifier fail 路径推回接活方 + 派活方,卡片样式遵守用户内存(无 # 标题、无 inline ` `,fenced 块保留)
+- 23/23 测试全过
+
+### W4-C · DR 灾备 + 8 员工 A2A 拆分 + 飞书幂等(31 文件,§5.5 + §3 收尾)
+- `infra/dr/{pg_backup.sh,pg_restore.sh,docker-compose.dr.yml,README.md}` — pg_dump/restore 脚本 + MinIO sidecar
+- `scripts/dr_backup.py` / `scripts/dr_restore.py` — Python wrapper,boto3 不可用降级本地存
+- `backend/models/dr.py` + `backend/repos/dr_backup_repo.py` — DRBackup 元数据
+- `backend/services/feishu_idempotency.py` — redis SETNX + EXPIRE 7d,redis 不可用降级进程内 dict
+- `agents_v2/_server_factory.py` + `agents_v2/a2a_router.py` + 8 员工 server.py(端口 8101-8108);路由失败 fallback in-process generic graph
+- 53/53 测试全过
+
+### 主进程集成
+- `agents_v2/tech_lead/routing.py`:命名对齐 — `pm/testing/cost` → `product_manager/test_engineer/cost_engineer`,与 a2a_router PORT_MAP 全名一致(否则 Supervisor 选出来的 key 路由不到 server)
+- `agents_v2/shared/claude_pool.py`:`spawn_for_task` 入口挂 `@with_resource_budget(mem_mb=2048)` — RLIMIT_AS 软上限 2GB,macOS 多半不强制(降级 log.warning)
+- `feishu/sender.py`:`acreate_rich_card` / `areply_rich_card` 加可选 `idem_key`,内部 `await mark_sent`,SETNX 重复直接 return None;sync 路径不动(老 API 飞书重放风险低)
+- `alembic/env.py` + `alembic/versions/wave4_dr_backups.py`:DRBackup 入迁移链(下游 wave0_merge),head 唯一 = wave4_dr_backups
+- `agents_v2/tests/test_supervisor.py`:同步更新 testing → test_engineer 期望
+- `pytest backend/tests/ mcp_servers/_shared/tests/ agents_v2/tests/` 322 passed
+
+⚠️ Wave 4 折衷(留主进程后续):
+- claude_pool 只挂 mem_mb,cpu_seconds 不挂(submit 自带 MAX_TIMEOUT,在那一层做硬超时更准)
+- pattern_extractor 真聚类 + 周期任务调度仍是骨架,真接 LLM 待落
+- evals_ci.py 阈值 < gate 时才 exit 1,DB 异常路径放行避免新仓阻塞
+- gate_callback / feedback_handler 不挂 FastAPI 路由(主进程 backend/api/feishu_routes.py 接 webhook + 验签)
+- 8 员工 server 真起进程仍要 systemd / docker-compose;本 wave 测试用 ASGITransport 内存拉
+- feishu/sender 只在 acreate / areply 两个 async 入口接幂等,sync 路径不动
+- pattern_extractor 聚类、真投产 minio + alembic dr revision pull-thru、真 Haiku verifier 拉测端到端 — 都需要 ops 配合
 
 ---
 

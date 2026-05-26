@@ -405,6 +405,13 @@ def _build_mcp_config(employee_key: str) -> str | None:
     return path
 
 
+# Wave 4 提案 4 §5.4 — 给 spawn 入口挂资源预算 mem 兜底(decorator 本身只调一次
+# _try_set_memory_limit,符合"边界只收不放"原则)。cpu_seconds 不挂 — submit 自带
+# MAX_TIMEOUT,在那一层做硬超时更准。
+from backend.services.resource_limits import with_resource_budget
+
+
+@with_resource_budget(mem_mb=2048)
 async def spawn_for_task(
     *,
     employee_key: str,
@@ -421,6 +428,8 @@ async def spawn_for_task(
       - 注入 EMPLOYEE_KEY / TASK_ID 给子进程 env(MCP trace 中间件依赖)
       - 调 backend.services.context_builder.build_context_preamble 生成上下文段
       - PersistentRunner.submit() 自动包 OTel llm_call_span(employee_key 已传入)
+      - **Wave 4** 入口挂 ``@with_resource_budget(mem_mb=2048)``:每次 spawn 时
+        统一收紧 RLIMIT_AS 软上限到 2GB(macOS 上 setrlimit 多半不强制,失败降级)
 
     返回:(runner, pool_key, preamble_or_none)
       - preamble 由调用方自行 prepend 到首次 prompt,本函数不替你 prepend

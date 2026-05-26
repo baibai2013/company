@@ -16,6 +16,7 @@ import backend.models.proposal1_state    # noqa: F401 — register TaskContext, 
 import backend.models.proposal2_verify   # noqa: F401 — register VerifierRun, AcceptanceCheck, GateApproval
 import backend.models.proposal3_learning # noqa: F401 — register Lesson, PatternExtract, EvalsFixture, EvalsRun, EvalsBatch
 import backend.models.proposal4_crosscut # noqa: F401 — register KbDocument, KbRetrievalLog, ToolCallLog, ToolFailureQueue, RoutingDecision
+import backend.models.dr  # noqa: F401 — register DRBackup (Wave 4 提案 4 §5.5)
 
 config = context.config
 config.set_main_option("sqlalchemy.url", settings.database_url_sync)

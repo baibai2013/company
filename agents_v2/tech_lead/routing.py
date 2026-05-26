@@ -22,9 +22,9 @@ EMPLOYEE_KEYWORDS: dict[str, list[str]] = {
     "firmware":        ["esp32", "rtos", "驱动", "i2c", "gpio"],
     "algorithm":       ["urdf", "pybullet", "控制", "步态", "力矩"],
     "hardware":        ["电机", "电源", "pcb"],
-    "testing":         ["测试", "评测", "回归"],
-    "cost":            ["成本", "采购", "bom 价格"],
-    "pm":              ["进度", "排期", "需求"],
+    "test_engineer":   ["测试", "评测", "回归"],     # 与 a2a_router PORT_MAP 全名对齐
+    "cost_engineer":   ["成本", "采购", "bom 价格"],  # 同上
+    "product_manager": ["进度", "排期", "需求"],     # 同上
     "tech_lead":       [],  # fallback,无关键词
     "project_manager": ["项目", "里程碑"],
 }

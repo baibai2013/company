@@ -1,0 +1,74 @@
+# Wave 4 · 提案 4 §5.5 — DR sidecar:用 MinIO 模拟 S3 + 备份 sidecar 容器
+#
+# 单独成文件,主 docker-compose.yml 不动。启动:
+#   docker compose -f infra/dr/docker-compose.dr.yml --env-file infra/.env up -d
+#
+# 服务:
+#   minio      :9000(API)/ :9001(Console)— 给 boto3 上传备份用
+#   pg_backup  cron sidecar(每天 02:00 跑一次 pg_backup.sh + dr_backup.py)
+#
+# 用 minio 而不是真 S3:
+#   - dev / 单机灾备演练免成本
+#   - boto3 行为完全兼容(endpoint_url 一切就好)
+#   - 真投产时只需把 S3_ENDPOINT 改回 https://s3.<region>.amazonaws.com 即可
+#
+# 主进程接管时:把这个 compose 加到 ops 文档,跑 e2e 演练前先起。
+
+services:
+  minio:
+    image: minio/minio:RELEASE.2024-01-01T16-36-33Z
+    container_name: company_dr_minio
+    restart: unless-stopped
+    ports:
+      - "9000:9000"
+      - "9001:9001"
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER:-minioadmin}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:-minioadmin}
+    command: server /data --console-address ":9001"
+    volumes:
+      - minio_data:/data
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9000/minio/health/live"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+
+  pg_backup:
+    # 用 postgres:16 自带 pg_dump + python(装 boto3)
+    image: postgres:16
+    container_name: company_dr_pg_backup
+    restart: unless-stopped
+    depends_on:
+      - minio
+    environment:
+      POSTGRES_HOST: ${POSTGRES_HOST:-host.docker.internal}
+      POSTGRES_PORT: ${POSTGRES_PORT:-5432}
+      POSTGRES_USER: ${POSTGRES_USER:-admin}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_DB: ${POSTGRES_DB:-company_app}
+      S3_ENDPOINT: http://minio:9000
+      S3_BUCKET: ${S3_BUCKET:-company-dr}
+      AWS_ACCESS_KEY_ID: ${MINIO_ROOT_USER:-minioadmin}
+      AWS_SECRET_ACCESS_KEY: ${MINIO_ROOT_PASSWORD:-minioadmin}
+    volumes:
+      - ../..:/repo:ro
+      - dr_tmp:/tmp/dr
+    # 简化的 cron loop:启动时立刻一次,然后每 24h 一次。
+    # 真投产建议挪到 host crontab 或 k8s CronJob,容器只做"执行单元"。
+    command: |
+      sh -c '
+        apt-get update && apt-get install -y python3 python3-pip cron && \
+        pip3 install boto3 && \
+        while true; do
+          echo "[dr_sidecar] $(date -u) 开始 dump"
+          bash /repo/infra/dr/pg_backup.sh /tmp/dr || echo "[dr_sidecar] dump 失败"
+          # wrapper 上传 + 写元数据
+          python3 /repo/scripts/dr_backup.py || echo "[dr_sidecar] wrapper 失败"
+          sleep 86400
+        done
+      '
+
+volumes:
+  minio_data:
+  dr_tmp:

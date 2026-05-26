@@ -179,7 +179,8 @@ async def test_routing_record_failure_does_not_break_supervisor(monkeypatch):
         config=_cfg("sup-thread-4"),
     )
     # 路由仍能选(只是没写 DB)
-    assert final["chosen_employee"] == "testing"
+    # Wave 4 routing 命名对齐 a2a_router PORT_MAP:testing → test_engineer
+    assert final["chosen_employee"] == "test_engineer"
     assert final["routing_decision_id"] is None
     # supervisor 仍跑到底
     assert final["status"] == "done"

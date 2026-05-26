@@ -691,6 +691,97 @@ def send_file_msg(client: lark.Client, chat_id: str, file_path: str) -> bool:
     return True
 
 
+# ── 视频消息 (msg_type=media,带缩略图,飞书可在线播放) ────────────────────────
+
+def _extract_video_thumb(video_path: str) -> str | None:
+    """用 ffmpeg 截视频第 1 秒的一帧成 jpg,返回临时文件路径。失败返回 None。
+    要求系统装了 ffmpeg。media 消息必须带 image_key,所以这步是必须的。"""
+    import shutil
+    import subprocess
+    import tempfile
+    if not shutil.which("ffmpeg"):
+        log.warning("send_video_msg: 系统没装 ffmpeg,无法截缩略图,fallback 到 send_file_msg")
+        return None
+    fd, thumb_path = tempfile.mkstemp(suffix=".jpg", prefix="video-thumb-")
+    os.close(fd)
+    try:
+        # -ss 1 跳到 1 秒(避开开头黑帧),-frames:v 1 只截 1 帧,-y 覆盖
+        result = subprocess.run(
+            ["ffmpeg", "-y", "-loglevel", "error",
+             "-ss", "1", "-i", video_path,
+             "-frames:v", "1", "-q:v", "3", thumb_path],
+            capture_output=True, timeout=30,
+        )
+        if result.returncode != 0:
+            log.warning("ffmpeg 截缩略图失败: %s", result.stderr.decode("utf-8", "replace")[:200])
+            return None
+        if not os.path.exists(thumb_path) or os.path.getsize(thumb_path) <= 0:
+            log.warning("ffmpeg 截缩略图为空: %s", thumb_path)
+            return None
+        return thumb_path
+    except Exception as exc:
+        log.warning("ffmpeg 异常: %s", exc)
+        return None
+
+
+def send_video_msg(client: lark.Client, chat_id: str, video_path: str) -> tuple[bool, str]:
+    """以飞书 media 消息(短视频,可在线预览+缩略图)发送本地 mp4。
+    流程: 截首帧 jpg → 上传成 image_key → 上传 mp4 拿 file_key → 发 media 消息。
+    缩略图截不出来 fallback 到 send_file_msg(普通文件附件,体验差但能用)。
+    返回 (ok, err_msg)。"""
+    p = Path(video_path)
+    if not p.is_file():
+        return False, f"视频不存在: {video_path}"
+    size_mb = p.stat().st_size / 1024 / 1024
+    if size_mb > 30:
+        return False, f"视频 {p.name} 超过 30MB ({size_mb:.1f}MB),飞书 file/media 上限"
+
+    # 1. 截缩略图(必须项,media 消息要 image_key)
+    thumb_path = _extract_video_thumb(video_path)
+    if not thumb_path:
+        # ffmpeg 不可用 → 退化成 send_file_msg
+        log.info("send_video_msg fallback to send_file_msg: %s", p.name)
+        ok = send_file_msg(client, chat_id, video_path)
+        return ok, "" if ok else "send_file_msg 失败 (看日志)"
+
+    # 2. 上传缩略图拿 image_key
+    image_key, err = upload_image(client, thumb_path)
+    try:
+        os.unlink(thumb_path)
+    except Exception:
+        pass
+    if not image_key:
+        log.warning("缩略图上传失败,fallback 到 send_file_msg: %s", err)
+        ok = send_file_msg(client, chat_id, video_path)
+        return ok, "" if ok else f"上传缩略图失败({err}) + send_file_msg 也失败"
+
+    # 3. 上传视频拿 file_key (复用 upload_file,会自动用 file_type=mp4)
+    file_key = upload_file(client, video_path)
+    if not file_key:
+        return False, "upload_file 失败 (看日志)"
+
+    # 4. 发 media 消息
+    body = (
+        CreateMessageRequestBody.builder()
+        .receive_id(chat_id)
+        .msg_type("media")
+        .content(json.dumps({"file_key": file_key, "image_key": image_key}))
+        .build()
+    )
+    req = (
+        CreateMessageRequest.builder()
+        .receive_id_type("chat_id")
+        .request_body(body)
+        .build()
+    )
+    resp = client.im.v1.message.create(req)
+    if not resp.success():
+        err = f"飞书 send_video_msg 失败: code={resp.code} msg={resp.msg}"
+        log.error(err)
+        return False, err
+    return True, ""
+
+
 def get_message(client: lark.Client, message_id: str) -> dict | None:
     """按 message_id 拉取一条飞书消息的完整 metadata + content。
     返回 {"message_type":..., "body":{"content": json_str}, "message_id":...} 或 None。
@@ -749,8 +840,20 @@ def download_file_resource(
 
 async def acreate_rich_card(
     client: lark.Client, chat_id: str, title: str, content: str, color: str = "grey",
+    idem_key: str | None = None,
 ) -> str | None:
-    """异步创建卡片，返回 message_id 用于后续 patch；失败返回 None。"""
+    """异步创建卡片，返回 message_id 用于后续 patch；失败返回 None。
+
+    Wave 4 提案 4 §5.5:可选 ``idem_key`` 接 ``feishu_idempotency``,在调真
+    SDK 之前 SETNX 一次 — 重复 key 直接返回 None,不浪费 lark 配额。
+    sync 路径(``send_card``/``send_rich_card``)未挂,飞书重放主要发生在
+    webhook 入口侧,主动发卡幂等只是兜底。
+    """
+    if idem_key:
+        from backend.services.feishu_idempotency import mark_sent
+        if not await mark_sent(idem_key):
+            log.info("acreate_rich_card: idem_key=%s 已处理,跳过", idem_key)
+            return None
     card_json = build_card_json(title, content, color)
     body = (
         CreateMessageRequestBody.builder()
@@ -766,8 +869,17 @@ async def acreate_rich_card(
 
 async def areply_rich_card(
     client: lark.Client, parent_id: str, title: str, content: str, color: str = "grey",
+    idem_key: str | None = None,
 ) -> str | None:
-    """异步以卡片回复某条消息，返回新卡片 message_id；失败返回 None。"""
+    """异步以卡片回复某条消息，返回新卡片 message_id；失败返回 None。
+
+    ``idem_key`` 同 ``acreate_rich_card``,可选幂等去重(Wave 4 提案 4 §5.5)。
+    """
+    if idem_key:
+        from backend.services.feishu_idempotency import mark_sent
+        if not await mark_sent(idem_key):
+            log.info("areply_rich_card: idem_key=%s 已处理,跳过", idem_key)
+            return None
     card_json = build_card_json(title, content, color)
     body = (
         ReplyMessageRequestBody.builder()
