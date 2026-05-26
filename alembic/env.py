@@ -12,6 +12,10 @@ import backend.models.employee  # noqa: F401 — register Employee, SystemConfig
 import backend.models.audit  # noqa: F401 — register AuditLog
 import backend.models.llm_call  # noqa: F401 — register LlmCall
 import backend.models.memory    # noqa: F401 — register EmployeeMemory
+import backend.models.proposal1_state    # noqa: F401 — register TaskContext, Delegation, DelegationEvent
+import backend.models.proposal2_verify   # noqa: F401 — register VerifierRun, AcceptanceCheck, GateApproval
+import backend.models.proposal3_learning # noqa: F401 — register Lesson, PatternExtract, EvalsFixture, EvalsRun, EvalsBatch
+import backend.models.proposal4_crosscut # noqa: F401 — register KbDocument, KbRetrievalLog, ToolCallLog, ToolFailureQueue, RoutingDecision
 
 config = context.config
 config.set_main_option("sqlalchemy.url", settings.database_url_sync)
