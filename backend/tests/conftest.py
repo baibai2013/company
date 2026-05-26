@@ -19,8 +19,17 @@ from backend.main import app
 
 TEST_DB_URL = "sqlite+aiosqlite:///:memory:"
 
-# Tables that use Postgres-only types that cannot be shimmed (pgvector Vector)
-_SKIP_TABLES = {"employee_memory"}
+# Tables that use Postgres-only types that cannot be shimmed
+# (pgvector Vector / postgresql.ARRAY)。需要这些表的测试都直接连 dev pg。
+_SKIP_TABLES = {
+    "employee_memory",      # Vector
+    "task_context",         # Vector
+    "kb_documents",         # Vector + ARRAY
+    "kb_retrieval_log",     # ARRAY
+    "lessons",              # Vector
+    "pattern_extracts",     # ARRAY
+    "routing_decisions",    # ARRAY
+}
 
 
 def _patch_sqlite_jsonb():

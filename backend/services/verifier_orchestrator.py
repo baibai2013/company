@@ -1,6 +1,8 @@
-"""提案 2 · 三闸编排器(verifier_orchestrator)。
+"""提案 2 · 三闸编排器(verifier_orchestrator)+ 提案 3 retro 钩子(Wave 3 集成)。
 
 复刻提案文档 §5.1 的伪码:闸 1 LLM → 闸 2 ground truth → 闸 3 human gate。
+Wave 3 在 _finalize 终态后 fire-and-forget 触发 retro_agent.run_retro_for_delegation,
+失败一律 swallow + log,不阻塞主路径。
 
 ⚠️ TODO(主进程后续集成):
 1. 提案 2 §6.2 要求 complete_delegation 加 "verifying" 中间态。Wave 1 状态机
@@ -10,14 +12,14 @@
    等主进程把 'verifying' 加进 _ALLOWED_TRANSITIONS 后,把这里的 TODO 替换为:
      - pass:  verifying → done
      - fail:  verifying → in_progress  + rejection_reason 写 DelegationEvent
-2. 飞书 gate callback 在 Wave 3 接(feishu/cc_bridge/gate_callback.py),
+2. 飞书 gate callback 在 Wave 4+ 接(feishu/cc_bridge/gate_callback.py),
    handle_gate_decision() 已经预留接口供 callback 调用。
 3. delegation_service.complete_delegation 当前直接 in_progress → done,
-   需要在主进程改成 in_progress → verifying 并 fire-and-forget 调用本模块的
-   on_delegation_done。
+   Wave 2 已经 fire-and-forget 调用本模块的 on_delegation_done(已就位)。
 """
 from __future__ import annotations
 
+import asyncio
 import logging
 import uuid
 from datetime import datetime, timedelta, timezone
@@ -66,6 +68,9 @@ async def _finalize(
         final_verdict=final_verdict,
         completed_at=_utcnow(),
     )
+
+    # Wave 3:终态(无论 pass / fail)都触发 retro,fire-and-forget,失败 swallow
+    asyncio.create_task(_trigger_retro_safe(delegation_id))
 
     if final_verdict != "pass":
         log.info(
@@ -312,6 +317,26 @@ async def handle_gate_decision(
             delegation_id=run.delegation_id,
             final_verdict="fail",
             reason=f"gate {decision} by {decided_by}: {reason}",
+        )
+
+
+async def _trigger_retro_safe(delegation_id: str) -> None:
+    """fire-and-forget 触发 retro_agent,任何异常 swallow + log。
+
+    与 delegation_service._trigger_verifier_safe 同样的模式 — 集中 try/except
+    避免污染 _finalize 主路径,asyncio.create_task 拿到一个有 name 的 Task。
+    """
+    try:
+        from backend.services import retro_agent
+        new_lessons = await retro_agent.run_retro_for_delegation(delegation_id)
+        log.info(
+            "retro triggered for delegation=%s → 抽出 %d 条 lesson",
+            delegation_id, len(new_lessons),
+        )
+    except Exception as exc:  # noqa: BLE001
+        log.warning(
+            "retro 触发失败,delegation=%s 已终态但未抽 lesson: %s",
+            delegation_id, exc,
         )
 
 

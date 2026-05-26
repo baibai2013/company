@@ -15,7 +15,7 @@
 | **Wave 0** | 数据底座(4 提案 schema) | ✅ 完成 | 2026-05-26(同日) |
 | **Wave 1** | 骨干起步 + MCP/OTel | ✅ 完成 | 2026-05-26(同日) |
 | **Wave 2** | 验证 + RAG + 看板 | ✅ 完成 | 2026-05-26(同日) |
-| **Wave 3** | 学习 + 多 agent 编排 | ⚪ 未开始 | — |
+| **Wave 3** | 学习 + 多 agent 编排 | ✅ 完成 | 27 文件;backend/agents_v2 224 测试全过 |
 | **Wave 4** | 系统工程收尾(CI/沙箱/灾备) | ⚪ 未开始 | — |
 
 **Goal**:全部提案完成且测试通过。
@@ -135,11 +135,39 @@
 
 ## Wave 3 · 学习 + 多 agent 编排
 
-> 待 Wave 2 验收后启动
+✅ 已完成(2026-05-26)。3 个并行子 agent 分头落地、主进程做集成 + 测试修复 + commit。
 
-**计划 stream**:
-- 提案 3:retro_agent + lessons + evals 骨架
-- 提案 4 §3:LangGraph Supervisor 落地 + 8 员工 A2A 拆分
+### W3-A · 提案 3 retro / lessons / evals 骨架(8 文件)
+- `backend/repos/lessons_repo.py`、`pattern_extract_repo.py`(psycopg sync + asyncio.to_thread + `::vector` cast,与 W2-B kb_repo 同模式,绕开 asyncpg pgvector codec 冲突)
+- `backend/services/retro_agent.py` — 接 `delegation` 终态后抽 1~3 条 lesson(rule stub:fail/cancel 路径才抽,pass 不抽)
+- `backend/services/lessons_retrieve.py` — 给 `context_builder` 用的 employee-scoped 召回 + `format_lessons_section` markdown 段(💡 标题)
+- `backend/services/pattern_extractor.py` — 周报级 L3:聚类同类 lesson 写 `pattern_extracts` 表(Wave 3 仅骨架,真聚类等 Wave 4+ 接 LLM)
+- 17 测试全过
+
+### W3-B · 提案 4 §3 LangGraph Supervisor + 多 agent(10 文件)
+- `agents_v2/generic/{state,graph}.py` — receive/decide/dispatch/conclude 四节点单 agent 壳(LangGraph StateGraph)
+- `agents_v2/tech_lead/{supervisor,routing}.py` — Supervisor 模式 stub:rule-based routing + `routing_decision_repo` 落决策记录
+- 8 员工 A2A server 端口拆分留 Wave 4(本 wave 仅 LangGraph 单节点壳就位,通过子图调度 + repo 持久化)
+- 16 测试全过
+
+### W3-C · evals 骨架 + CLI(9 文件)
+- `backend/repos/evals_{fixture,run,batch}_repo.py`
+- `backend/services/{evals_runner,evals_batch}.py` — fixture → run → batch 三段式;CI gate 阈值 stub
+- `scripts/{evals_seed,evals_run_batch}.py` — CLI 端到端 verified
+- 12 测试全过
+
+### 主进程集成
+- `backend/services/delegation_service.py`:`complete_delegation` 末尾 + `cancel_delegation` 末尾 各挂一个 `asyncio.create_task(_safe_wrapper)` — 都是 fire-and-forget,失败 swallow + log,绝不阻塞 done/cancel 主路径
+- `backend/services/verifier_orchestrator.py`:`_finalize` 在 verifier_run 终态后 fire-and-forget 触发 `_trigger_retro_safe`(pass / fail 都触发,cancelled 走 delegation_service 那一路)
+- `backend/services/context_builder.py`:新增 `_fetch_lessons_section` 段,顺序为 L1 记忆 → L2 chunk → RAG L2 → RAG L3 → 💡 历史教训 → 📤 派出 → 📥 待认领;失败一律 swallow log
+- `backend/tests/conftest.py` + 3 个本地有自己 `_SKIP_TABLES` 的测试文件(`test_kanban_ws.py`、`test_orchestration_e2e.py`、`test_task_step_writes.py`)同步加入 6 张 PG-only 表(task_context / kb_documents / kb_retrieval_log / lessons / pattern_extracts / routing_decisions),解决 SQLite fixture 创建 ARRAY/Vector 列报错
+- `pytest backend/tests/ mcp_servers/_shared/tests/ agents_v2/tests/` 全过(224 passed)
+
+⚠️ Wave 3 折衷(留 Wave 4):
+- pattern_extractor 仅骨架,真聚类 + 周期任务调度等接 LLM
+- 8 员工 A2A 端口拆分仅落 LangGraph 单节点壳,完整 8 子进程 server 留 Wave 4
+- evals CI gate 仅 CLI 可跑,真挂到 GitHub Actions 留 Wave 4
+- retro/lessons 走 rule stub:fail/cancel → 抽教训,真 LLM 抽取留 Wave 4 接 Haiku
 
 ---
 

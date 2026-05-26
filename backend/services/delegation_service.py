@@ -209,7 +209,30 @@ async def cancel_delegation(
         "delegation_service: cancelled id=%s by=%s reason=%s",
         row.id, canceller_employee, reason[:80],
     )
+
+    # Wave 3:cancelled 路径也触发 retro(verifier_orchestrator 不会经过 cancelled)
+    asyncio.create_task(_trigger_retro_for_cancelled_safe(delegation_id))
     return row
+
+
+async def _trigger_retro_for_cancelled_safe(delegation_id: str) -> None:
+    """cancelled 路径专用 retro 钩子,fire-and-forget,失败 swallow。
+
+    pass/fail 路径走 verifier_orchestrator._finalize → retro;cancelled
+    不会进 verifier,所以单独在这里挂一次。
+    """
+    try:
+        from backend.services import retro_agent
+        new_lessons = await retro_agent.run_retro_for_delegation(delegation_id)
+        log.info(
+            "retro(cancelled) triggered for delegation=%s → 抽出 %d 条 lesson",
+            delegation_id, len(new_lessons),
+        )
+    except Exception as exc:  # noqa: BLE001
+        log.warning(
+            "retro(cancelled) 触发失败,delegation=%s: %s",
+            delegation_id, exc,
+        )
 
 
 # ── 催办 ───────────────────────────────────────────────────────────

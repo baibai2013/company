@@ -23,7 +23,10 @@ from group_chat.models import GroupSession, MessageEvent, SpeakResponse
 from group_chat.session import SessionStore
 
 
-_SKIP_TABLES = {"employee_memory"}
+_SKIP_TABLES = {  # PG-only 类型(Vector / ARRAY),与 conftest._SKIP_TABLES 同步
+    "employee_memory", "task_context", "kb_documents", "kb_retrieval_log",
+    "lessons", "pattern_extracts", "routing_decisions",
+}
 
 
 @pytest.fixture

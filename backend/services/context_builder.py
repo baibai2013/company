@@ -197,6 +197,9 @@ def _render_in_section(rows: list[Delegation]) -> str:
 # RAG L2/L3 各自的预算(token),够拼几条短摘录,不挤占已有 L1/L2 chunk。
 _RAG_L2_TOKEN_BUDGET = 600
 _RAG_L3_TOKEN_BUDGET = 800
+# 提案 3 lessons 召回预算 — 教训段比 RAG 短一些,保留 3 条 hit
+_LESSONS_TOKEN_BUDGET = 600
+_LESSONS_TOP_K = 3
 
 
 async def _build_rag_query(employee_key: str, task_id: str | None) -> str:
@@ -275,6 +278,40 @@ async def _fetch_rag_sections(
     return sections
 
 
+# ── 提案 3 教训召回(Wave 3 集成) ────────────────────────────────
+async def _fetch_lessons_section(
+    employee_key: str,
+    task_id: str | None,
+) -> str:
+    """召回该员工相关教训(lessons),拼成 markdown 段。整体失败降级返回 ""。
+
+    与 RAG 共用 query 来源(任务标题或 employee_key 退化);trace 由
+    lessons_retrieve 内部写到 kb_retrieval_log(layer='lessons')。
+    """
+    try:
+        from backend.services import lessons_retrieve
+    except Exception as exc:  # noqa: BLE001
+        log.debug("_fetch_lessons_section: lessons_retrieve 不可用,跳过: %s", exc)
+        return ""
+
+    query = await _build_rag_query(employee_key, task_id)
+    if not query.strip():
+        return ""
+
+    try:
+        hits = await lessons_retrieve.retrieve_lessons_for_employee(
+            employee_key=employee_key,
+            query=query,
+            top_k=_LESSONS_TOP_K,
+            token_budget=_LESSONS_TOKEN_BUDGET,
+            task_id=task_id,
+        )
+        return lessons_retrieve.format_lessons_section(hits)
+    except Exception as exc:  # noqa: BLE001
+        log.warning("lessons 召回失败,跳过: %s", exc)
+        return ""
+
+
 # ── 总入口 ─────────────────────────────────────────────────────────
 async def build_context_preamble(
     employee_key: str,
@@ -287,21 +324,25 @@ async def build_context_preamble(
         employee_key 员工 key,不可为空
         task_id      若给了,会拉 L2 task_context + RAG 召回;不给则跳过这两段
         token_budget 总预算(目前只用于将来扩展;L2 chunk 内部硬编码 2000,
-                     RAG 段各自硬编码 600/800)
+                     RAG 段各自硬编码 600/800,lessons 段 600)
 
     返回:
         markdown 字符串,以 [CONTEXT] / [/CONTEXT] 包裹;**所有段全空返回 ""**。
+
+    段顺序(从上到下):
+        L1 长期记忆 → L2 任务 chunk → RAG L2 公司规范 → RAG L3 领域知识
+        → 💡 历史教训 → 📤 派出未回 → 📥 待认领
     """
     if not employee_key:
         raise ValueError("employee_key is required")
 
-    # 并发拿 L1 / L2 chunk / RAG / out / in
+    # L1 / L2 chunk / RAG / lessons / out / in
     l1_scored = await _fetch_l1_memory(employee_key)
     l2_chunks: list[str] = []
-    rag_sections: list[str] = []
     if task_id:
         l2_chunks = await _fetch_l2_chunks(task_id)
     rag_sections = await _fetch_rag_sections(employee_key, task_id)
+    lessons_section = await _fetch_lessons_section(employee_key, task_id)
     out_rows = await delegation_repo.list_in_flight_for_employee(employee_key, "out")
     in_rows = await delegation_repo.list_pending_claim_for_employee(employee_key)
 
@@ -311,6 +352,8 @@ async def build_context_preamble(
     if l2_chunks:
         sections.append(_render_l2_section(l2_chunks))
     sections.extend(rag_sections)
+    if lessons_section:
+        sections.append(lessons_section)
     if out_rows:
         sections.append(_render_out_section(out_rows))
     if in_rows:

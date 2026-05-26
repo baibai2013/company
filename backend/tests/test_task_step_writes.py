@@ -18,7 +18,10 @@ from group_chat import task_steps as ts
 
 
 TEST_DB_URL = "sqlite+aiosqlite:///:memory:"
-_SKIP_TABLES = {"employee_memory"}
+_SKIP_TABLES = {  # PG-only 类型(Vector / ARRAY),与 conftest._SKIP_TABLES 同步
+    "employee_memory", "task_context", "kb_documents", "kb_retrieval_log",
+    "lessons", "pattern_extracts", "routing_decisions",
+}
 
 
 def _sqlite_compatible_tables():
