@@ -43,6 +43,10 @@ _SPINNER_FRAMES = [".", "..", "..."]
 _SPINNER_PREFIX = "🤔 思考中 "
 _SPINNER_TICK = 0.8  # 帧间隔秒数
 
+# cc_bridge 卡片身份(对齐员工卡片风格:{emoji} {name} · 处理中)
+_CC_EMOJI = os.getenv("CC_BRIDGE_CARD_EMOJI", "🤖")
+_CC_NAME = os.getenv("CC_BRIDGE_CARD_NAME", "Claude Code")
+
 # ── 自发卡片缓存：message_id → (title, content)，用于 parent_id 引用回查 ────
 # 飞书 GetMessage API 对 interactive 类型只返回 {"title": "..."}，拿不到正文，
 # 因此自己发出的卡片都缓存一份，引用时优先从缓存查得完整内容。
@@ -438,15 +442,19 @@ async def handle_message(
             )
 
     async with thread.lock:
+        t0 = time.time()                                   # 执行计时起点(进度/结果卡显示「已用 N s」)
+        _prog_title = f"{_CC_EMOJI} {_CC_NAME} · 处理中"   # 对齐员工卡片风格
+        _task_preview = (text[:80] + "…") if text and len(text) > 80 else (text or "(空)")
+        _init_content = f"**任务**：{_task_preview}\n\n**已用**：0.0s"
         # 进度卡（持续 patch）：reply 到用户消息下，fallback 到普通发送
         if message_id:
             progress_id = await _reply_card(
-                client, message_id, "⏳ 执行中", "处理中…", "grey",
+                client, message_id, _prog_title, _init_content, "grey",
                 thread_key=thread.key,
             )
         else:
             progress_id = await _create_card(
-                client, chat_id, "⏳ 执行中", "处理中…", "grey",
+                client, chat_id, _prog_title, _init_content, "grey",
                 thread_key=thread.key,
             )
 
@@ -462,14 +470,14 @@ async def handle_message(
         async def _do_patch():
             if not progress_id:
                 return
-            todo_block = _build_todo_block(task_list)
-            if not steps and not todo_block:
-                await _patch_card(client, progress_id, "⏳ 执行中", "处理中…", "grey")
-                return
-            # 进度卡按字符数从尾部往前累，超出 MAX_CARD_LEN 就停并加省略提示。
-            # todo_block 在"必保留"集合：先扣它的预算，剩余给 steps。
+            # 员工风格:任务头 + 工具步骤流 + 已用尾。任务头/已用尾/todo 块为"必保留"。
             sep = "\n\n"
-            reserved = (len(todo_block) + len(sep)) if todo_block else 0
+            header = f"**任务**：{_task_preview}"
+            footer = f"**已用**：{time.time() - t0:.1f}s"
+            todo_block = _build_todo_block(task_list)
+            reserved = len(header) + len(footer) + 2 * len(sep)
+            if todo_block:
+                reserved += len(todo_block) + len(sep)
             cap = max(0, MAX_CARD_LEN - reserved)
             picked: list[str] = []
             total = 0
@@ -480,13 +488,14 @@ async def handle_message(
                     break
                 picked.append(s)
                 total += cost
-            parts: list[str] = []
+            parts: list[str] = [header]
             if todo_block:
                 parts.append(todo_block)
             if picked:
                 parts.append(sep.join(reversed(picked)))
+            parts.append(footer)
             content = sep.join(parts)
-            await _patch_card(client, progress_id, "⏳ 执行中", content, "grey")
+            await _patch_card(client, progress_id, _prog_title, content, "grey")
 
         async def _maybe_patch():
             now = time.time()
@@ -640,7 +649,9 @@ async def handle_message(
 
         # 另发结果卡（触发推送）
         is_error = result.startswith("❌")
-        final_title = "❌ 执行出错" if is_error else "✅ 执行完成"
+        _elapsed = time.time() - t0
+        final_title = (f"❌ 执行出错 · {_elapsed:.1f}s" if is_error
+                       else f"✅ 执行完成 · {_elapsed:.1f}s")
         final_color = "red" if is_error else "green"
 
         # 优先用流式累积的最终文本，fallback 到 result 事件
