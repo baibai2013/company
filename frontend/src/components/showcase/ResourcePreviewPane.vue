@@ -134,12 +134,14 @@ function routeOf(path: string): RouteResult {
     }
   }
   if (lower.endsWith('.step') || lower.endsWith('.stp')) {
+    // 浏览器内用 occt-import-js (WASM 编译的 OpenCASCADE) parse STEP 直接渲染
     return {
-      component: BinaryPreview,
-      bind: { path, size },
-      icon: '📐',
-      title: 'STEP CAD 源文件',
-      hint: '浏览器不解析 STEP(WASM 解析器代价过大)。请下载后用 FreeCAD / Fusion 360 / SolidWorks 打开。',
+      component: Cad3DPreview,
+      bind: {
+        glbUrl: '',
+        stepUrl: store.fileUrl(path),
+        name: path.split('/').pop() ?? path,
+      },
     }
   }
   if (lower.endsWith('.csv')) return { component: CsvPreview, bind: { path } }

@@ -1,12 +1,14 @@
 <!--
-  Cad3DPreview — 单件 .glb 查看组件,给 Workflow / Resources 复用。
+  Cad3DPreview — 单件 .glb 或 .step 查看组件,给 Workflow / Resources 复用。
 
   props:
-    glbUrl   — 必填,GLTFLoader 直接 load
-    stepUrl  — 可选,有则显示「下载 STEP」按钮
+    glbUrl   — 可选,GLTFLoader 直接 load(优先)
+    stepUrl  — 可选,有则:1) 显示「下载 STEP」按钮 2) 若无 glbUrl 用 occt-import-js 解析
     name     — 可选,标题
     meta     — 可选,Record<string,string|number>,显示在元信息条
 
+  STEP 解析: occt-import-js (WASM 编译的 OpenCASCADE) 浏览器内 parse,
+            转 mesh → three.js BufferGeometry → 渲染。首次加载 wasm ~3MB。
   自带 OrbitControls + 灯光 + 自动 fit。
 -->
 <script setup lang="ts">
@@ -16,13 +18,14 @@ import { GLTFLoader } from 'three/examples/jsm/loaders/GLTFLoader.js'
 import { OrbitControls } from 'three/examples/jsm/controls/OrbitControls.js'
 
 interface Props {
-  glbUrl: string
+  glbUrl?: string
   stepUrl?: string
   name?: string
   meta?: Record<string, string | number>
 }
 
 const props = withDefaults(defineProps<Props>(), {
+  glbUrl: '',
   stepUrl: '',
   name: '',
   meta: () => ({}),
@@ -82,10 +85,10 @@ function initThree() {
 }
 
 async function load() {
-  if (!rootGroup.value || !props.glbUrl) return
+  if (!rootGroup.value) return
+  if (!props.glbUrl && !props.stepUrl) return
   loading.value = true
   error.value = null
-  // 清旧
   while (rootGroup.value.children.length > 0) {
     const c = rootGroup.value.children[0]
     if (!c) break
@@ -93,15 +96,96 @@ async function load() {
     disposeObject(c)
   }
   try {
-    const loader = new GLTFLoader()
-    const gltf = await loader.loadAsync(props.glbUrl)
-    rootGroup.value.add(gltf.scene)
+    if (props.glbUrl) {
+      const loader = new GLTFLoader()
+      const gltf = await loader.loadAsync(props.glbUrl)
+      rootGroup.value.add(gltf.scene)
+    } else if (props.stepUrl) {
+      const group = await loadStep(props.stepUrl)
+      rootGroup.value.add(group)
+    }
     fit()
   } catch (e: unknown) {
     error.value = e instanceof Error ? e.message : String(e)
   } finally {
     loading.value = false
   }
+}
+
+// ── STEP 解析 (occt-import-js) ─────────────────────────────────────────
+// occt-import-js 是 OpenCASCADE 编译的 WASM,在浏览器内解析 STEP/IGES/BREP
+// 返回 mesh 数据 (positions/normals/indices),转 three.js BufferGeometry。
+let _occtPromise: Promise<unknown> | null = null
+function getOcct(): Promise<any> {
+  if (!_occtPromise) {
+    _occtPromise = (async () => {
+      // occt-import-js 是 emscripten 模块,默认相对路径 fetch wasm。
+      // Vite dev 会 fallback 到 index.html,所以必须 locateFile 指向 public/
+      // 下的 wasm(部署时 wasm 在 dist/ 根),路径相对 site root。
+      // @ts-expect-error - occt-import-js 没 .d.ts
+      const mod = await import('occt-import-js')
+      const factory = mod.default || mod
+      return factory({
+        locateFile: (file: string) => {
+          if (file.endsWith('.wasm')) return '/occt-import-js.wasm'
+          return file
+        },
+      })
+    })()
+  }
+  return _occtPromise as Promise<any>
+}
+
+interface OcctMesh {
+  name?: string
+  color?: [number, number, number]
+  attributes: {
+    position: { array: number[] | Float32Array }
+    normal?: { array: number[] | Float32Array }
+  }
+  index: { array: number[] | Uint32Array }
+}
+
+async function loadStep(url: string): Promise<THREE.Group> {
+  const occt = await getOcct()
+  const resp = await fetch(url)
+  if (!resp.ok) throw new Error(`fetch step failed: ${resp.status}`)
+  const buf = await resp.arrayBuffer()
+  const u8 = new Uint8Array(buf)
+  const result = occt.ReadStepFile(u8, null)
+  if (!result || result.success !== true) {
+    throw new Error('STEP 解析失败 (occt-import-js)')
+  }
+  const meshes: OcctMesh[] = result.meshes || []
+  const group = new THREE.Group()
+  for (const m of meshes) {
+    const geom = new THREE.BufferGeometry()
+    const posArr = new Float32Array(m.attributes.position.array)
+    geom.setAttribute('position', new THREE.BufferAttribute(posArr, 3))
+    if (m.attributes.normal && m.attributes.normal.array) {
+      const normArr = new Float32Array(m.attributes.normal.array)
+      geom.setAttribute('normal', new THREE.BufferAttribute(normArr, 3))
+    } else {
+      geom.computeVertexNormals()
+    }
+    if (m.index && m.index.array) {
+      const idxArr = new Uint32Array(m.index.array)
+      geom.setIndex(new THREE.BufferAttribute(idxArr, 1))
+    }
+    const color = m.color
+      ? new THREE.Color(m.color[0], m.color[1], m.color[2])
+      : new THREE.Color(0x9aa6b8)
+    const mat = new THREE.MeshStandardMaterial({
+      color,
+      metalness: 0.25,
+      roughness: 0.55,
+      side: THREE.DoubleSide,
+    })
+    const mesh = new THREE.Mesh(geom, mat)
+    if (m.name) mesh.name = m.name
+    group.add(mesh)
+  }
+  return group
 }
 
 function fit() {
@@ -175,7 +259,7 @@ onBeforeUnmount(() => {
   }
 })
 
-watch(() => props.glbUrl, async () => {
+watch(() => [props.glbUrl, props.stepUrl], async () => {
   if (scene.value) await load()
 })
 

@@ -23,6 +23,7 @@
     "elkjs": "^0.11.1",
     "marked": "^18.0.4",
     "monaco-editor": "^0.55.1",
+    "occt-import-js": "^0.0.23",
     "pinia": "^3.0.4",
     "svg-pan-zoom": "^3.6.2",
     "three": "^0.184.0",
