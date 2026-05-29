@@ -22,7 +22,12 @@ import lark_oapi as lark
 from lark_oapi.api.im.v1.model.p2_im_message_receive_v1 import P2ImMessageReceiveV1
 
 from feishu.cc_bridge.message_handler import handle_message, init_whitelist
-from feishu.sender import download_image, reply_rich_card, send_rich_card
+from feishu.sender import (
+    download_file_resource,
+    download_image,
+    reply_rich_card,
+    send_rich_card,
+)
 
 logging.basicConfig(
     level=logging.INFO,
@@ -60,9 +65,80 @@ APP_SECRET = os.getenv("CC_BRIDGE_APP_SECRET", "COozkvL5KVAtlwNGStqDig6uykU2kLgj
 # 群聊 @ 检测需要机器人自己的 open_id；可在 .env 里配 CC_BRIDGE_BOT_OPEN_ID 跳过 API 拉取
 BOT_OPEN_ID: str = os.getenv("CC_BRIDGE_BOT_OPEN_ID", "")
 
-# ── 待处理图片（等用户补充问题）────────────────────────────────────────────────
-# key 用 (chat_id, sender_id)：群里每个人独立缓存，避免互相串图
-_pending_images: dict[tuple[str, str], bytes] = {}
+# ── 待处理附件（等用户补充问题）────────────────────────────────────────────────
+# key 用 (chat_id, sender_id):群里每个人独立缓存,避免互相串图/串文件
+# value 形如 {"image_bytes": bytes | None, "file_paths": list[str]}
+_pending_attachments: dict[tuple[str, str], dict] = {}
+
+# 落地飞书 file/media 附件的根目录(Claude 要用 Read 工具读绝对路径)
+_ATTACH_DIR = Path("/tmp/cc_bridge_attachments")
+_ATTACH_DIR.mkdir(parents=True, exist_ok=True)
+
+# 临时 MCP 配置文件 — main() 启动时写,claude CLI 通过 --mcp-config 加载
+# 内容是 cc_bridge_messaging stdio server(只暴露 send 媒体相关工具)
+_MCP_CONFIG_PATH = Path("/tmp/cc_bridge.mcp.json")
+
+
+def _save_attachment(message_id: str, file_key: str, file_name: str) -> str | None:
+    """把飞书 file/media 附件下载到 _ATTACH_DIR/<msg-short>/<file_name>,返回绝对路径。
+
+    失败返回 None。同 message_id 重复下载会覆盖。
+    """
+    if not file_key:
+        return None
+    safe_name = (file_name or "unnamed").replace("/", "_") or "unnamed"
+    mid_short = (message_id or "anon")[-12:]
+    save_dir = _ATTACH_DIR / mid_short
+    save_dir.mkdir(parents=True, exist_ok=True)
+    save_path = save_dir / safe_name
+    ok = download_file_resource(_client, message_id, file_key, str(save_path))
+    if not ok:
+        log.warning("_save_attachment 下载失败 file_key=%s name=%s", file_key, safe_name)
+        return None
+    log.info("附件已落地: %s (%d bytes)", save_path, save_path.stat().st_size)
+    return str(save_path)
+
+
+def _stash_attachment(
+    pending_key: tuple[str, str],
+    image_bytes: bytes | None = None,
+    file_paths: list[str] | None = None,
+) -> None:
+    """把附件累计到 pending 槽位,等下一条 text 进来时合并消费。"""
+    slot = _pending_attachments.setdefault(
+        pending_key, {"image_bytes": None, "file_paths": []},
+    )
+    if image_bytes and not slot["image_bytes"]:
+        slot["image_bytes"] = image_bytes
+    if file_paths:
+        slot["file_paths"].extend(file_paths)
+
+
+def _consume_attachments(pending_key: tuple[str, str]) -> dict:
+    """取出并清空 pending 槽位。空时返回 {"image_bytes": None, "file_paths": []}。"""
+    return _pending_attachments.pop(
+        pending_key, {"image_bytes": None, "file_paths": []},
+    )
+
+
+def _write_mcp_config() -> None:
+    """启动时把临时 .mcp.json 写到 /tmp/cc_bridge.mcp.json,挂 cc_bridge_messaging。
+
+    cc_bridge_messaging = mcp_servers/messaging 的别名(同一个 stdio server),
+    用别名是为了 settings.json 白名单不和员工那条路径混。
+    """
+    venv_py = "/Users/liyijiang/work/company/.venv/bin/python"
+    cfg = {
+        "mcpServers": {
+            "cc_bridge_messaging": {
+                "command": venv_py,
+                "args": ["-m", "mcp_servers.messaging.server"],
+                "cwd": "/Users/liyijiang/work/company",
+            },
+        },
+    }
+    _MCP_CONFIG_PATH.write_text(json.dumps(cfg, indent=2, ensure_ascii=False))
+    log.info("MCP 配置已写入: %s", _MCP_CONFIG_PATH)
 
 # ── 去重 ─────────────────────────────────────────────────────────────────────
 _processed: set[str] = set()
@@ -282,9 +358,10 @@ def _on_message_inner(data: P2ImMessageReceiveV1) -> None:
         msg_type, msg.chat_type, chat_id, sender_id,
     )
 
-    # 提取文本
+    # 提取文本与附件
     text = ""
-    image_bytes = None
+    image_bytes: bytes | None = None
+    file_paths: list[str] = []  # 飞书 file/media 落地后的本地绝对路径
 
     pending_key = (chat_id, sender_id)
 
@@ -297,7 +374,7 @@ def _on_message_inner(data: P2ImMessageReceiveV1) -> None:
             return
 
     elif msg_type == "image":
-        # 纯图片消息：先存图，提示用户补充问题
+        # 纯图片消息:先存图,提示用户补充问题
         try:
             content = json.loads(msg.content)
             image_key = content.get("image_key", "")
@@ -309,12 +386,12 @@ def _on_message_inner(data: P2ImMessageReceiveV1) -> None:
             log.warning("图片处理失败: %s", exc)
             return
         if image_bytes:
-            _pending_images[pending_key] = image_bytes
+            _stash_attachment(pending_key, image_bytes=image_bytes)
             reply_rich_card(_client, message_id, "📷 已收到图片", "请问您有什么问题？", "blue")
             return
 
     elif msg_type == "post":
-        # 富文本消息（可能包含图片+文字+引用块）
+        # 富文本消息(可能包含图片+文字+引用块)
         try:
             content = json.loads(msg.content)
             paragraphs = content.get("content", [])
@@ -331,7 +408,7 @@ def _on_message_inner(data: P2ImMessageReceiveV1) -> None:
                             if b64:
                                 image_bytes = base64.b64decode(b64)
                     elif elem.get("tag") == "quote":
-                        # quote 元素：content 字符串 或 嵌套 elements
+                        # quote 元素:content 字符串 或 嵌套 elements
                         q = elem.get("content", "") or elem.get("text", "")
                         if not q and isinstance(elem.get("elements"), list):
                             q = "".join(
@@ -342,35 +419,79 @@ def _on_message_inner(data: P2ImMessageReceiveV1) -> None:
                             quote_parts.append(str(q).strip())
             text = _strip_mentions("".join(texts).strip(), msg)
             if not text and image_bytes:
-                # post 有图无文字：同纯图片处理，等用户补充问题
-                _pending_images[pending_key] = image_bytes
+                # post 有图无文字:同纯图片处理,等用户补充问题
+                _stash_attachment(pending_key, image_bytes=image_bytes)
                 reply_rich_card(_client, message_id, "📷 已收到图片", "请问您有什么问题？", "blue")
                 return
-            # 命令（/cmd）不挂引用上下文，避免 message_handler 的 startswith("/") 判定被 [引用内容] 前缀绕过
+            # 命令(/cmd)不挂引用上下文,避免 message_handler 的 startswith("/") 判定被 [引用内容] 前缀绕过
             if quote_parts and not text.startswith("/"):
                 ctx = "\n".join(quote_parts)
                 text = f"[引用内容]\n{ctx}\n---\n{text}" if text else ctx
         except Exception as exc:
             log.warning("富文本处理失败: %s", exc)
             return
+
+    elif msg_type == "file":
+        # file 消息:落到 _ATTACH_DIR,等下一条 text 来再统一送 Claude
+        try:
+            content = json.loads(msg.content)
+            file_key = content.get("file_key", "")
+            file_name = content.get("file_name", "") or "unnamed"
+        except Exception as exc:
+            log.warning("file 消息解析失败: %s", exc)
+            return
+        path = _save_attachment(message_id, file_key, file_name)
+        if path:
+            _stash_attachment(pending_key, file_paths=[path])
+            reply_rich_card(
+                _client, message_id, "📎 已收到文件",
+                f"`{file_name}` 已暂存,请告诉我要怎么处理它。",
+                "blue",
+            )
+        return
+
+    elif msg_type == "media":
+        # media 消息(短视频):同 file 落地,Claude 用 Read 工具看
+        try:
+            content = json.loads(msg.content)
+            file_key = content.get("file_key", "")
+            file_name = content.get("file_name", "") or "video.mp4"
+        except Exception as exc:
+            log.warning("media 消息解析失败: %s", exc)
+            return
+        path = _save_attachment(message_id, file_key, file_name)
+        if path:
+            _stash_attachment(pending_key, file_paths=[path])
+            reply_rich_card(
+                _client, message_id, "🎬 已收到视频",
+                f"`{file_name}` 已暂存,请告诉我要怎么处理它。",
+                "blue",
+            )
+        return
+
     else:
         return
 
-    # 回复型引用：parent_id 有值且尚无引用上下文时，拉取父消息
-    # 命令（/cmd）跳过：保持以 "/" 开头让 message_handler 走命令分支
+    # 回复型引用:parent_id 有值且尚无引用上下文时,拉取父消息
+    # 命令(/cmd)跳过:保持以 "/" 开头让 message_handler 走命令分支
     parent_id = getattr(msg, "parent_id", None) or ""
     if parent_id and not text.startswith("[引用内容]") and not text.startswith("/"):
         parent_text = _fetch_parent_text(parent_id)
         if parent_text:
             text = f"[引用内容]\n{parent_text}\n---\n{text}" if text else parent_text
 
-    if not text and not image_bytes:
-        return
+    # 有文字进来时,合并 pending 槽位里累积的图片/文件
+    if text:
+        slot = _consume_attachments(pending_key)
+        if slot["image_bytes"] and not image_bytes:
+            image_bytes = slot["image_bytes"]
+            log.info("附加待处理图片: %s", pending_key)
+        if slot["file_paths"]:
+            file_paths = list(slot["file_paths"]) + file_paths
+            log.info("附加待处理文件: %s -> %s", pending_key, slot["file_paths"])
 
-    # 有文字时，检查是否有待处理的图片并附上
-    if text and not image_bytes and pending_key in _pending_images:
-        image_bytes = _pending_images.pop(pending_key)
-        log.info("附加待处理图片: %s", pending_key)
+    if not text and not image_bytes and not file_paths:
+        return
 
     # 提交到异步事件循环执行
     loop = _get_loop()
@@ -378,6 +499,7 @@ def _on_message_inner(data: P2ImMessageReceiveV1) -> None:
         handle_message(
             _client, chat_id, text,
             image_bytes=image_bytes,
+            file_paths=file_paths or None,
             sender_id=sender_id,
             message_id=message_id,
             parent_id=parent_id,
@@ -391,6 +513,7 @@ def main():
     _acquire_singleton()
     try:
         log.info("CC Bridge 启动 — App ID: %s  PID: %d", APP_ID, os.getpid())
+        _write_mcp_config()
         init_whitelist()
 
         # 构建事件分发器

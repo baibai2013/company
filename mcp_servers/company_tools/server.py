@@ -243,23 +243,24 @@ def send_feishu_image(image_path: str, feishu_chat_id: str = "") -> str:
 def send_feishu_file(file_path: str, feishu_chat_id: str = "") -> str:
     """把本地任意文件上传到飞书并以 file 消息发到群里(单文件 ≤30MB)。
 
+    自动识别视频(.mp4/.mov)走 media 消息类型(短视频,带缩略图,飞书可在线预览+播放)。
+    其他类型走普通 file 消息(附件形式)。
+
     用法场景:
     - 把生成的 STEP / DXF / Excel / PDF / zip 作为附件发给用户
+    - 把生成的 mp4 视频以"短视频"形式发(自动 ffmpeg 截首帧当封面,在群里直接预览)
     - 把日志、报告、CSV 直接送回群里,免得用户去 git pull
-
-    支持类型:任何二进制文件均可。常见扩展会自动识别 file_type
-    (pdf/doc/xls/ppt/mp4),其他走 stream。
 
     Args:
         file_path: 本地文件绝对路径。
         feishu_chat_id: 目标群 chat_id。空则回退 EMPLOYEE_CHAT_ID env。
 
     Returns:
-        成功:"✅ 文件已发送 (xxx.step, NNN KB)"
+        成功:"✅ 文件已发送 (xxx.step, NNN KB)" 或 "✅ 视频已发送 (...,带缩略图可在线播)"
         失败:"❌ 失败原因"(超 30MB / 文件不存在 / 上传失败等)
     """
     from pathlib import Path
-    from feishu.sender import make_client, send_file_msg
+    from feishu.sender import make_client, send_file_msg, send_video_msg
     p = Path(file_path)
     if not p.is_file():
         return f"❌ 文件不存在: {file_path}"
@@ -276,8 +277,16 @@ def send_feishu_file(file_path: str, feishu_chat_id: str = "") -> str:
         feishu_chat_id = os.environ.get("FEISHU_CHAT_ID", "") or ""
     if not feishu_chat_id:
         return "❌ 没有可用的 feishu_chat_id"
+
+    # 视频走 media 消息(可在线预览),其他走 file
+    is_video = p.suffix.lower() in (".mp4", ".mov")
     try:
         client = make_client()
+        if is_video:
+            ok, err = send_video_msg(client, feishu_chat_id, str(p))
+            if ok:
+                return f"✅ 视频已发送 ({p.name}, {size_kb:.0f} KB,带缩略图可在线播)"
+            return f"❌ 视频发送失败: {err}"
         ok = send_file_msg(client, feishu_chat_id, str(p))
         if ok:
             return f"✅ 文件已发送 ({p.name}, {size_kb:.0f} KB)"

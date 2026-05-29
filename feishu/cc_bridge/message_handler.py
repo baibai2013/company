@@ -402,6 +402,7 @@ async def handle_message(
     chat_id: str,
     text: str,
     image_bytes: bytes | None = None,
+    file_paths: list[str] | None = None,
     sender_id: str = "",
     message_id: str = "",
     parent_id: str = "",
@@ -572,17 +573,38 @@ async def handle_message(
                 last_patch[0] = now
                 await _do_patch()
 
-        # 准备图片
+        # 准备图片(image_bytes 转临时文件)+ 文件路径(原样透传)
         image_paths = []
         if image_bytes:
             image_paths.append(save_temp_image(compress_image(image_bytes)))
+        # 飞书 file/media 落地的本地路径,合并进 image_paths 一起送进 prompt,让
+        # claude_runner 用 "请先用 Read 工具读取" 提示语统一处理 — Claude Read 工具
+        # 既能看图也能 head 文本/二进制,无需 vision 描述层。
+        if file_paths:
+            image_paths.extend(file_paths)
+
+        # cc_bridge 专属 MCP 配置(挂 cc_bridge_messaging stdio server,
+        # 让 Claude 能调 send_feishu_image / send_feishu_file 把媒体发回当前飞书)。
+        # 同时拼一段 preamble,告知当前 chat_id — Claude 调工具时显式传 feishu_chat_id。
+        from feishu.cc_bridge.main import _MCP_CONFIG_PATH  # 避免顶级循环 import
+        extra_cli_args = ["--mcp-config", str(_MCP_CONFIG_PATH)]
+
+        media_preamble = (
+            f"\n\n[飞书会话信息] 当前 feishu_chat_id={chat_id}\n"
+            "如需把图片/文件/视频回传给用户,使用 mcp__cc_bridge_messaging__send_feishu_image "
+            "(图片) 或 mcp__cc_bridge_messaging__send_feishu_file (文件/视频),"
+            f"工具参数 feishu_chat_id 显式传 {chat_id}。"
+            "注意:卡片/纯文本回复由 cc_bridge 自动处理,**不要**调 send_feishu_message / "
+            "reply_feishu_short / react_emoji,直接以普通文本回答即可。"
+        )
+        prompt_with_chat = text + media_preamble
 
         spinner_task = asyncio.create_task(_spinner_tick())
         new_session_id: str | None = None
         try:
             async with router.global_sema:
                 result, _, new_session_id = await thread.get_runner().run(
-                    text,
+                    prompt_with_chat,
                     cwd=thread.cwd,
                     session_id=thread.session_id,
                     image_paths=image_paths,
@@ -590,6 +612,7 @@ async def handle_message(
                     on_tool_result=on_tool_result,
                     on_text=on_text,
                     on_thinking=on_thinking,
+                    extra_cli_args=extra_cli_args,
                 )
         except Exception as exc:
             log.exception("Claude runner 异常")

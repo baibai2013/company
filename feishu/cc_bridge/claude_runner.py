@@ -101,7 +101,26 @@ async def parse_stream_loop(
     state = StreamState()
     last_callback_len = 0
     while True:
-        line = await asyncio.wait_for(stdout.readline(), timeout=timeout)
+        try:
+            line = await asyncio.wait_for(stdout.readline(), timeout=timeout)
+        except ValueError as exc:
+            # asyncio.StreamReader.readline 单行超 limit 会抛 ValueError
+            # ("Separator is not found, and chunk exceed the limit")。
+            # 之前会让整个 runner 死掉 / pool fallback,改成跳过这一行,继续读后面。
+            # 跳的方式: 读到下个 \n 为止,丢弃中间所有字节。
+            log.warning("parse_stream_loop: 单行超 limit,跳过该事件 (%s)", exc)
+            try:
+                while True:
+                    chunk = await asyncio.wait_for(stdout.read(65536), timeout=timeout)
+                    if not chunk:
+                        break
+                    if b"\n" in chunk:
+                        # 找到分隔符,后面的字节再 push 回去不容易,
+                        # 但 stream-json 行界限明确,丢这一帧问题不大。
+                        break
+            except (asyncio.TimeoutError, ValueError):
+                pass
+            continue
         if not line:
             break
         line = line.decode("utf-8", errors="replace").strip()
@@ -248,7 +267,7 @@ class ClaudeRunner:
         on_thinking: callable = None,
         extra_cli_args: list[str] | None = None,
         cmd_wrapper: callable = None,
-        model: str = "claude-opus-4-7",
+        model: str = "claude-opus-4-8",
         effort: str = "high",
     ) -> tuple[str, list[str], str | None]:
         """
@@ -261,7 +280,7 @@ class ClaudeRunner:
                           --permission-mode acceptEdits）。在 prompt 前插入
           cmd_wrapper:    argv → argv 的回调，给外部包 sandbox-exec 用。例：
                           lambda argv: ['/usr/bin/sandbox-exec','-f',profile,*argv]
-          model:          claude --model 值（默认 opus-4-7；闲聊场景可用 sonnet）
+          model:          claude --model 值（默认 opus-4-8；闲聊场景可用 sonnet）
           effort:         claude --effort 值（默认 high；闲聊场景可用 low）
 
         返回 (最终文本, 工具调用日志, 新 session_id)。
@@ -279,10 +298,15 @@ class ClaudeRunner:
         if extra_cli_args:
             cmd.extend(extra_cli_args)
 
-        # 图片：告知 Claude 文件路径，由其 Read 工具读取（支持多模态）
+        # 附件:告知 Claude 本地路径,由其 Read 工具读取
+        # 图片走 Claude 多模态识别,PDF/Office/文本走 Read,视频可用 Bash 调 ffprobe
         if image_paths:
             paths_str = "\n".join(f"- {p}" for p in image_paths)
-            prompt = f"请先用 Read 工具读取以下图片文件，然后再回答：\n{paths_str}\n\n用户问题：{prompt}"
+            prompt = (
+                f"请先用 Read 工具读取以下附件(图片/文档),然后再回答。"
+                f"对视频/二进制可先用 Bash 看体积或调 ffprobe 取元数据:\n"
+                f"{paths_str}\n\n用户问题:{prompt}"
+            )
 
         cmd.append(prompt)
 
@@ -291,10 +315,12 @@ class ClaudeRunner:
 
         log.info("执行: cwd=%s session=%s cmd=%s", cwd, session_id, " ".join(cmd[:6]) + "...")
 
-        # limit=4MB：claude 的 system init 行包含所有 slash_commands，远超默认 64KB
+        # limit=32MB：claude 的 system init 行包含所有 slash_commands；
+        # 工具响应里也可能塞 mp4/图片 base64(2026-05-23: 5.3MB mp4 触发过 4MB limit fallback)。
+        # 32MB 远超任何合理 stream-json 事件，配合 parse_stream_loop 的 graceful skip 兜底。
         # stdin=DEVNULL：防止继承父进程 stdin（如 zsh here-doc 残留 fd），
         # claude code CLI 在 stdin 不是 pipe/tty 时可能卡死等输入
-        _limit = 4 * 1024 * 1024
+        _limit = 32 * 1024 * 1024
         self._process = await asyncio.create_subprocess_exec(
             *cmd,
             stdin=asyncio.subprocess.DEVNULL,
