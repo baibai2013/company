@@ -17,6 +17,7 @@ EMPLOYEE_PORTS = {
     "project_manager": 9008,
     "tech_lead":       9000,
     "sysadmin":        9009,
+    "fullstack":       9010,
 }
 
 

@@ -55,6 +55,7 @@ EMPLOYEE_MAP: dict[str, str] = {
     "算法": "algorithm", "algorithm": "algorithm",
     "测试": "testing", "testing": "testing",
     "成本": "cost", "cost": "cost",
+    "全栈": "fullstack", "cc": "fullstack", "fullstack": "fullstack",
 }
 
 # chat_id → last created task_id (for ?approve without explicit id)
@@ -265,6 +266,7 @@ _EMPLOYEE_DISPLAY = {
     "algorithm":       ("🧠", "喵喵球"),
     "testing":         ("🧪", "狐妖小红娘"),
     "cost":            ("💰", "兔子精"),
+    "fullstack":       ("🧑‍💻", "CC"),
 }
 
 

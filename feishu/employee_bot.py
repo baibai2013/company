@@ -1012,6 +1012,7 @@ def make_on_message(employee: str, client: lark.Client, bot_open_id: str):
                     "产品小米": "product_manager", "小米": "product_manager",
                     "技术胖虎": "tech_lead", "胖虎": "tech_lead",
                     "电脑管理员零": "sysadmin", "电脑管家零": "sysadmin", "零": "sysadmin",
+                    "CC": "fullstack", "全栈": "fullstack", "全栈工程师": "fullstack",
                 }
                 _OPEN_ID_TO_EMP = {
                     "ou_cbda0e035efddd928884cfa249b2aaf1": "mechanical",
@@ -1024,6 +1025,7 @@ def make_on_message(employee: str, client: lark.Client, bot_open_id: str):
                     "ou_c4cb6e0e53fb05010437c07d5f1109b3": "project_manager",
                     "ou_ba1ca54d49cef0f56819856b37f60ff0": "tech_lead",
                     "ou_4c02bb278b833ed4d43f0e3c545a4d53": "sysadmin",
+                    "ou_d487c47919a5e2c687b8beb14441c8a4": "fullstack",
                 }
                 mention_keys = []
                 for m in (msg.mentions or []):

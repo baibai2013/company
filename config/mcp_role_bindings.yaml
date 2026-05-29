@@ -20,6 +20,9 @@ employees:
   testing:           [docs, messaging, verification]
   cost:              [docs, messaging]
   project_manager:   [scheduling, docs, messaging]
+  # fullstack(对外工具开发 CC):做外部 SDK/CLI/MCP,需要派活给内部员工(orchestration)、
+  # 排期(scheduling)、发飞书(messaging)、读写 KB 文档(docs)。
+  fullstack:         [orchestration, scheduling, messaging, docs]
 
 # 全局 deny:任何员工都不能调用,删除类操作走人审
 global_deny:
