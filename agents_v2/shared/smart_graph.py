@@ -209,10 +209,46 @@ def _global_prompt(employee_key: str, name: str, fallback: str) -> str:
 
 # ── Nodes ────────────────────────────────────────────────────────────────────
 
+# route 启发式关键词(对齐 _DEFAULT_ROUTE_PROMPT)。WORK 优先,拿不准→WORK。
+_ROUTE_WORK_KW = (
+    "查看", "检查", "排查", "查找", "看看", "看一下", "找一下", "分析", "统计", "对比",
+    "评估", "计算", "汇总", "读取", "修改", "写入", "编辑", "删除", "创建", "部署",
+    "运行", "启动", "停止", "重启", "测试", "输出", "生成", "方案", "报告", "记录",
+    "日志", "进程", "端口", "配置", "数据库", "帮我", "跑一下", "实现", "写个", "写一个",
+    "做个", "做一个", "改一下", "build", "run", "fix", "make", "deploy",
+)
+_ROUTE_CHAT_KW = (
+    "你好", "您好", "在吗", "在不在", "怎么样", "最近忙", "早安", "晚安", "午安", "嗨",
+    "哈喽", "谢谢", "多谢", "感谢", "收到", "好的", "没问题", "你是谁", "你叫什么",
+    "还记得", "记得吗", "刚才", "之前那个", "hi", "hello", "hey", "thanks", "thx",
+)
+
+
+def _heuristic_route(text: str) -> str:
+    """本地关键词判 CHAT/WORK,对齐 _DEFAULT_ROUTE_PROMPT(拿不准→WORK)。
+
+    免一次 langchain→代理 往返(~2-3s)。WORK 动作词命中即 WORK;
+    否则短消息命中打招呼/感谢/回忆词才判 CHAT;其余一律 WORK。
+    """
+    t = text.strip()
+    if not t:
+        return "WORK"
+    tl = t.lower()
+    if any(k in t or k in tl for k in _ROUTE_WORK_KW):
+        return "WORK"
+    if len(t) <= 30 and any(k in t or k in tl for k in _ROUTE_CHAT_KW):
+        return "CHAT"
+    return "WORK"
+
+
 def _route_node(state: SmartState, employee_key: str) -> dict:
     text = _text_only(state["task_input"])
     if not text:
         return {"route": "WORK"}
+    import os
+    # 默认本地启发式(免一次 langchain→代理 往返);ROUTE_HEURISTIC=off 回退 LLM。
+    if os.environ.get("ROUTE_HEURISTIC", "on").lower() not in ("0", "off", "false", "no"):
+        return {"route": _heuristic_route(text)}
     llm = _llm_for(employee_key, "route", default_model="claude-sonnet-4-6")
     prompt = _global_prompt(employee_key, "route_prompt", _DEFAULT_ROUTE_PROMPT)
     resp = llm.invoke([SystemMessage(prompt), HumanMessage(text)])
@@ -417,6 +453,13 @@ async def _cc_node(state: SmartState, employee_key: str, cc_prompt: str) -> dict
     import json as _json
     import re as _re
     from agents_v2.shared.cc_oneshot import run_cli_oneshot, CLIOneshotFailed
+    from agents_v2.shared.runner import current_session_config
+
+    # 单聊(feishu_p2p)是一对一,不需要别的员工补充意见 → 直接跳过,
+    # 省一次冷启 claude CLI oneshot(~数秒)。群聊/看板/定时才需要决定谁插话。
+    source = (current_session_config.get({}) or {}).get("source", "")  # type: ignore[call-arg]
+    if source == "feishu_p2p":
+        return {"cc": []}
 
     context = f"原始消息：{_text_only(state['task_input'])}\n\n{employee_key}回复：{state['execution_result']}"
     prompt = f"{cc_prompt}\n\n{context}"

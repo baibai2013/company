@@ -35,8 +35,11 @@ from feishu.cc_bridge.claude_runner import (
 log = logging.getLogger("agents_v2.claude_pool")
 
 # 池配置
-_POOL_IDLE_TIMEOUT = 300.0   # 5 分钟 idle 后释放
-_POOL_MAX_SIZE = 30          # 池上限
+# idle 保温窗:每个员工的 claude CLI 在此窗口内一直保活复用,免冷启(spawn+MCP init ~5-8s)。
+# 默认 30 分钟(原 5 分钟太短,活跃会话频繁被 GC 后冷启,简单查询都要 ~11s)。
+# 可用环境变量 CLAUDE_POOL_IDLE_TIMEOUT 覆盖(秒);想"长期常驻"设大值如 86400。
+_POOL_IDLE_TIMEOUT = float(os.environ.get("CLAUDE_POOL_IDLE_TIMEOUT", "1800"))
+_POOL_MAX_SIZE = int(os.environ.get("CLAUDE_POOL_MAX_SIZE", "30"))  # 池上限(兜底内存)
 _POOL_GC_INTERVAL = 30.0     # GC 频率
 
 

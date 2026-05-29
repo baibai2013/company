@@ -30,7 +30,10 @@ def make_langchain_llm(
         "base_url": _settings.ANTHROPIC_BASE_URL or None,
         "default_headers": _settings.ANTHROPIC_EXTRA_HEADERS or {},
         "timeout": 120.0,
-        "max_retries": 2,
+        # 代理(lumos)的 opus 后端会间歇性返回 500/overloaded;anthropic SDK 对
+        # 429/500/overloaded 自带指数退避重试。2 次不够吃掉抽风(实测连续 500
+        # 会把整个 A2A 调用打成硬失败),提到 6。(2026-05-29)
+        "max_retries": 6,
     }
     if temperature is not None:
         kwargs["temperature"] = temperature
