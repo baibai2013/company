@@ -237,10 +237,26 @@ class ClaudeRunner:
 
     def __init__(self):
         self._process: asyncio.subprocess.Process | None = None
+        self._submit_lock = asyncio.Lock()
+        self._spawn_sig: tuple | None = None       # (cwd,model,effort,extra) 变了要重启常驻进程
+        self._stderr_task: asyncio.Task | None = None
+        self.session_id: str | None = None         # 常驻进程维持的会话(重启时 --resume 恢复)
+        # 默认常驻;CC_BRIDGE_PERSISTENT=off 回退「每条消息 spawn 一次」
+        self._persistent = os.environ.get("CC_BRIDGE_PERSISTENT", "on").lower() \
+            not in ("0", "off", "false", "no")
 
     async def stop(self):
-        """中止当前正在运行的 Claude 进程。"""
+        """中止当前 Claude 进程(常驻 / 一次性通用)。"""
+        if self._stderr_task and not self._stderr_task.done():
+            self._stderr_task.cancel()
+        self._stderr_task = None
+        self._spawn_sig = None
         if self._process and self._process.returncode is None:
+            try:
+                if self._process.stdin and not self._process.stdin.is_closing():
+                    self._process.stdin.close()
+            except Exception:
+                pass
             self._process.terminate()
             try:
                 await asyncio.wait_for(self._process.wait(), timeout=5)
@@ -248,6 +264,7 @@ class ClaudeRunner:
                 self._process.kill()
             self._process = None
             return True
+        self._process = None
         return False
 
     @property
@@ -286,85 +303,167 @@ class ClaudeRunner:
         返回 (最终文本, 工具调用日志, 新 session_id)。
         新 session_id 由调用方写回 Thread。
         """
-        # 4.7 用 --effort 控制 thinking（adaptive 模式），不接受 --max-thinking-tokens
-        # --include-partial-messages 启用 stream_event 增量事件
-        cmd = [CLAUDE_BIN, "-p", "--output-format", "stream-json", "--verbose",
-               "--include-partial-messages", "--effort", effort,
-               "--model", model]
+        prompt = self._format_prompt(prompt, image_paths)
+        if self._persistent:
+            return await self._run_persistent(
+                prompt, cwd, session_id,
+                on_chunk=on_chunk, on_tool_start=on_tool_start,
+                on_tool_result=on_tool_result, on_text=on_text, on_thinking=on_thinking,
+                extra_cli_args=extra_cli_args, cmd_wrapper=cmd_wrapper,
+                model=model, effort=effort,
+            )
+        return await self._run_oneshot(
+            prompt, cwd, session_id,
+            on_chunk=on_chunk, on_tool_start=on_tool_start,
+            on_tool_result=on_tool_result, on_text=on_text, on_thinking=on_thinking,
+            extra_cli_args=extra_cli_args, cmd_wrapper=cmd_wrapper,
+            model=model, effort=effort,
+        )
 
-        if session_id:
-            cmd.extend(["--resume", session_id])
-
-        if extra_cli_args:
-            cmd.extend(extra_cli_args)
-
-        # 附件:告知 Claude 本地路径,由其 Read 工具读取
-        # 图片走 Claude 多模态识别,PDF/Office/文本走 Read,视频可用 Bash 调 ffprobe
+    @staticmethod
+    def _format_prompt(prompt: str, image_paths: list[str] | None) -> str:
+        """附件:告知 Claude 本地路径,由其 Read 工具读取(图片走多模态,文档走 Read)。"""
         if image_paths:
             paths_str = "\n".join(f"- {p}" for p in image_paths)
-            prompt = (
+            return (
                 f"请先用 Read 工具读取以下附件(图片/文档),然后再回答。"
                 f"对视频/二进制可先用 Bash 看体积或调 ffprobe 取元数据:\n"
                 f"{paths_str}\n\n用户问题:{prompt}"
             )
+        return prompt
 
-        cmd.append(prompt)
+    async def _drain_stderr_loop(self) -> None:
+        """常驻进程的 stderr 持续读走,避免管道塞满阻塞。"""
+        proc = self._process
+        if not proc or not proc.stderr:
+            return
+        try:
+            while True:
+                line = await proc.stderr.readline()
+                if not line:
+                    break
+                txt = line.decode("utf-8", errors="replace").strip()
+                if txt:
+                    log.debug("claude stderr: %s", txt[:300])
+        except (asyncio.CancelledError, Exception):
+            pass
 
+    async def _ensure_persistent_proc(self, cwd, model, effort, extra_cli_args,
+                                      cmd_wrapper, resume_sid) -> None:
+        """保证有一个匹配参数的常驻 claude 进程;参数变了或挂了就(重)spawn。"""
+        sig = (cwd, model, effort, tuple(extra_cli_args or []))
+        if self.is_running and self._spawn_sig == sig:
+            return
+        if self.is_running:
+            await self.stop()   # 参数变 → 重启
+        # 常驻协议:--input-format stream-json,stdin 持续喂 user message
+        cmd = [CLAUDE_BIN, "-p", "--output-format", "stream-json", "--verbose",
+               "--include-partial-messages", "--input-format", "stream-json",
+               "--effort", effort, "--model", model]
+        if resume_sid:
+            cmd.extend(["--resume", resume_sid])
+        if extra_cli_args:
+            cmd.extend(extra_cli_args)
         if cmd_wrapper:
             cmd = cmd_wrapper(cmd)
+        log.info("cc_bridge 常驻 spawn: cwd=%s model=%s resume=%s", cwd, model, resume_sid or "-")
+        self._process = await asyncio.create_subprocess_exec(
+            *cmd,
+            stdin=asyncio.subprocess.PIPE,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+            cwd=cwd,
+            limit=32 * 1024 * 1024,
+        )
+        self._spawn_sig = sig
+        self._stderr_task = asyncio.create_task(self._drain_stderr_loop())
 
-        log.info("执行: cwd=%s session=%s cmd=%s", cwd, session_id, " ".join(cmd[:6]) + "...")
+    async def _run_persistent(self, prompt, cwd, session_id=None,
+                              on_chunk=None, on_tool_start=None, on_tool_result=None,
+                              on_text=None, on_thinking=None, extra_cli_args=None,
+                              cmd_wrapper=None, model="claude-opus-4-8", effort="high"):
+        """常驻模式:prompt 走 stdin,读到 result 即返回,进程保活复用(省冷启)。"""
+        async with self._submit_lock:
+            # 进程没起/挂了 → 用最近会话 id 恢复(优先 self.session_id,其次调用方传入)
+            resume_sid = (self.session_id or session_id) if not self.is_running else None
+            try:
+                await self._ensure_persistent_proc(
+                    cwd, model, effort, extra_cli_args, cmd_wrapper, resume_sid)
+                msg = {"type": "user", "message": {"role": "user",
+                       "content": [{"type": "text", "text": prompt}]}}
+                self._process.stdin.write(
+                    (json.dumps(msg, ensure_ascii=False) + "\n").encode("utf-8"))
+                await self._process.stdin.drain()
+                state = await parse_stream_loop(
+                    self._process.stdout,
+                    on_text=on_text, on_thinking=on_thinking,
+                    on_tool_start=on_tool_start, on_tool_result=on_tool_result,
+                    on_chunk=on_chunk,
+                    stop_on_result=True,   # 常驻:读到 result 即返回,进程不退
+                    timeout=MAX_TIMEOUT,
+                )
+            except asyncio.TimeoutError:
+                log.warning("cc_bridge 常驻执行超时,重启进程")
+                await self.stop()
+                return "⚠️ 执行超时(10分钟),已中止。", [], self.session_id
+            except Exception as exc:
+                log.warning("cc_bridge 常驻进程异常(%s),已重启,请重发", type(exc).__name__)
+                await self.stop()
+                return f"⚠️ 进程异常({type(exc).__name__}),已重启,请重发消息。", [], self.session_id
+            if state.new_session_id:
+                self.session_id = state.new_session_id
+            final = state.result_text or "".join(state.accumulated)
+            return (final.strip() if final else "(无输出)"), state.tool_log, state.new_session_id
 
-        # limit=32MB：claude 的 system init 行包含所有 slash_commands；
-        # 工具响应里也可能塞 mp4/图片 base64(2026-05-23: 5.3MB mp4 触发过 4MB limit fallback)。
-        # 32MB 远超任何合理 stream-json 事件，配合 parse_stream_loop 的 graceful skip 兜底。
-        # stdin=DEVNULL：防止继承父进程 stdin（如 zsh here-doc 残留 fd），
-        # claude code CLI 在 stdin 不是 pipe/tty 时可能卡死等输入
-        _limit = 32 * 1024 * 1024
+    async def _run_oneshot(self, prompt, cwd, session_id=None,
+                           on_chunk=None, on_tool_start=None, on_tool_result=None,
+                           on_text=None, on_thinking=None, extra_cli_args=None,
+                           cmd_wrapper=None, model="claude-opus-4-8", effort="high"):
+        """旧的「每条消息 spawn 一次 + --resume」模型(CC_BRIDGE_PERSISTENT=off 兜底)。"""
+        cmd = [CLAUDE_BIN, "-p", "--output-format", "stream-json", "--verbose",
+               "--include-partial-messages", "--effort", effort, "--model", model]
+        if session_id:
+            cmd.extend(["--resume", session_id])
+        if extra_cli_args:
+            cmd.extend(extra_cli_args)
+        cmd.append(prompt)
+        if cmd_wrapper:
+            cmd = cmd_wrapper(cmd)
+        log.info("执行(oneshot): cwd=%s session=%s cmd=%s", cwd, session_id,
+                 " ".join(cmd[:6]) + "...")
         self._process = await asyncio.create_subprocess_exec(
             *cmd,
             stdin=asyncio.subprocess.DEVNULL,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
             cwd=cwd,
-            limit=_limit,
+            limit=32 * 1024 * 1024,
         )
-
         state = StreamState()
-
         try:
             async def _read():
                 nonlocal state
                 state = await parse_stream_loop(
                     self._process.stdout,
-                    on_text=on_text,
-                    on_thinking=on_thinking,
-                    on_tool_start=on_tool_start,
-                    on_tool_result=on_tool_result,
-                    on_chunk=on_chunk,
-                    stop_on_result=False,   # spawn-per-task 模式：读到 EOF 才停
-                    timeout=MAX_TIMEOUT,
+                    on_text=on_text, on_thinking=on_thinking,
+                    on_tool_start=on_tool_start, on_tool_result=on_tool_result,
+                    on_chunk=on_chunk, stop_on_result=False, timeout=MAX_TIMEOUT,
                 )
 
             async def _drain_stderr():
                 err = await self._process.stderr.read()
                 if err:
-                    log.warning(
-                        "claude stderr: %s",
-                        err.decode("utf-8", errors="replace")[:500],
-                    )
+                    log.warning("claude stderr: %s",
+                                err.decode("utf-8", errors="replace")[:500])
 
             await asyncio.gather(_read(), _drain_stderr())
             await self._process.wait()
-
         except asyncio.TimeoutError:
             log.warning("Claude 执行超时，终止进程")
             await self.stop()
             state.result_text = "".join(state.accumulated) + "\n\n⚠️ 执行超时（10分钟），已中止。"
-
         finally:
             self._process = None
-
         final = state.result_text or "".join(state.accumulated)
         return (final.strip() if final else "(无输出)"), state.tool_log, state.new_session_id
 
