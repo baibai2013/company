@@ -736,12 +736,14 @@ async def _handle(employee: str, task: str, chat_id: str, client: lark.Client,
 
     # ── 订阅 task_events ──
     stop_evt = asyncio.Event()
+    subscribed_evt = asyncio.Event()   # 订阅就绪信号:派发前等它,避免漏掉早期事件
 
     async def _listen_events() -> None:
         try:
             async with aioredis.from_url("redis://localhost:6379/0") as rr:
                 pubsub = rr.pubsub()
                 await pubsub.subscribe("task_events")
+                subscribed_evt.set()   # 订阅生效,通知主流程可以派发了
                 async for msg in pubsub.listen():
                     if stop_evt.is_set():
                         break
@@ -805,6 +807,12 @@ async def _handle(employee: str, task: str, chat_id: str, client: lark.Client,
             log.debug("task_events listener failed: %s", exc)
 
     listener = asyncio.create_task(_listen_events())
+    # 等订阅真正生效再派发 —— route 启发式后 route_decided 几乎瞬发,
+    # 不等就绪会漏掉早期 route_decided / tool_use 事件(进度卡缺路由和步骤)。
+    try:
+        await asyncio.wait_for(subscribed_evt.wait(), timeout=2.0)
+    except asyncio.TimeoutError:
+        log.warning("[%s] task_events 订阅 2s 未就绪,仍继续派发", employee)
 
     # ── 跑 dispatch ──
     try:
