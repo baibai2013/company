@@ -452,7 +452,7 @@ async def _cc_node(state: SmartState, employee_key: str, cc_prompt: str) -> dict
     """决定哪些专家应在主回复后追加一段补充意见。走轻量 claude code CLI（不入池、不挂 MCP）。"""
     import json as _json
     import re as _re
-    from agents_v2.shared.cc_oneshot import run_cli_oneshot, CLIOneshotFailed
+    from agents_v2.shared.cc_oneshot import run_cli_oneshot_pooled, CLIOneshotFailed
     from agents_v2.shared.runner import current_session_config
 
     # 单聊(feishu_p2p)是一对一,不需要别的员工补充意见 → 直接跳过,
@@ -464,7 +464,10 @@ async def _cc_node(state: SmartState, employee_key: str, cc_prompt: str) -> dict
     context = f"原始消息：{_text_only(state['task_input'])}\n\n{employee_key}回复：{state['execution_result']}"
     prompt = f"{cc_prompt}\n\n{context}"
     try:
-        text = await run_cli_oneshot(prompt, model="claude-sonnet-4-6", effort="low", timeout=30.0)
+        text = await run_cli_oneshot_pooled(
+            prompt, model="claude-sonnet-4-6", effort="low", timeout=30.0,
+            employee_key=employee_key,
+        )
     except CLIOneshotFailed as exc:
         log.warning("[%s] cc_node oneshot 失败：%s", employee_key, exc)
         return {"cc": []}
