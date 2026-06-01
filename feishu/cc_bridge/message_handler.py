@@ -596,7 +596,10 @@ async def handle_message(
         # 让 Claude 能调 send_feishu_image / send_feishu_file 把媒体发回当前飞书)。
         # 同时拼一段 preamble,告知当前 chat_id — Claude 调工具时显式传 feishu_chat_id。
         from feishu.cc_bridge.main import _MCP_CONFIG_PATH  # 避免顶级循环 import
-        extra_cli_args = ["--mcp-config", str(_MCP_CONFIG_PATH)]
+        # bypassPermissions:直聊路径放开 Bash/Edit/Write,不再卡在 plan mode /
+        # 授权弹窗。注意此路径无 sandbox 包裹,会跳过 settings.json 的 deny 名单。
+        extra_cli_args = ["--mcp-config", str(_MCP_CONFIG_PATH),
+                          "--permission-mode", "bypassPermissions"]
 
         media_preamble = (
             f"\n\n[飞书会话信息] 当前 feishu_chat_id={chat_id}\n"

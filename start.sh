@@ -125,6 +125,12 @@ fi
 source "$VENV"
 cd "$COMPANY_DIR"
 
+# ── 员工权限：取消 sandbox-exec 文件沙箱，彻底放开 ───────────────────────────
+# cc_executor 已用 --permission-mode bypassPermissions；再关掉 sandbox 后员工
+# claude 子进程不再被限制只能写 cwd / robot-dog domain，可写任意路径。
+# 恢复沙箱：删掉这行（或设 EMPLOYEE_SANDBOX=1）后重启即可。
+export EMPLOYEE_SANDBOX=0
+
 # ── 清理残留 Python 进程（上次未 stop 的）────────────────────────────────────
 echo ""
 info "检查并清理残留进程..."
