@@ -293,6 +293,27 @@ def _submit_coro(coro):
     return asyncio.run_coroutine_threadsafe(coro, _ensure_runtime_loop())
 
 
+# asyncio 只对 task 持弱引用,fire-and-forget 的长驻任务会被 GC("Task was destroyed
+# but it is pending")。用模块级集合 + 自注册包装钉住它们。
+_BG_TASKS: set = set()
+
+
+async def _pinned(coro):
+    """长驻任务包装:把自身 task 注册进 _BG_TASKS 强引用,跑完再移除,防被 GC。"""
+    import asyncio as _a
+    t = _a.current_task()
+    _BG_TASKS.add(t)
+    try:
+        await coro
+    finally:
+        _BG_TASKS.discard(t)
+
+
+def _submit_bg(coro):
+    """投递一个需要长期存活的协程到运行时 loop(强引用钉住,防 GC)。"""
+    return _submit_coro(_pinned(coro))
+
+
 _REPLY_EMOJI = {
     "product_manager": "🎯", "project_manager": "📋", "tech_lead": "🔧",
     "mechanical": "⚙️", "hardware": "🔌", "firmware": "💾",
@@ -1470,7 +1491,7 @@ def _start_group_listener(employee: str, client: lark.Client, app_id: str = "", 
                 await redis_conn.publish(f"speak_resp:{session_id}", resp_payload)
 
     # 投到统一运行时 loop(与 DM 处理、自主工作循环同一个 loop),共用 claude_pool 单例。
-    _submit_coro(_listener())
+    _submit_bg(_listener())
 
 
 # ── 自主工作循环(脱 LangGraph,直连常驻 CLI)──────────────────────────────────
@@ -1510,11 +1531,15 @@ def _start_scheduler(employee: str) -> None:
         log.info("[sched %s] %s → %s", employee, task_name, (result or "")[:200])
 
     async def _boot():
+        import asyncio as _a
         sched = AgentScheduler(employee, agent_fn=_agent_fn, output_fn=_output_fn)
         await sched.start()
         log.info("自主工作循环已启动: %s", employee)
+        # 不返回:保持 sched 引用存活(cron task 在 sched._loops 里),否则会被 GC
+        while True:
+            await _a.sleep(3600)
 
-    _submit_coro(_boot())
+    _submit_bg(_boot())
 
 
 # ── 同事 delegate / 外部投递:Redis cc_req → 常驻 CLI(高优,打断后台工作)─────────
@@ -1571,7 +1596,7 @@ def _start_cc_req_listener(employee: str) -> None:
                     log.warning("cc_req(%s) 回传失败: %s", employee, _e)
             log.info("cc_req(%s): done from=%s len=%d", employee, from_emp, len(text or ""))
 
-    _submit_coro(_listener())
+    _submit_bg(_listener())
 
 
 def run_bot(employee: str) -> None:

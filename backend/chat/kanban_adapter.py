@@ -143,16 +143,15 @@ class KanbanAdapter(PlatformAdapter):
 
 
 async def _invoke_agent(employee: str, history_text: str) -> str | None:
-    """通过 A2A 协议调用员工 agent，返回回复内容。"""
-    import importlib
+    """投递到员工常驻 CLI(Redis cc_req),返回回复内容。"""
     from backend.services import registry
 
     cfg = registry.get_effective_sync(employee)
-    if not cfg or not cfg.agent_port:
+    if not cfg:
         return None
     try:
-        a2a = importlib.import_module("agents_v2.shared.a2a_server")
-        return await a2a.call_agent(f"http://localhost:{cfg.agent_port}/", history_text, timeout=120)
+        from feishu.cc_req_client import ask_employee
+        return await ask_employee(employee, history_text, timeout=120)
     except Exception as exc:
         log.warning("KanbanAdapter: agent call failed employee=%s err=%s", employee, exc)
         return None

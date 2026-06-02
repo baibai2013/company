@@ -80,13 +80,11 @@ async def _invoke_agent(
 
     把 history_text + role_context 拼起来作为 prompt 传给员工。
     """
-    import importlib
-
     from backend.services import registry
 
     cfg = registry.get_effective_sync(employee)
-    if not cfg or not cfg.agent_port:
-        log.warning("TaskAdapter: no agent_port for employee=%s", employee)
+    if not cfg:
+        log.warning("TaskAdapter: employee=%s not found", employee)
         return None
 
     prompt_parts = []
@@ -97,12 +95,8 @@ async def _invoke_agent(
     prompt = "\n\n".join(prompt_parts) or history_text
 
     try:
-        a2a = importlib.import_module("agents_v2.shared.a2a_server")
-        return await a2a.call_agent(
-            f"http://localhost:{cfg.agent_port}/",
-            prompt,
-            timeout=_AGENT_TIMEOUT,
-        )
+        from feishu.cc_req_client import ask_employee
+        return await ask_employee(employee, prompt, timeout=_AGENT_TIMEOUT)
     except Exception as exc:
         log.warning("TaskAdapter: agent call failed employee=%s err=%s", employee, exc)
         return None

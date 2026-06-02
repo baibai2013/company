@@ -160,12 +160,14 @@ echo ""
 info "启动 Backend API (port 8000)..."
 start_py "backend" 8000 -m uvicorn backend.main:app --host 0.0.0.0 --port 8000 --reload --reload-dir backend
 
-# ── 3. 员工 Agents — 从 DB registry 读列表（含 tech_lead）────────────────────
-echo ""
-info "启动员工 Agents（来自 employee 表）..."
-
-# 所有 active 员工统一从 registry 拿 agent_port；tech_lead 没有独立目录，会走 generic.main
-EMPLOYEE_LIST=$(cd "$COMPANY_DIR" && .venv/bin/python -c "
+# ── 3. 员工 Agents（LangGraph A2A server）—— 已退役 ──────────────────────────
+# cc_bridge 化重构后,员工 = employee_bot 进程里的常驻 Claude Code CLI;聊天/自主工作/
+# delegate/派单全走该 CLI(Redis cc_req + 自主循环),不再需要 agents_v2 的 graph server。
+# 如需临时回退到旧 graph,设 START_AGENT_SERVERS=1。
+if [[ "${START_AGENT_SERVERS:-0}" == "1" ]]; then
+  echo ""
+  info "启动员工 Agents（来自 employee 表，graph 回退模式）..."
+  EMPLOYEE_LIST=$(cd "$COMPANY_DIR" && .venv/bin/python -c "
 from backend.services import registry
 registry.warmup_sync()
 for k in registry.list_keys_sync_cached(active_only=True):
@@ -173,18 +175,19 @@ for k in registry.list_keys_sync_cached(active_only=True):
     if cfg and cfg.agent_port:
         print(f'{k}:{cfg.agent_port}')
 ")
-
-while IFS= read -r entry; do
-  [[ -z "$entry" ]] && continue
-  name="${entry%%:*}"
-  port="${entry##*:}"
-  # 有独立目录的走自己的 main.py，其他统一走 generic
-  if [ -d "agents_v2/$name" ] && [ -f "agents_v2/$name/main.py" ]; then
-    start_py "$name" "$port" -m "agents_v2.$name.main"
-  else
-    EMPLOYEE_KEY="$name" start_py "$name" "$port" -m "agents_v2.generic.main" "$name"
-  fi
-done <<< "$EMPLOYEE_LIST"
+  while IFS= read -r entry; do
+    [[ -z "$entry" ]] && continue
+    name="${entry%%:*}"; port="${entry##*:}"
+    if [ -d "agents_v2/$name" ] && [ -f "agents_v2/$name/main.py" ]; then
+      start_py "$name" "$port" -m "agents_v2.$name.main"
+    else
+      EMPLOYEE_KEY="$name" start_py "$name" "$port" -m "agents_v2.generic.main" "$name"
+    fi
+  done <<< "$EMPLOYEE_LIST"
+else
+  echo ""
+  info "员工 Agents(graph server)已退役 — 员工跑在 employee_bot 进程的常驻 CLI 上"
+fi
 
 # ── 4. Frontend (port 5173) ───────────────────────────────────────────────────
 if [[ $NO_FRONTEND -eq 0 ]]; then

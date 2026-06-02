@@ -48,18 +48,7 @@ async def _call_agent_and_save(
     For work tasks: saves an immediate ack so user sees activity fast,
     then saves the full result when the agent finishes.
     """
-    port = _employee_port(employee_key)
-    if not port:
-        return
-
-    try:
-        a2a = importlib.import_module("agents_v2.shared.a2a_server")
-        call_agent = a2a.call_agent
-    except ModuleNotFoundError:
-        return  # agents_v2 not available (e.g. unit-test env)
-
     save_channel = channel if channel is not None else employee_key
-    url = f"http://localhost:{port}/"
     name = _employee_name(employee_key)
 
     # Save immediate ack for work tasks so the user isn't staring at silence
@@ -69,7 +58,8 @@ async def _call_agent_and_save(
                         f"收到，我来处理这个任务，稍等…")
 
     try:
-        reply = await call_agent(url, user_text, timeout=180)
+        from feishu.cc_req_client import ask_employee
+        reply = await ask_employee(employee_key, user_text, timeout=180)
         # For work tasks, prefix result with a progress marker
         if is_work:
             reply = f"✅ 完成！以下是结果：\n\n{reply}"
