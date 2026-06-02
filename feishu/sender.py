@@ -74,7 +74,10 @@ def send_text(client: lark.Client, chat_id: str, text: str) -> None:
         log.error("send_text failed: %s %s", resp.code, resp.msg)
 
 
-def send_card(client: lark.Client, chat_id: str, title: str, content: str, color: str = "blue") -> None:
+def send_card(client: lark.Client, chat_id: str, title: str, content: str, color: str = "blue",
+              receive_id_type: str = "chat_id") -> None:
+    """发卡片。receive_id_type 可为 chat_id / open_id / user_id / email —— 用 open_id
+    直发可在不预先建群的情况下自动开启与该用户的单聊(自主循环私聊 CEO 用)。"""
     body = (
         CreateMessageRequestBody.builder()
         .receive_id(chat_id)
@@ -84,7 +87,7 @@ def send_card(client: lark.Client, chat_id: str, title: str, content: str, color
     )
     req = (
         CreateMessageRequest.builder()
-        .receive_id_type("chat_id")
+        .receive_id_type(receive_id_type)
         .request_body(body)
         .build()
     )

@@ -72,6 +72,38 @@ _DEFAULT_CC_PROMPT = """根据用户原消息和当前员工的回复，判断�
 只输出 JSON 数组，不要任何其他文字。
 例如：["mechanical", "firmware"] 或 []"""
 
+# 全员统一注入：员工首先是全能 CLI 工程助手，不受本职领域限制。
+# 只在 WORK 路径前置（CHAT 路径不加，避免闲聊也乱动工具）。
+_GLOBAL_CLI_DIRECTIVE = (
+    "【通用能力】你首先是一个全能的命令行工程助手(CLI)。除了你自己的专业领域，"
+    "任何编码、系统操作、调试、文件处理乃至现实工程问题，你都要直接上手解决，"
+    "不要以\"这不是我的领域\"推脱或转交。优先用 Bash/Read/Write/Edit/Grep 等工具"
+    "实际动手（必要时查文档、写脚本、跑命令），而不是只给口头建议。\n\n"
+)
+
+def _pm_decompose_directive() -> str:
+    """项目经理芳芳的「拆解 + 即时派单」指令(按需直派通路)。
+
+    复用 group_chat.prompts.EXECUTE_DECOMPOSE_PROMPT 的拆解规则(import 引用避免两处漂移),
+    再追加调 employee_cli.py 建任务+直派、事后私聊汇报 CEO 的步骤。lazy import 防循环依赖。
+    """
+    from group_chat.prompts import EXECUTE_DECOMPOSE_PROMPT
+    _PY = "/Users/liyijiang/work/company/.venv/bin/python"
+    _CLI = "/Users/liyijiang/work/company/scripts/employee_cli.py"
+    return (
+        "【项目经理职责:拆解需求并即时派单】\n"
+        "当 CEO 给你一个需求、要你**拆解并分配**时(而非普通对话/单纯查询),按以下三步做:\n"
+        "① 按下面《拆解规则》把需求拆成 tasks JSON(执行人必须在 11 人白名单内,"
+        "priority∈P0/P1/P2,最多 5 条,任务之间只并行不可有依赖,每条 description 写清产物落盘路径);\n"
+        f"② 调 `{_PY} {_CLI} decompose-dispatch '<tasks_json>'` 建任务并立即直派(JSON 含特殊字符时可传 \"-\" 改从 stdin 喂入);\n"
+        f"③ 拿到返回的指派清单后,调 `{_PY} {_CLI} report project_manager \"已拆成 N 个任务并派单:...\"` 私聊把清单告知 CEO(事后告知)。\n"
+        "若只是普通对话、或 CEO 没有要你拆解派单,忽略本段,正常回复即可。\n\n"
+        "—— 以下是《拆解规则》(注意:这里不再经过会议 summary,直接按 CEO 的需求拆)——\n"
+        f"{EXECUTE_DECOMPOSE_PROMPT}\n\n"
+        "—— 拆解规则结束 ——\n\n"
+    )
+
+
 # Backwards-compat aliases (some imports reference these)
 _ROUTE_PROMPT = _DEFAULT_ROUTE_PROMPT
 _CHAT_SUFFIX = _DEFAULT_CHAT_SUFFIX
@@ -536,15 +568,20 @@ async def _cc_work_node(state: SmartState, employee_key: str) -> dict:
             f"用户消息：{query}"
         )
     elif plan:
-        prompt = f"执行方案：\n{plan}\n\n原始需求：\n{query}"
+        prompt = _GLOBAL_CLI_DIRECTIVE + f"执行方案：\n{plan}\n\n原始需求：\n{query}"
     else:
-        prompt = (
+        prompt = _GLOBAL_CLI_DIRECTIVE + (
             "【任务模式】这是要做的工作任务。\n"
             "- 复杂任务请先用 TodoWrite 列出步骤（包含\"查实际情况\"作为第一步）\n"
             "- 不要凭空想方案，先用 Bash / Read / Grep / Glob 查清现状再动手\n"
             "- 边做边更新 TodoWrite，让用户在进度卡上看到推进\n\n"
             f"用户需求：{query}"
         )
+
+    # 项目经理芳芳专属:CEO 要求「拆解需求并分配」时,走按需直派通路。
+    # 仅 project_manager 命中;私聊 / 群@ 都过本节点,一处注入即覆盖两入口。
+    if route != "CHAT" and employee_key == "project_manager":
+        prompt = _pm_decompose_directive() + prompt
 
     # CHAT 路径用 Sonnet + low effort（闲聊不要 Opus + thinking 那么慢）
     # WORK 路径用 Opus + high effort（重活值得）

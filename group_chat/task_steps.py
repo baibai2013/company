@@ -26,6 +26,7 @@ log = logging.getLogger(__name__)
 _VALID_EXECUTORS = frozenset({
     "mechanical", "hardware", "firmware", "algorithm",
     "testing", "cost", "product_manager", "project_manager", "tech_lead",
+    "sysadmin", "fullstack",
 })
 
 
@@ -112,7 +113,8 @@ async def mark_task_status(task_id: str, target: str) -> None:
             # 沿用 backend.api.routes.tasks._TRANSITIONS 的语义
             allowed = {
                 "pending": {"in_progress"},
-                "in_progress": {"done", "failed"},
+                "in_progress": {"awaiting_approval", "done", "failed"},
+                "awaiting_approval": {"in_progress", "done", "failed"},
             }
             if target not in allowed.get(task.status, set()):
                 log.info("mark_task_status: skip transition %s → %s task=%s",

@@ -19,6 +19,20 @@ class TaskCreate(BaseModel):
     verifier: str | None = None
 
 
+class DecomposeTaskItem(BaseModel):
+    """芳芳拆解出的单条子任务(按需直派用)。"""
+    title: str
+    description: str | None = None
+    executor: str
+    priority: str = "P1"
+
+
+class DecomposeDispatchRequest(BaseModel):
+    """POST /api/tasks/decompose-dispatch 请求体:一组带指定执行人的子任务。"""
+    tasks: list[DecomposeTaskItem]
+    requester: str = "CEO"
+
+
 class TaskStepRead(BaseModel):
     id: str
     step_name: str

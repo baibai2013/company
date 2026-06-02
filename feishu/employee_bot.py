@@ -83,6 +83,43 @@ def _get_redis() -> redis.Redis:
     return _redis_client
 
 
+# ── CEO 私聊 chat_id 捕获 ──────────────────────────────────────────────────────
+# 自主工作循环里员工要"私聊汇报 CEO",收件地址 = 该员工 bot 与 CEO 的单聊 chat_id。
+# 系统原先没存这个映射。这里在每条 p2p 消息到达时把 chat_id 落到该员工
+# behavior.ceo_dm_chat_id(仅在变化时写 DB)。employee_cli.py report 读这个字段发卡。
+_ceo_dm_cache: dict[str, str] = {}   # employee -> 最近写入的 chat_id(进程内,避免重复写库)
+
+
+def _capture_ceo_dm(employee: str, chat_id: str) -> None:
+    """把 CEO 单聊 chat_id 持久化到 employee.behavior.ceo_dm_chat_id(仅变化时)。
+
+    在 WS 线程里被调用,落库走独立 daemon 线程(自带 event loop),不阻塞消息处理。
+    """
+    if not chat_id or _ceo_dm_cache.get(employee) == chat_id:
+        return
+    _ceo_dm_cache[employee] = chat_id   # 先占位,避免并发重复触发
+
+    def _do() -> None:
+        async def _run() -> None:
+            from backend.services import registry
+            emp = await registry.get_raw(employee)
+            if not emp:
+                return
+            behavior = dict(emp.get("behavior") or {})
+            if behavior.get("ceo_dm_chat_id") == chat_id:
+                return   # DB 里已是最新,无需写
+            behavior["ceo_dm_chat_id"] = chat_id
+            await registry.update(employee, {"behavior": behavior}, actor="employee_bot")
+            log.info("captured CEO dm chat_id for %s: %s", employee, chat_id)
+        try:
+            asyncio.run(_run())
+        except Exception as exc:
+            log.warning("capture_ceo_dm failed %s: %s", employee, exc)
+            _ceo_dm_cache.pop(employee, None)   # 失败回滚,下条消息再试
+
+    threading.Thread(target=_do, daemon=True, name=f"capture-ceo-dm-{employee}").start()
+
+
 # ── 群聊历史记录(自维护,绕开飞书 v2 卡片 ListMessage 降级 bug)──
 # 飞书 ListMessage API 对 v2 卡片返回"请升级客户端"占位文本,拿不到员工真实回复内容。
 # 改方案: 员工每次完成回复时 LPUSH 一条 history,fetch 时从 redis list 取。
@@ -1090,6 +1127,10 @@ def make_on_message(employee: str, client: lark.Client, bot_open_id: str):
         chat_id = msg.chat_id
         log.info("employee=%s chat_type=%s text=%.60s image=%s",
                  employee, msg.chat_type, text, bool(image_base64))
+
+        # p2p 单聊 = CEO 私聊该员工 bot,记下 chat_id 供自主循环私聊汇报用
+        if msg.chat_type == "p2p":
+            _capture_ceo_dm(employee, chat_id)
 
         # 记一条用户消息到 redis 群聊历史(SETNX 跨 9 个 bot 去重,避免每个 bot 都 append)
         try:

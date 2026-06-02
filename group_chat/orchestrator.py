@@ -688,10 +688,12 @@ async def _execute_node(
                 task_id=tid,
                 chat_id=f"task:{tid}",
             )
-            ok = bool(result.get("result"))
+            # 失败时 _dispatch 也返回非空 result(以 ❌ 开头),只看非空会把失败误判成功。
+            res = result.get("result") or ""
+            ok = bool(res) and not res.lstrip().startswith("❌")
             await mark_task_status(tid, "done" if ok else "failed")
             log.info("execute_node: task=%s done=%s result_len=%d",
-                     tid[:8], ok, len(result.get("result", "")))
+                     tid[:8], ok, len(res))
         except Exception as exc:
             log.warning("execute_node: dispatch failed task=%s err=%s", tid[:8], exc)
             try:
@@ -704,6 +706,7 @@ async def _execute_node(
                        "mechanical", "hardware", "firmware", "algorithm",
                        "testing", "cost", "product_manager",
                        "project_manager", "tech_lead",
+                       "sysadmin", "fullstack",
                    } and (it.get("title") or "").strip()]
     paired = list(zip(task_ids, valid_items[:len(task_ids)]))
 

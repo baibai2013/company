@@ -1,0 +1,194 @@
+{
+  "_meta": {
+    "schema_version": 1,
+    "generator": "skills/mechanical/benchmarks/run_all.py",
+    "build123d_version": "0.6.x",
+    "ocp_version": "7.7.x",
+    "frozen_at_seed": "2026-06-08T18:00:00+08:00",
+    "frozen_by": "mechanical (Dave)",
+    "git_ref": "<commit-short>",
+    "_note": "本文件是 benchmarks 10 题的 golden 基线。每个 key 对应一题(题面见 examples/benchmarks-prompts.md)。compare_golden.py 按本文件验证;不一致即回归。"
+  },
+
+  "calibration_block": {
+    "version": 1,
+    "build_seconds": 0.42,
+    "step_path": "output/calibration_block.step",
+    "step_reimport_ok": true,
+    "solid_count": 1,
+    "is_manifold": true,
+    "volume_mm3": 47497.79,
+    "volume_tolerance_pct": 0.5,
+    "bbox_mm": [60.0, 40.0, 20.0],
+    "bbox_tolerance_mm": 0.05,
+    "center_of_mass_mm": [30.0, 20.0, 10.0],
+    "com_tolerance_mm": 0.1,
+    "area_mm2": 7456.0,
+    "area_tolerance_pct": 1.0,
+    "checksum_sha256": "<sha256-of-step,仅记录不断言>",
+    "extra_assertions": [
+      {"kind": "hole_centers_xy_mm", "value": [[5,5],[55,5],[5,35],[55,35]], "tol_mm": 0.05}
+    ]
+  },
+
+  "flange_4hole": {
+    "version": 1,
+    "build_seconds": 0.85,
+    "step_path": "output/flange_4hole.step",
+    "step_reimport_ok": true,
+    "solid_count": 1,
+    "is_manifold": true,
+    "volume_mm3": 29154.6,
+    "volume_tolerance_pct": 0.5,
+    "bbox_mm": [80.0, 80.0, 8.0],
+    "bbox_tolerance_mm": 0.05,
+    "center_of_mass_mm": [0.0, 0.0, 4.0],
+    "com_tolerance_mm": 0.1,
+    "area_mm2": 7892.4,
+    "area_tolerance_pct": 1.0,
+    "checksum_sha256": "<sha256-of-step>",
+    "extra_assertions": [
+      {"kind": "hole_centers_xy_mm",
+       "value": [[30.0,0.0],[0.0,30.0],[-30.0,0.0],[0.0,-30.0]],
+       "tol_mm": 0.1},
+      {"kind": "dxf_top_view_present",
+       "path": "output/flange_4hole.dxf",
+       "min_entities": 6}
+    ]
+  },
+
+  "l_bracket": {
+    "version": 1,
+    "build_seconds": 0.6,
+    "step_path": "output/l_bracket.step",
+    "step_reimport_ok": true,
+    "solid_count": 1,
+    "is_manifold": true,
+    "volume_mm3": "_seed_after_first_run_",
+    "volume_tolerance_pct": 0.5,
+    "bbox_mm": [50.0, 50.0, 40.0],
+    "bbox_tolerance_mm": 0.05,
+    "center_of_mass_mm": "_seed_after_first_run_",
+    "com_tolerance_mm": 0.1,
+    "area_mm2": "_seed_after_first_run_",
+    "area_tolerance_pct": 1.0,
+    "checksum_sha256": "<sha256-of-step>",
+    "extra_assertions": [
+      {"kind": "face_count_seed", "_seed_after_first_run_": true}
+    ]
+  },
+
+  "stepped_shaft": {
+    "version": 1,
+    "step_path": "output/stepped_shaft.step",
+    "step_reimport_ok": true,
+    "solid_count": 1,
+    "is_manifold": true,
+    "volume_mm3": "_seed_",
+    "volume_tolerance_pct": 1.0,
+    "bbox_mm": [16.0, 16.0, 65.0],
+    "bbox_tolerance_mm": 0.05,
+    "extra_assertions": [
+      {"kind": "keyway_center_mm", "value": [5.0, 0.0, 35.0], "tol_mm": 0.1}
+    ]
+  },
+
+  "enclosure_box": {
+    "version": 1,
+    "step_path": "output/enclosure_box.step",
+    "step_reimport_ok": true,
+    "solid_count": 1,
+    "is_manifold": true,
+    "volume_mm3": "_seed_",
+    "volume_tolerance_pct": 1.0,
+    "bbox_mm": [100.0, 60.0, 30.0],
+    "bbox_tolerance_mm": 0.05,
+    "extra_assertions": [
+      {"kind": "usb_cutout_mm", "value": [12.0, 6.0], "tol_mm": 0.1},
+      {"kind": "standoff_top_centers_mm",
+       "value": [[5,5,27.5],[95,5,27.5],[5,55,27.5],[95,55,27.5]],
+       "tol_mm": 0.1}
+    ]
+  },
+
+  "clevis_yoke": {
+    "version": 1,
+    "step_path": "output/clevis_yoke.step",
+    "step_reimport_ok": true,
+    "solid_count": 1,
+    "is_manifold": true,
+    "volume_mm3": "_seed_",
+    "volume_tolerance_pct": 1.0,
+    "bbox_mm": [30.0, 30.0, 40.0],
+    "bbox_tolerance_mm": 0.1,
+    "extra_assertions": [
+      {"kind": "pin_hole_axis", "value": [1.0, 0.0, 0.0], "tol": 1e-3},
+      {"kind": "pin_hole_center_yz_mm", "value": [15.0, 25.0], "tol_mm": 0.1}
+    ]
+  },
+
+  "radial_cylinder": {
+    "version": 1,
+    "step_path": "output/radial_cylinder.step",
+    "step_reimport_ok": true,
+    "solid_count": 1,
+    "is_manifold": true,
+    "volume_mm3": "_seed_",
+    "volume_tolerance_pct": 1.5,
+    "bbox_mm": [60.0, 60.0, 88.0],
+    "bbox_tolerance_mm": 0.1,
+    "extra_assertions": [
+      {"kind": "inner_void_volume_mm3", "value": 24938.0, "tol_pct": 2.0,
+       "_note": "主缸 Φ20 内体积 + 进气管 Φ9 内体积之和"}
+    ]
+  },
+
+  "impeller_3blade": {
+    "version": 1,
+    "step_path": "output/impeller_3blade.step",
+    "step_reimport_ok": true,
+    "solid_count": 1,
+    "is_manifold": true,
+    "volume_mm3": "_seed_",
+    "volume_tolerance_pct": 2.0,
+    "bbox_mm_x": [80.0, 0.5],
+    "bbox_mm_y": [80.0, 0.5],
+    "bbox_mm_z_range": [30.0, 38.0],
+    "_note": "扫掠样条容差更宽,Z 由 15° 倾角延伸"
+  },
+
+  "spiral_staircase": {
+    "version": 1,
+    "step_path": "output/spiral_staircase.step",
+    "step_reimport_ok": true,
+    "solid_count": 1,
+    "is_manifold": true,
+    "volume_mm3": "_seed_",
+    "volume_tolerance_pct": 1.0,
+    "bbox_mm": [200.0, 200.0, 2200.0],
+    "bbox_tolerance_mm": 0.1,
+    "extra_assertions": [
+      {"kind": "step_count", "value": 12, "strict": true,
+       "_note": "12 阶必须能被识别(face count 或 union 子拓扑数)"}
+    ]
+  },
+
+  "planetary_gear_set": {
+    "version": 1,
+    "step_path": "output/planetary_gear_set.step",
+    "step_reimport_ok": true,
+    "solid_count": 5,
+    "all_manifold": true,
+    "volume_mm3_total": "_seed_",
+    "volume_tolerance_pct": 2.0,
+    "bbox_mm_xy_seed": [80.0, 80.0],
+    "bbox_tolerance_mm": 2.0,
+    "extra_assertions": [
+      {"kind": "planet_centers_mm",
+       "value": [[18.0, 0.0], [-9.0, 15.59], [-9.0, -15.59]],
+       "tol_mm": 0.5},
+      {"kind": "gear_face_width_mm", "value": 8.0, "tol_mm": 0.05}
+    ],
+    "_note": "齿形可近似,只校中心距与位姿"
+  }
+}

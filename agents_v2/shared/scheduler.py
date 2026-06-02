@@ -486,6 +486,12 @@ class AgentScheduler:
         task_name = cfg.get("name", task_id)
         triggered_at = datetime.now(timezone.utc)
 
+        # 防重入：自主工作循环单轮可能跑很久(放大了 timeout),若上一轮还没结束就
+        # 又到了 cron 触发点,跳过本轮,避免同一员工并发起多个 cc 子进程互相打架。
+        if self._status.get(task_id, {}).get("running"):
+            log.warning("[%s] task %s 上一轮仍在执行,跳过本轮(防重入)", self.key, task_name)
+            return "SKIPPED: previous run still in progress"
+
         self._status[task_id]["running"] = True
         log.info("[%s] executing task: %s (mode=%s)", self.key, task_name, mode)
 

@@ -9,3 +9,12 @@ logs/
 .pids
 .pids_feishu
 node_modules/
+
+# 员工运行态快照(share/ 下进度/PM 状态,运行时自写)
+share/.report_snapshot_*.md
+share/.pm_state_snapshot.md
+# persona 配置时间戳备份
+config/persona_backup_*.json
+# chat_history 运行态(保留目录占位)
+chat_history/*
+!chat_history/.gitkeep

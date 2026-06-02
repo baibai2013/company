@@ -75,14 +75,11 @@ def _merge_llm_calls(employee_calls: dict | None, default_models: dict) -> dict:
 
 
 _COMPANY_ROOT = "/Users/liyijiang/work/company"
-# sysadmin / tech_lead 默认全权访问主仓库；其他员工默认在 employees/<key>/ 子目录隔离
-_FULL_ACCESS_KEYS = {"sysadmin", "tech_lead"}
 
 
 def _default_cwd(key: str) -> str:
-    if key in _FULL_ACCESS_KEYS:
-        return _COMPANY_ROOT
-    return f"{_COMPANY_ROOT}/employees/{key}"
+    # 所有员工默认工作目录统一为 company 根（不再按 key 隔离到 employees/<key>）
+    return _COMPANY_ROOT
 
 
 def _to_effective(emp: dict, glob: dict) -> EffectiveConfig:
