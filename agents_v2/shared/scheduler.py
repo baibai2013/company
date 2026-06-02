@@ -513,11 +513,19 @@ class AgentScheduler:
             log.warning("[%s] task %s 上一轮仍在执行,跳过本轮(防重入)", self.key, task_name)
             return "SKIPPED: previous run still in progress"
 
-        # 廉价预检:自主工作循环(skip_if_no_tasks)在拉起昂贵的 claude 之前,先用一次
-        # DB 直查判断名下有没有待办任务。空 → 本轮直接跳过,不 spawn claude。这避免了
-        # 12 个员工每 5 分钟各拉一个 opus claude "查清单发现没活就退" 的空转烧钱。
-        # (id == auto_5min_report 作为旧配置的兜底识别,新配置应显式带 skip_if_no_tasks)
-        if cfg.get("skip_if_no_tasks") or task_id == "auto_5min_report":
+        # 是否「自主工作循环」任务:多重识别,防漏标导致空转刷屏。
+        # (显式 flag 优先;兼容旧 id;再按名字/cron 兜底——有的循环任务 id 是 uuid)
+        _cron = (cfg.get("cron") or (cfg.get("trigger") or {}).get("cron") or "").strip()
+        is_work_loop = bool(
+            cfg.get("skip_if_no_tasks")
+            or task_id == "auto_5min_report"
+            or "自主工作循环" in (cfg.get("name") or "")
+            or _cron == "*/5 * * * *"
+        )
+
+        # 廉价预检:自主工作循环在拉起昂贵的 claude 之前,先用一次 DB 直查判断名下有没有
+        # 待办任务。空 → 本轮直接跳过,不 spawn claude(避免空转烧 opus + 给 CEO 刷空卡)。
+        if is_work_loop:
             if not await self._has_pending_tasks():
                 log.info("[%s] task %s: 名下无待办任务,跳过本轮(不 spawn claude)", self.key, task_name)
                 return "SKIPPED: 无待办任务"
@@ -532,7 +540,7 @@ class AgentScheduler:
                 result = await self._execute_direct(task_id, cfg)
             elif mode == "webhook":
                 result = await self._execute_webhook(task_id, cfg)
-            elif cfg.get("skip_if_no_tasks") or task_id == "auto_5min_report":
+            elif is_work_loop:
                 # 自主工作循环:连续做、每步给问答让路(步骤边界抢占)
                 result = await self._execute_work_loop(task_id, cfg)
             else:
