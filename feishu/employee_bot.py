@@ -1668,6 +1668,9 @@ def run_bot(employee: str) -> None:
     _start_cc_req_listener(employee)
     print(f"  cc_req 监听: 已启动")
 
+    # 注:bot 主线程阻塞在 ws_client.start()(C 层),Python 信号处理器跑不到,无法在
+    # 此优雅终止常驻 claude。改由 stop.sh 兜底(pgrep mcp_servers.company_tools.server
+    # 精确清理员工 CLI 子进程),可靠且不误伤交互式会话。
     ws_client.start()
 
 

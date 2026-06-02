@@ -32,7 +32,7 @@ else
 fi
 
 # ── 按端口补充清理 ────────────────────────────────────────────────────────────
-ALL_PORTS="8000 8180 8089 9000 9001 9002 9003 9004 9005 9006 9007 9008 9009 5173"
+ALL_PORTS="8000 8180 8089 9000 9001 9002 9003 9004 9005 9006 9007 9008 9009 9010 9011 5173"
 for port in $ALL_PORTS; do
   pids=$(lsof -ti:"$port" 2>/dev/null || true)
   if [[ -n "$pids" ]]; then
@@ -40,6 +40,22 @@ for port in $ALL_PORTS; do
     kill $pids 2>/dev/null && ok "停止端口 $port (PID=$pids)"
   fi
 done
+
+# ── 兜底:按进程模式清理(bot 无监听端口,且 .pids 可能不全)─────────────────
+# 员工 bot:只能按模式杀(没端口,手动起的也不在 .pids 里)。
+bot_pids=$(pgrep -f "feishu.employee_bot" 2>/dev/null || true)
+if [[ -n "$bot_pids" ]]; then
+  # shellcheck disable=SC2086
+  kill $bot_pids 2>/dev/null && ok "停止员工 bot 进程 (PID=$bot_pids)"
+  sleep 1
+fi
+# 员工常驻 Claude Code CLI:bot 被杀后子 claude 会成孤儿。按"挂了 company MCP server"
+# 这个特征签名精确清理(交互式 claude 会话无此签名,不会误伤)。
+cli_pids=$(pgrep -f "mcp_servers.company_tools.server" 2>/dev/null || true)
+if [[ -n "$cli_pids" ]]; then
+  # shellcheck disable=SC2086
+  kill $cli_pids 2>/dev/null && ok "停止员工 CLI 子进程 (PID=$cli_pids)"
+fi
 
 # ── 清理 process_manager 的 per-employee PID 目录 ─────────────────────────────
 PIDS_DIR="$COMPANY_DIR/logs/.pids"
