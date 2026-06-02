@@ -165,7 +165,14 @@ async def lifespan(inner_app: FastAPI):
             output_fn=_output_for_scheduler,
             tools=tools,
         )
-        await scheduler.start()
+        # 一员工一进程模式:自主工作循环改由 employee_bot 进程托管(与聊天共用常驻 CLI),
+        # agent server 不再起调度,避免任务被两个进程重复触发。设 0 可让 agent server 接管。
+        import os as _os
+        if _os.environ.get("EMPLOYEE_SCHEDULER_IN_BOT", "on").lower() not in ("0", "off", "false", "no"):
+            _log_sched = __import__("logging").getLogger(f"agents_v2.{_employee_key}")
+            _log_sched.info("scheduler 交由 employee_bot 进程托管,agent server 跳过启动")
+        else:
+            await scheduler.start()
         inner_app.state.scheduler = scheduler
 
         # 确保 PG NOTIFY listener 在 lifespan 里就跑起来（不等第一条消息）

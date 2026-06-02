@@ -137,6 +137,10 @@ export EMPLOYEE_SANDBOX=0
 # 回退旧的"按对话×模型分桶"进程池:设 CLAUDE_CLI_PER_EMPLOYEE=0。
 export CLAUDE_CLI_PER_EMPLOYEE=1
 
+# 自主工作循环托管在 employee_bot 进程(与聊天共用常驻 CLI,聊天可 interrupt 工作);
+# agent server 不再重复起调度。设 0 回退到 agent server 托管。
+export EMPLOYEE_SCHEDULER_IN_BOT=1
+
 # ── 清理残留 Python 进程（上次未 stop 的）────────────────────────────────────
 echo ""
 info "检查并清理残留进程..."

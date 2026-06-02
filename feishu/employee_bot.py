@@ -269,6 +269,30 @@ def _run_async(coro) -> None:
     asyncio.run(coro)
 
 
+# ── 统一运行时事件循环 ────────────────────────────────────────────────────────
+# 一员工一进程一常驻 CLI:聊天(DM/群)、自主工作循环、被同事 delegate 全部在
+# 这一个 loop 上跑,才能共用同一个 claude_pool 单例 + asyncio 锁,interrupt 抢占
+# 才跨场景生效。旧的"每条消息 asyncio.run 新循环"会让池锁绑到不同 loop 上炸掉。
+_RUNTIME_LOOP: "asyncio.AbstractEventLoop | None" = None
+_RUNTIME_LOOP_LOCK = threading.Lock()
+
+
+def _ensure_runtime_loop() -> "asyncio.AbstractEventLoop":
+    global _RUNTIME_LOOP
+    with _RUNTIME_LOOP_LOCK:
+        if _RUNTIME_LOOP is None:
+            loop = asyncio.new_event_loop()
+            threading.Thread(target=loop.run_forever, daemon=True,
+                             name="employee-runtime-loop").start()
+            _RUNTIME_LOOP = loop
+        return _RUNTIME_LOOP
+
+
+def _submit_coro(coro):
+    """从任意线程(WS 回调线程等)把协程投到统一运行时 loop。返回 concurrent.futures.Future。"""
+    return asyncio.run_coroutine_threadsafe(coro, _ensure_runtime_loop())
+
+
 _REPLY_EMOJI = {
     "product_manager": "🎯", "project_manager": "📋", "tech_lead": "🔧",
     "mechanical": "⚙️", "hardware": "🔌", "firmware": "💾",
@@ -1175,14 +1199,11 @@ def make_on_message(employee: str, client: lark.Client, bot_open_id: str):
             # 单 @ 我 / PM 兜底 → 走 direct cli
             # (走到这里的 bot 一定是该响应的: 精确 @ 我 / 无 @ + is_default)
 
-        # 单聊 + 群聊单 @ 都走 _handle(cli 通道)
-        threading.Thread(
-            target=_run_async,
-            args=(_handle(employee, text, chat_id, client,
-                          image_base64=image_base64, image_media_type=image_media_type,
-                          message_id=mid, chat_type=msg.chat_type),),
-            daemon=True,
-        ).start()
+        # 单聊 + 群聊单 @ 都走 _handle(cli 通道)。投到统一运行时 loop(与自主工作循环
+        # 同 loop)→ 聊天能 interrupt 正在跑的后台工作。fire-and-forget,不阻塞 WS 回调。
+        _submit_coro(_handle(employee, text, chat_id, client,
+                             image_base64=image_base64, image_media_type=image_media_type,
+                             message_id=mid, chat_type=msg.chat_type))
 
     return on_message
 
@@ -1448,7 +1469,52 @@ def _start_group_listener(employee: str, client: lark.Client, app_id: str = "", 
                 }, ensure_ascii=False)
                 await redis_conn.publish(f"speak_resp:{session_id}", resp_payload)
 
-    _asyncio.run(_listener())
+    # 投到统一运行时 loop(与 DM 处理、自主工作循环同一个 loop),共用 claude_pool 单例。
+    _submit_coro(_listener())
+
+
+# ── 自主工作循环(脱 LangGraph,直连常驻 CLI)──────────────────────────────────
+
+def _start_scheduler(employee: str) -> None:
+    """在统一运行时 loop 上起该员工的 AgentScheduler。
+
+    agent_fn 直接 run_cc_node(thread_id=sched_* → is_work=True),不经 agents_v2 graph。
+    自主工作和聊天共用同一个常驻 CLI,故聊天能 interrupt 正在跑的工作。
+    """
+    from agents_v2.shared.scheduler import AgentScheduler
+
+    async def _agent_fn(prompt: str, context: dict) -> str:
+        from agents_v2.shared.cc_executor import run_cc_node, CCExecutorFailed
+        from backend.services import registry as _reg
+        cfg = _reg.get_effective_sync(employee)
+        if not cfg:
+            return "ERROR: 员工未注册"
+        try:
+            text, _sid, _logs = await run_cc_node(
+                employee_key=employee,
+                query=prompt,
+                cwd=cfg.cwd,
+                chat_id=context.get("chat_id", "") or "",
+                thread_id=context.get("task_id", "") or "",   # sched_* → is_work=True
+                feishu_app_id=cfg.feishu_app_id or "",
+                feishu_app_secret=cfg.feishu_app_secret or "",
+                agent_port=cfg.agent_port or "",
+            )
+            return text or ""
+        except CCExecutorFailed as exc:
+            return f"ERROR: {exc}"
+
+    async def _output_fn(output_to: str, task_name: str, result: str,
+                         feishu_chat_id: str = "") -> None:
+        # 自主循环里 claude 自己用 report/send_feishu_message 推送;这里只兜底记日志。
+        log.info("[sched %s] %s → %s", employee, task_name, (result or "")[:200])
+
+    async def _boot():
+        sched = AgentScheduler(employee, agent_fn=_agent_fn, output_fn=_output_fn)
+        await sched.start()
+        log.info("自主工作循环已启动: %s", employee)
+
+    _submit_coro(_boot())
 
 
 def run_bot(employee: str) -> None:
@@ -1467,6 +1533,14 @@ def run_bot(employee: str) -> None:
         sys.exit(1)
 
     emoji, name = EMPLOYEE_CONFIG[employee]
+
+    # 主线程先 warmup registry —— get_effective_sync 在未加载时会 asyncio.run,
+    # 若延后到运行时 loop 上触发会炸("cannot be called from a running event loop")。
+    try:
+        from backend.services import registry as _reg
+        _reg.warmup_sync()
+    except Exception as _exc:
+        print(f"⚠️  registry warmup 失败(继续): {_exc}")
 
     print(f"{'='*50}")
     print(f"飞书员工机器人启动: {emoji} {name}")
@@ -1495,7 +1569,7 @@ def run_bot(employee: str) -> None:
         event_handler=handler,
     )
 
-    # 启动群聊 SpeakRequest 监听器（daemon 线程，独立 asyncio loop）
+    # 启动群聊 SpeakRequest 监听器（投到统一运行时 loop）
     threading.Thread(
         target=_start_group_listener,
         args=(employee, client, app_id, app_secret),
@@ -1503,6 +1577,10 @@ def run_bot(employee: str) -> None:
         name=f"group-listener-{employee}",
     ).start()
     print(f"  群聊监听器: 已启动")
+
+    # 启动自主工作循环(同一运行时 loop,与聊天共用常驻 CLI → 聊天可 interrupt 工作)
+    _start_scheduler(employee)
+    print(f"  自主工作循环: 已启动")
 
     ws_client.start()
 
