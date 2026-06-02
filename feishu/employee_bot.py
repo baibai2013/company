@@ -1517,6 +1517,63 @@ def _start_scheduler(employee: str) -> None:
     _submit_coro(_boot())
 
 
+# ── 同事 delegate / 外部投递:Redis cc_req → 常驻 CLI(高优,打断后台工作)─────────
+
+def _start_cc_req_listener(employee: str) -> None:
+    """监听 cc_req:{employee}:同事 delegate 提问 / 派单问答投递进来 → 跑该员工常驻 CLI。
+
+    走运行时 loop + 同一个常驻 CLI(is_work=False),会 interrupt 正在跑的后台工作,
+    答完工作续上 —— 实现"PM 问 Dave 进度,Dave 停下汇报再继续"的跨员工抢占。
+    """
+    import redis.asyncio as _aioredis
+    import json as _json
+
+    async def _listener():
+        from agents_v2.shared.cc_executor import run_cc_node, CCExecutorFailed
+        from backend.services import registry as _reg
+        redis_conn = _aioredis.from_url("redis://localhost:6379/0")
+        pubsub = redis_conn.pubsub()
+        await pubsub.subscribe(f"cc_req:{employee}")
+        log.info("cc_req listener(%s): 已订阅", employee)
+        async for msg in pubsub.listen():
+            if msg["type"] != "message":
+                continue
+            try:
+                data = _json.loads(msg["data"])
+            except Exception:
+                continue
+            query = data.get("query", "")
+            if not query:
+                continue
+            chat_id = data.get("chat_id", "") or ""
+            thread_id = data.get("thread_id", "") or f"cc_req_{employee}"
+            trigger = data.get("trigger_message_id", "") or ""
+            from_emp = data.get("from_employee", "") or ""
+            reply_to = data.get("reply_to", "") or ""
+            cfg = _reg.get_effective_sync(employee)
+            if not cfg:
+                continue
+            q = f"【来自同事 {from_emp} 的请求/提问】\n{query}" if from_emp else query
+            try:
+                text, _sid, _logs = await run_cc_node(
+                    employee_key=employee, query=q, cwd=cfg.cwd,
+                    chat_id=chat_id, thread_id=thread_id,
+                    feishu_app_id=cfg.feishu_app_id or "",
+                    feishu_app_secret=cfg.feishu_app_secret or "",
+                    agent_port=cfg.agent_port or "", trigger_message_id=trigger,
+                )  # is_work=False(thread 非 sched_)→ 会打断正在跑的工作
+            except CCExecutorFailed as exc:
+                text = f"❌ {employee} 处理失败: {exc}"
+            if reply_to:
+                try:
+                    await redis_conn.publish(reply_to, _json.dumps({"reply": text or ""}, ensure_ascii=False))
+                except Exception as _e:
+                    log.warning("cc_req(%s) 回传失败: %s", employee, _e)
+            log.info("cc_req(%s): done from=%s len=%d", employee, from_emp, len(text or ""))
+
+    _submit_coro(_listener())
+
+
 def run_bot(employee: str) -> None:
     if employee not in EMPLOYEE_CONFIG:
         print(f"❌ 未知员工: {employee}")
@@ -1581,6 +1638,10 @@ def run_bot(employee: str) -> None:
     # 启动自主工作循环(同一运行时 loop,与聊天共用常驻 CLI → 聊天可 interrupt 工作)
     _start_scheduler(employee)
     print(f"  自主工作循环: 已启动")
+
+    # 启动 cc_req 监听(同事 delegate / 派单问答 → 同一常驻 CLI,可打断工作)
+    _start_cc_req_listener(employee)
+    print(f"  cc_req 监听: 已启动")
 
     ws_client.start()
 

@@ -152,6 +152,7 @@ async def dispatch_to_employee(key: str, payload: dict = Body(...)) -> dict:
     立即返回，不等目标员工完成。
     """
     import asyncio
+    import json
     import os
     import uuid
     from datetime import datetime, timezone
@@ -182,28 +183,21 @@ async def dispatch_to_employee(key: str, payload: dict = Body(...)) -> dict:
     else:
         full_task = task
 
-    # 异步触发目标员工的 a2a JSON-RPC tasks/send
-    import httpx as _httpx
-    a2a_url = f"http://localhost:{cfg.agent_port}/"
-    rpc_payload = {
-        "jsonrpc": "2.0",
-        "id": task_id,
-        "method": "tasks/send",
-        "params": {
-            "message": {"parts": [{"type": "text", "text": full_task}]},
-            "metadata": {
-                "task_id": f"delegate_{task_id}",
-                "chat_id": chat_id,
-                "from_employee": from_employee,
-                "trigger_message_id": trigger_message_id,
-            },
-        },
-    }
+    # 投递到目标员工运行时(employee_bot 进程)的 cc_req Redis 通道 → 跑该员工的常驻 CLI,
+    # is_work=False 高优,会打断它正在跑的后台工作,答完续上(取代旧的 A2A → graph)。
+    import redis.asyncio as _aioredis
 
     async def _fire():
         try:
-            async with _httpx.AsyncClient(timeout=300) as client:
-                await client.post(a2a_url, json=rpc_payload)
+            r = _aioredis.from_url("redis://localhost:6379/0")
+            await r.publish(f"cc_req:{key}", json.dumps({
+                "query": full_task,
+                "chat_id": chat_id,
+                "thread_id": f"delegate_{from_employee or 'x'}_{key}",
+                "trigger_message_id": trigger_message_id,
+                "from_employee": from_employee,
+            }, ensure_ascii=False))
+            await r.aclose()
         except Exception as exc:
             log.warning("delegate %s → %s 失败: %s", from_employee, key, exc)
 
