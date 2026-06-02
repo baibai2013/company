@@ -131,6 +131,12 @@ cd "$COMPANY_DIR"
 # 恢复沙箱：删掉这行（或设 EMPLOYEE_SANDBOX=1）后重启即可。
 export EMPLOYEE_SANDBOX=0
 
+# ── 一员工一常驻 Claude Code CLI ────────────────────────────────────────────
+# 每个员工只保留一个 claude 子进程(opus 4.8/high),处理它的一切(群聊/私聊/
+# 员工互问/定时自主工作)。问答优先抢占后台工作(interrupt=ESC + 步骤边界让路)。
+# 回退旧的"按对话×模型分桶"进程池:设 CLAUDE_CLI_PER_EMPLOYEE=0。
+export CLAUDE_CLI_PER_EMPLOYEE=1
+
 # ── 清理残留 Python 进程（上次未 stop 的）────────────────────────────────────
 echo ""
 info "检查并清理残留进程..."

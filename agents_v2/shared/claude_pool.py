@@ -42,6 +42,14 @@ _POOL_IDLE_TIMEOUT = float(os.environ.get("CLAUDE_POOL_IDLE_TIMEOUT", "1800"))
 _POOL_MAX_SIZE = int(os.environ.get("CLAUDE_POOL_MAX_SIZE", "30"))  # 池上限(兜底内存)
 _POOL_GC_INTERVAL = 30.0     # GC 频率
 
+# 「真·一员工一常驻 CLI」模式:每个员工只保留一个 claude 子进程,处理它的一切
+# (群聊 / 私聊 / 定时干活 / 补充意见)。开关默认开,设 0/off/false 回退旧的五元组池。
+# 单例进程用固定 model/effort(opus 4.8 / high),按消息变化的 chat_id/thread_id/trigger
+# 不再走 spawn 时冻结的 MCP env,而是由调用方注入 prompt、claude 显式传给工具。
+PER_EMPLOYEE_CLI = os.environ.get("CLAUDE_CLI_PER_EMPLOYEE", "on").lower() not in ("0", "off", "false", "no")
+PER_EMPLOYEE_MODEL = os.environ.get("CLAUDE_CLI_MODEL", "claude-opus-4-8")
+PER_EMPLOYEE_EFFORT = os.environ.get("CLAUDE_CLI_EFFORT", "high")
+
 
 @dataclass
 class SpawnArgs:
@@ -70,6 +78,9 @@ class PersistentRunner:
         self._submit_lock = asyncio.Lock()
         self.last_used_at: float = time.monotonic()
         self.session_id: str | None = None      # 同进程多次 submit 的 session 一致
+        self._busy: bool = False                # 是否正在跑一个 turn
+        self._current_is_work: bool = False      # 当前 turn 是否低优(后台工作)
+        self._int_seq: int = 0                   # interrupt 请求 id 计数
 
     async def start(self) -> None:
         """spawn 子进程（含 sandbox + mcp 配置）。"""
@@ -110,12 +121,49 @@ class PersistentRunner:
     def is_alive(self) -> bool:
         return self._process is not None and self._process.returncode is None
 
+    @property
+    def is_busy(self) -> bool:
+        """是否有 turn 正在跑(submit 进行中)。"""
+        return self._busy
+
+    @property
+    def current_is_work(self) -> bool:
+        """当前正在跑的 turn 是否是后台工作(低优,可被问答打断)。"""
+        return self._busy and self._current_is_work
+
+    async def interrupt(self) -> bool:
+        """发送 stream-json 控制请求中断当前 turn —— 等价交互式按 ESC。
+
+        让正在跑的(通常是后台工作)turn 立即停下,使问答能马上插入。turn 停下后
+        其 submit 会读到 result 事件正常返回。返回是否成功写出中断请求。
+        """
+        if not self.is_alive or self._process.stdin is None:
+            return False
+        self._int_seq += 1
+        req = {
+            "type": "control_request",
+            "request_id": f"int_{self._int_seq}",
+            "request": {"subtype": "interrupt"},
+        }
+        try:
+            self._process.stdin.write((json.dumps(req) + "\n").encode("utf-8"))
+            await self._process.stdin.drain()
+            log.info("[pool] 已发 interrupt(ESC) employee=%s req=%d",
+                     self.spawn_args.employee_key, self._int_seq)
+            return True
+        except Exception as exc:
+            log.warning("[pool] interrupt 写 stdin 失败: %s", exc)
+            return False
+
     async def submit(
         self, prompt: str,
         on_text=None, on_thinking=None,
         on_tool_start=None, on_tool_result=None, on_chunk=None,
+        is_work: bool = False,
     ) -> tuple[str, str | None, list[str]]:
         """投递一个任务，等到 result 事件返回。任务间串行（asyncio.Lock 保护）。
+
+        is_work=True 标记本 turn 为后台工作(低优),可被问答 interrupt 打断。
 
         Raises: RuntimeError 子进程已挂、asyncio.TimeoutError MAX_TIMEOUT 超时
         """
@@ -123,46 +171,52 @@ class PersistentRunner:
             raise RuntimeError("PersistentRunner: 子进程已挂")
 
         async with self._submit_lock:
-            # 写一条 user message 到 stdin
-            msg = {
-                "type": "user",
-                "message": {
-                    "role": "user",
-                    "content": [{"type": "text", "text": prompt}],
-                },
-            }
-            line = (json.dumps(msg, ensure_ascii=False) + "\n").encode("utf-8")
+            self._busy = True
+            self._current_is_work = is_work
             try:
-                self._process.stdin.write(line)
-                await self._process.stdin.drain()
-            except Exception as exc:
-                raise RuntimeError(f"写 stdin 失败（子进程可能已挂）: {exc}") from exc
+                # 写一条 user message 到 stdin
+                msg = {
+                    "type": "user",
+                    "message": {
+                        "role": "user",
+                        "content": [{"type": "text", "text": prompt}],
+                    },
+                }
+                line = (json.dumps(msg, ensure_ascii=False) + "\n").encode("utf-8")
+                try:
+                    self._process.stdin.write(line)
+                    await self._process.stdin.drain()
+                except Exception as exc:
+                    raise RuntimeError(f"写 stdin 失败（子进程可能已挂）: {exc}") from exc
 
-            # ── OTel 包裹(只对走过 spawn_for_task 的 runner 生效;旧路径 NoOp)──
-            from agents_v2.shared.otel import llm_call_span
-            with llm_call_span(
-                self.spawn_args.model,
-                **{
-                    "employee.key": self.spawn_args.employee_key or "unknown",
-                    "llm.session_id": self.session_id or "<new>",
-                },
-            ):
-                # 读 stream-json 到 result 事件
-                state = await parse_stream_loop(
-                    self._process.stdout,
-                    on_text=on_text, on_thinking=on_thinking,
-                    on_tool_start=on_tool_start, on_tool_result=on_tool_result,
-                    on_chunk=on_chunk,
-                    stop_on_result=True,
-                    timeout=MAX_TIMEOUT,
-                )
+                # ── OTel 包裹(只对走过 spawn_for_task 的 runner 生效;旧路径 NoOp)──
+                from agents_v2.shared.otel import llm_call_span
+                with llm_call_span(
+                    self.spawn_args.model,
+                    **{
+                        "employee.key": self.spawn_args.employee_key or "unknown",
+                        "llm.session_id": self.session_id or "<new>",
+                    },
+                ):
+                    # 读 stream-json 到 result 事件
+                    state = await parse_stream_loop(
+                        self._process.stdout,
+                        on_text=on_text, on_thinking=on_thinking,
+                        on_tool_start=on_tool_start, on_tool_result=on_tool_result,
+                        on_chunk=on_chunk,
+                        stop_on_result=True,
+                        timeout=MAX_TIMEOUT,
+                    )
 
-            self.last_used_at = time.monotonic()
-            if state.new_session_id:
-                self.session_id = state.new_session_id
+                self.last_used_at = time.monotonic()
+                if state.new_session_id:
+                    self.session_id = state.new_session_id
 
-            final = state.result_text or "".join(state.accumulated)
-            return (final.strip() if final else "(无输出)"), state.new_session_id, state.tool_log
+                final = state.result_text or "".join(state.accumulated)
+                return (final.strip() if final else "(无输出)"), state.new_session_id, state.tool_log
+            finally:
+                self._busy = False
+                self._current_is_work = False
 
     async def terminate(self) -> None:
         """优雅关闭：close stdin 让 claude 自然退出，5s 没退就 SIGKILL。"""
@@ -197,6 +251,13 @@ class ClaudePool:
         self._lock = asyncio.Lock()
         self._gc_task: asyncio.Task | None = None
         self._enabled = os.environ.get("CLAUDE_POOL", "on").lower() not in ("0", "off", "false", "no")
+        # 「一员工一常驻 CLI」模式:employee_key → 唯一常驻 runner;每员工一把锁防首次并发双 spawn
+        self._singletons: dict[str, PersistentRunner] = {}
+        self._singleton_locks: dict[str, asyncio.Lock] = {}
+        # 步骤边界抢占:问答(群聊/私聊/员工互问)进行中的计数;为 0 时 _chat_idle 置位,
+        # 自主工作循环每做一步前 await wait_for_chat_idle,让排队问答先跑、答完再续工作。
+        self._chat_active: dict[str, int] = {}
+        self._chat_idle: dict[str, asyncio.Event] = {}
 
     @property
     def enabled(self) -> bool:
@@ -270,6 +331,63 @@ class ClaudePool:
             asyncio.create_task(r.terminate())
             log.info("[pool] LRU 淘汰 key=%s", _key_repr(key))
 
+    async def acquire_singleton(self, employee_key: str, spawn_args: SpawnArgs) -> PersistentRunner:
+        """「一员工一常驻 CLI」:返回该员工唯一的常驻 runner,没有就 spawn。
+
+        不归还、不从 map 移除 —— 进程一直活着复用。并发调用安全:submit 内部有
+        _submit_lock 串行排队;这里再用 per-employee 锁防"首次同时进来俩都 spawn"。
+        进程崩了(is_alive=False)则丢弃重建。
+        """
+        if not self._enabled:
+            raise RuntimeError("ClaudePool disabled (CLAUDE_POOL=off)")
+        self._ensure_gc()
+        lock = self._singleton_locks.setdefault(employee_key, asyncio.Lock())
+        async with lock:
+            runner = self._singletons.get(employee_key)
+            if runner is not None and runner.is_alive:
+                return runner
+            if runner is not None:
+                log.info("[pool] 单例进程已挂,重建 employee=%s", employee_key)
+                self._singletons.pop(employee_key, None)
+            runner = PersistentRunner(spawn_args)
+            await runner.start()
+            self._singletons[employee_key] = runner
+            log.info("[pool] spawn 单例 employee=%s pid=%s model=%s",
+                     employee_key, runner._process.pid if runner._process else "?", spawn_args.model)
+            return runner
+
+    def get_singleton(self, employee_key: str) -> "PersistentRunner | None":
+        """返回该员工已存在且存活的常驻 runner;没有/已挂返回 None(不 spawn)。
+
+        给"补充意见"等想搭车主进程、但又不该自己拉起 bare 进程的场景用。
+        """
+        r = self._singletons.get(employee_key)
+        return r if (r is not None and r.is_alive) else None
+
+    def _idle_event(self, employee_key: str) -> asyncio.Event:
+        ev = self._chat_idle.get(employee_key)
+        if ev is None:
+            ev = asyncio.Event()
+            ev.set()  # 初始无问答 = idle
+            self._chat_idle[employee_key] = ev
+        return ev
+
+    def chat_enter(self, employee_key: str) -> None:
+        """标记一个问答(群聊/私聊/员工互问)开始占用该员工的 CLI。"""
+        self._chat_active[employee_key] = self._chat_active.get(employee_key, 0) + 1
+        self._idle_event(employee_key).clear()
+
+    def chat_exit(self, employee_key: str) -> None:
+        """问答结束;计数归零时置 idle,放行被让路的工作步。"""
+        n = max(0, self._chat_active.get(employee_key, 0) - 1)
+        self._chat_active[employee_key] = n
+        if n == 0:
+            self._idle_event(employee_key).set()
+
+    async def wait_for_chat_idle(self, employee_key: str) -> None:
+        """自主工作每做一步前调:若有问答在排队/进行,先等它们跑完再继续。"""
+        await self._idle_event(employee_key).wait()
+
     async def acquire(self, key: PoolKey, spawn_args: SpawnArgs) -> PersistentRunner:
         """池里找空闲；找不到 spawn 新的。"""
         if not self._enabled:
@@ -307,10 +425,12 @@ class ClaudePool:
             await self._enforce_lru()
 
     async def shutdown_all(self) -> None:
-        """agent 进程退出时调，释放所有进程。"""
+        """agent 进程退出时调，释放所有进程（含单例常驻进程）。"""
         async with self._lock:
             all_runners = [r for rs in self._pool.values() for r in rs]
+            all_runners.extend(self._singletons.values())
             self._pool.clear()
+            self._singletons.clear()
         if self._gc_task and not self._gc_task.done():
             self._gc_task.cancel()
         for r in all_runners:

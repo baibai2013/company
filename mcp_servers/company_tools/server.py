@@ -100,11 +100,15 @@ def list_scheduled_tasks() -> str:
 
 # ── 工具：消息发送 ────────────────────────────────────────────────────────────
 
-def _reply_or_send_card(title: str, content: str, color: str, feishu_chat_id: str) -> str:
-    """优先 reply 到 EMPLOYEE_TRIGGER_MESSAGE_ID(让员工卡片挂在用户消息 thread 下)。
+def _reply_or_send_card(title: str, content: str, color: str, feishu_chat_id: str,
+                        reply_to: str = "") -> str:
+    """优先 reply 到 reply_to / EMPLOYEE_TRIGGER_MESSAGE_ID(让员工卡片挂在用户消息 thread 下)。
     没有 trigger 时回退到普通 send_card 创建新消息。
+
+    reply_to: 显式传入的用户原消息 id(一员工一常驻 CLI 模式下由 prompt 头给出);
+              优先于 env,因为常驻进程的 env 会冻结在首次 spawn。
     """
-    trigger = os.environ.get("EMPLOYEE_TRIGGER_MESSAGE_ID", "") or ""
+    trigger = reply_to or os.environ.get("EMPLOYEE_TRIGGER_MESSAGE_ID", "") or ""
     if trigger:
         try:
             from feishu.sender import make_client, reply_rich_card
@@ -515,17 +519,19 @@ def delegate_to_employee(
 # ── 工具：历史检索 ────────────────────────────────────────────────────────────
 
 @mcp.tool()
-def recall_history(offset: int = 20, count: int = 20) -> str:
+def recall_history(offset: int = 20, count: int = 20, thread_id: str = "") -> str:
     """检索当前对话更早历史（滑动窗口）。
 
     当前上下文找不到用户之前提到的信息时调用。
     offset: 跳过最近多少条消息（默认 20，从第 21 条往前取）
     count: 要取多少条（默认 20）
+    thread_id: 对话标识。一员工一常驻 CLI 模式下由 prompt 头给出,请直接传;
+               不传则回退 EMPLOYEE_THREAD_ID env(常驻进程里会冻结,故优先用入参)。
     """
     # recall_history 内部走 runner.current_thread_id ContextVar，
-    # MCP 子进程里 ContextVar 是默认空的，需要先把 env 里的 thread_id 注入回去
+    # MCP 子进程里 ContextVar 是默认空的，需要先把 thread_id 注入回去
     from agents_v2.shared import runner as _runner
-    thread_id = os.environ.get("EMPLOYEE_THREAD_ID", "")
+    thread_id = thread_id or os.environ.get("EMPLOYEE_THREAD_ID", "")
     token = _runner.current_thread_id.set(thread_id) if thread_id else None
     try:
         return _recall_history.invoke({"offset": offset, "count": count})

@@ -185,6 +185,14 @@ async def lifespan(inner_app: FastAPI):
         yield
 
         await scheduler.stop()
+        # 进程退出时终止本员工的常驻 claude(含单例),避免留孤儿
+        try:
+            from agents_v2.shared.claude_pool import get_pool
+            await get_pool().shutdown_all()
+        except Exception as exc:
+            import logging as _logging
+            _logging.getLogger(f"agents_v2.{_employee_key}").warning(
+                "claude pool shutdown_all 失败: %s", exc)
 
 
 async def _run_agent_for_scheduler(prompt: str, context: dict) -> str:

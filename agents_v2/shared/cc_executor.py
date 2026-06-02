@@ -23,7 +23,13 @@ from typing import Awaitable, Callable
 
 from feishu.cc_bridge.claude_runner import ClaudeRunner
 
-from agents_v2.shared.claude_pool import SpawnArgs, get_pool
+from agents_v2.shared.claude_pool import (
+    PER_EMPLOYEE_CLI,
+    PER_EMPLOYEE_EFFORT,
+    PER_EMPLOYEE_MODEL,
+    SpawnArgs,
+    get_pool,
+)
 from agents_v2.shared.mcp_config import build_mcp_config, to_cli_arg
 from agents_v2.shared.sandbox import wrap_command
 
@@ -41,6 +47,37 @@ class _Callbacks:
     on_thinking: Callable[[str], Awaitable[None]] | None = None
     on_tool_start: Callable[[str, str, dict], Awaitable[None]] | None = None
     on_tool_result: Callable[[str, str], Awaitable[None]] | None = None
+
+
+def _frame_prompt(query: str, chat_id: str, thread_id: str,
+                  trigger_message_id: str, is_work: bool) -> str:
+    """一员工一常驻 CLI 模式:把按消息变化的上下文写进 prompt 头(直接传达)。
+
+    常驻进程的 MCP env 冻结在首次 spawn,所以 chat_id/thread_id/trigger 不能靠 env,
+    必须每条消息显式告诉 claude,并要求它调工具时显式传参。
+    """
+    # 工作步(定时循环)不需要发消息回某个会话,prompt 头从简,避免污染工作上下文
+    if is_work:
+        head = "【本轮是后台自主工作,非对话。如需私聊 CEO 汇报请用 report 工具/脚本。】"
+        if thread_id:
+            head += f"\n【thread_id={thread_id}】"
+        return f"{head}\n\n{query}"
+
+    lines = ["【本次对话上下文(常驻进程,务必按此传参,勿用默认值)】"]
+    if chat_id:
+        lines.append(f"feishu_chat_id={chat_id}")
+    if thread_id:
+        lines.append(f"thread_id={thread_id}")
+    if trigger_message_id:
+        lines.append(f"trigger_message_id={trigger_message_id}")
+    rules = ["【发送规则】"]
+    if chat_id:
+        rules.append(f"- 回这条消息必须调 send_feishu_message(..., feishu_chat_id=\"{chat_id}\")")
+    if trigger_message_id:
+        rules.append(f"- 要把卡片挂在用户原消息下时传 reply_to=\"{trigger_message_id}\"")
+    if thread_id:
+        rules.append(f"- 需要翻历史时 recall_history(..., thread_id=\"{thread_id}\")")
+    return "\n".join(lines) + "\n" + "\n".join(rules) + f"\n\n{query}"
 
 
 async def run_cc_node(
@@ -79,7 +116,10 @@ async def run_cc_node(
     """
     cb = callbacks or _Callbacks()
 
-    # 1) 构造 MCP config（每次内联生成，含 chat_id / thread_id / 凭证 / trigger）
+    # 1) 构造 MCP config。
+    # PER_EMPLOYEE_CLI(一员工一常驻 CLI)模式下 stable_only=True:env 只放进程生命周期内
+    # 不变的值(员工身份/端口/凭证),chat_id/thread_id/trigger 不进 env(会冻结),改由
+    # 下面的上下文头注入 prompt、claude 显式传给工具。
     mcp_cfg = build_mcp_config(
         employee_key=employee_key,
         agent_port=agent_port,
@@ -88,6 +128,7 @@ async def run_cc_node(
         feishu_app_id=feishu_app_id,
         feishu_app_secret=feishu_app_secret,
         trigger_message_id=trigger_message_id,
+        stable_only=PER_EMPLOYEE_CLI,
     )
     mcp_cli_arg = to_cli_arg(mcp_cfg)
 
@@ -107,7 +148,45 @@ async def run_cc_node(
     def _wrap(argv: list[str]) -> list[str]:
         return wrap_command(argv, cwd, employee_key=employee_key)
 
-    # 4) 阶段 11：优先走热进程池（同 thread 5 分钟内复用），CLAUDE_POOL=off 时退回 spawn-per-task
+    pool = get_pool()
+
+    # 4a) 一员工一常驻 CLI 模式:整个员工只有一个 claude 进程,处理它的一切。
+    #     - model/effort 固定(opus 4.8 / high),忽略入参
+    #     - 按消息变化的 chat_id/thread_id/trigger 写进 prompt 头(直接传达)
+    #     - 问答(群聊/私聊/员工互问)= 高优,工作步(sched_)让路给问答
+    if pool.enabled and PER_EMPLOYEE_CLI:
+        is_work = thread_id.startswith("sched_")
+        spawn_args = SpawnArgs(
+            cwd=cwd, model=PER_EMPLOYEE_MODEL, effort=PER_EMPLOYEE_EFFORT,
+            extra_cli_args=extra_args, cmd_wrapper=_wrap, employee_key=employee_key,
+        )
+        framed = _frame_prompt(query, chat_id, thread_id, trigger_message_id, is_work)
+        if not is_work:
+            pool.chat_enter(employee_key)
+        try:
+            runner_obj = await pool.acquire_singleton(employee_key, spawn_args)
+            # 问答(高优)进来时,若单例正在跑后台工作 → 立即 interrupt(ESC)打断它,
+            # 让对话马上插入;被打断的工作任务保持 in_progress,下一轮自动续上。
+            if not is_work and runner_obj.current_is_work:
+                await runner_obj.interrupt()
+            final_text, new_sid, tool_logs = await runner_obj.submit(
+                prompt=framed,
+                on_text=cb.on_text,
+                on_thinking=cb.on_thinking,
+                on_tool_start=cb.on_tool_start,
+                on_tool_result=cb.on_tool_result,
+                is_work=is_work,
+            )
+        except Exception as exc:
+            log.warning("[%s] 单例 runner 异常：%r（type=%s）",
+                        employee_key, exc, type(exc).__name__, exc_info=True)
+            raise CCExecutorFailed(f"{type(exc).__name__}: {exc!r}") from exc
+        finally:
+            if not is_work:
+                pool.chat_exit(employee_key)
+        return final_text.strip() if final_text else "", new_sid, tool_logs
+
+    # 4) 旧池：优先走热进程池（同 thread 5 分钟内复用），CLAUDE_POOL=off 时退回 spawn-per-task
     #
     # 池化 key 选择(2026-05-21 RFC feishu-cli-direct Phase 1):
     # - chat_id "task:..."  → "task_pool:{employee}"     同员工跨 task 复用
@@ -115,7 +194,6 @@ async def run_cc_node(
     # - chat_id "p2p_..."   → "feishu_p2p:{employee}:{chat_id}"   同员工同单聊跨消息复用
     # - 其他(看板/测试)     → thread_id 原值
     # 同员工同会话复用同进程 → claude session 自然累积上下文,跨消息记忆免做。
-    pool = get_pool()
     pool_thread = thread_id
     if chat_id.startswith("task:"):
         pool_thread = f"task_pool:{employee_key}"

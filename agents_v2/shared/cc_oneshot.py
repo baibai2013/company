@@ -80,10 +80,23 @@ async def run_cli_oneshot_pooled(
 
     池不可用 / 复用失败 → 回退冷启 run_cli_oneshot(保证不退化)。
     """
-    from agents_v2.shared.claude_pool import SpawnArgs, get_pool
+    from agents_v2.shared.claude_pool import PER_EMPLOYEE_CLI, SpawnArgs, get_pool
 
     pool = get_pool()
     if not getattr(pool, "enabled", False):
+        return await run_cli_oneshot(prompt, model=model, effort=effort, timeout=timeout, cwd=cwd)
+
+    # 一员工一常驻 CLI 模式:补充意见搭车员工已有的那个常驻进程(真·一个进程),
+    # 不再单开无 MCP 的轻量进程。进程不存在时(罕见,补充意见通常在主回复后才触发)
+    # 回退冷启,绝不自己 spawn bare 单例(否则主进程会丢 MCP)。
+    if PER_EMPLOYEE_CLI and employee_key:
+        runner = pool.get_singleton(employee_key)
+        if runner is not None:
+            try:
+                final, _sid, _logs = await asyncio.wait_for(runner.submit(prompt), timeout=timeout)
+                return (final or "").strip()
+            except Exception as exc:
+                log.warning("补充意见搭车单例失败(%s),回退冷启", type(exc).__name__)
         return await run_cli_oneshot(prompt, model=model, effort=effort, timeout=timeout, cwd=cwd)
 
     _cwd = cwd or os.getcwd()

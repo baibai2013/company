@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 import re
 import uuid
 from datetime import datetime, timezone
@@ -531,6 +532,9 @@ class AgentScheduler:
                 result = await self._execute_direct(task_id, cfg)
             elif mode == "webhook":
                 result = await self._execute_webhook(task_id, cfg)
+            elif cfg.get("skip_if_no_tasks") or task_id == "auto_5min_report":
+                # 自主工作循环:连续做、每步给问答让路(步骤边界抢占)
+                result = await self._execute_work_loop(task_id, cfg)
             else:
                 result = await self._execute_agent(task_id, cfg)
 
@@ -565,6 +569,27 @@ class AgentScheduler:
     _SEND_SUCCESS_PATTERNS = re.compile(
         r"已成功发送|发送成功|sent successfully|send.*success", re.IGNORECASE
     )
+
+    async def _execute_work_loop(self, task_id: str, cfg: dict) -> str:
+        """自主工作循环(步骤边界抢占):每步只做最高优一条任务,步与步之间给问答让路。
+
+        - prompt 让 claude "只做一条然后返回"(不再内部 while 清空队列),这样每条任务
+          做完就交还控制权 → 排队的问答(群聊/私聊/员工互问)能插进来先跑。
+        - 持续做到队列清空,或达单轮步数上限(剩余留给下个 cron tick 续),避免长期独占。
+        - 每步前 await pool.wait_for_chat_idle:有问答在等就先让它们跑完,答完工作立即续上。
+        """
+        from agents_v2.shared.claude_pool import get_pool
+        pool = get_pool()
+        max_steps = int(os.environ.get("WORK_LOOP_MAX_STEPS", "10"))
+        last = "无任务,跳过"
+        for _ in range(max_steps):
+            if not await self._has_pending_tasks():
+                break
+            await pool.wait_for_chat_idle(self.key)   # 让路:有问答先让它跑完
+            last = await self._execute_agent(task_id, cfg)
+            if last[:6].startswith("ERROR") or "超时" in last:
+                break
+        return last
 
     async def _execute_agent(self, task_id: str, cfg: dict) -> str:
         """agent 模式：走 LLM SmartGraph，agent 自主思考、润色、调工具发送。
