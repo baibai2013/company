@@ -134,7 +134,7 @@ export EMPLOYEE_SANDBOX=0
 # ── 清理残留 Python 进程（上次未 stop 的）────────────────────────────────────
 echo ""
 info "检查并清理残留进程..."
-STALE_PORTS="8000 8089 9000 9001 9002 9003 9004 9005 9006 9007 9008 9009"
+STALE_PORTS="8000 8089 9000 9001 9002 9003 9004 9005 9006 9007 9008 9009 9010 9011"
 for port in $STALE_PORTS; do
   pids=$(lsof -ti:"$port" 2>/dev/null || true)
   if [[ -n "$pids" ]]; then

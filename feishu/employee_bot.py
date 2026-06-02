@@ -273,6 +273,7 @@ _REPLY_EMOJI = {
     "product_manager": "🎯", "project_manager": "📋", "tech_lead": "🔧",
     "mechanical": "⚙️", "hardware": "🔌", "firmware": "💾",
     "algorithm": "🧠", "testing": "🧪", "cost": "💰", "sysadmin": "🖥️",
+    "fullstack": "🧑‍💻", "art": "🎨",
 }
 
 
@@ -1058,6 +1059,7 @@ def make_on_message(employee: str, client: lark.Client, bot_open_id: str):
                     "技术胖虎": "tech_lead", "胖虎": "tech_lead",
                     "电脑管理员零": "sysadmin", "电脑管家零": "sysadmin", "零": "sysadmin",
                     "CC": "fullstack", "全栈": "fullstack", "全栈工程师": "fullstack",
+                    "画皮": "art", "设计师画皮": "art", "媒体设计师": "art",
                 }
                 _OPEN_ID_TO_EMP = {
                     "ou_cbda0e035efddd928884cfa249b2aaf1": "mechanical",
@@ -1071,6 +1073,7 @@ def make_on_message(employee: str, client: lark.Client, bot_open_id: str):
                     "ou_ba1ca54d49cef0f56819856b37f60ff0": "tech_lead",
                     "ou_4c02bb278b833ed4d43f0e3c545a4d53": "sysadmin",
                     "ou_d487c47919a5e2c687b8beb14441c8a4": "fullstack",
+                    "ou_7fa9ab5ffedb64b9577d2129b81648b3": "art",
                 }
                 mention_keys = []
                 for m in (msg.mentions or []):

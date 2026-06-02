@@ -23,6 +23,9 @@ employees:
   # fullstack(对外工具开发 CC):做外部 SDK/CLI/MCP,需要派活给内部员工(orchestration)、
   # 排期(scheduling)、发飞书(messaging)、读写 KB 文档(docs)。
   fullstack:         [orchestration, scheduling, messaging, docs]
+  # art(生成式媒体设计师):产出通知图片/UI/声音/AI 生成素材,写文档 + 发飞书。
+  # 注:图像/视频/声音生成的 MCP server 尚未接入,接入后在此追加对应 server。
+  art:               [docs, messaging]
 
 # 全局 deny:任何员工都不能调用,删除类操作走人审
 global_deny:

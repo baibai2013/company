@@ -225,7 +225,7 @@ EXECUTE_DECOMPOSE_PROMPT = """你是项目经理芳芳。一场跨职能会议�
 {
   "title":       "一句话(<= 30 字)",
   "description": "给工程师看的具体指令,告诉他要产出什么、放到哪、怎么验证",
-  "executor":    "<必须从下面 11 个 key 选一个>",
+  "executor":    "<必须从下面 12 个 key 选一个>",
   "priority":    "P0|P1|P2"  // P0=阻塞他人, P1=主线, P2=锦上添花
 }
 
@@ -236,6 +236,7 @@ EXECUTE_DECOMPOSE_PROMPT = """你是项目经理芳芳。一场跨职能会议�
 - project_manager (你自己,写跟踪/状态文档)
 - sysadmin (运维/基础设施/部署/脚本)
 - fullstack (全栈/前后端/Web 应用)
+- art (生成式媒体:通知图片/UI 视觉/声音音效/AI 生成图像视频3D模型)
 
 # 工作目录约定(写进 description 让工程师知道往哪存)
 
@@ -254,7 +255,7 @@ EXECUTE_DECOMPOSE_PROMPT = """你是项目经理芳芳。一场跨职能会议�
 # 边界
 
 - 如果 summary 全是讨论没有具体交付物,返回 {"tasks": []}
-- 如果 summary 提到的人不在 11 个 executor 里,丢弃那条
+- 如果 summary 提到的人不在 12 个 executor 里,丢弃那条
 - 一次最多拆 5 个 task(避免一场会议派太多导致 cc_bridge 排长队)
 - 拆出来的 task 之间应该可以**并行**——有依赖的(B 等 A 完成)只拆 A,B 由 A 的产物触发下一轮派单
 """

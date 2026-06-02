@@ -706,7 +706,7 @@ async def _execute_node(
                        "mechanical", "hardware", "firmware", "algorithm",
                        "testing", "cost", "product_manager",
                        "project_manager", "tech_lead",
-                       "sysadmin", "fullstack",
+                       "sysadmin", "fullstack", "art",
                    } and (it.get("title") or "").strip()]
     paired = list(zip(task_ids, valid_items[:len(task_ids)]))
 

@@ -26,7 +26,7 @@ log = logging.getLogger(__name__)
 _VALID_EXECUTORS = frozenset({
     "mechanical", "hardware", "firmware", "algorithm",
     "testing", "cost", "product_manager", "project_manager", "tech_lead",
-    "sysadmin", "fullstack",
+    "sysadmin", "fullstack", "art",
 })
 
 
