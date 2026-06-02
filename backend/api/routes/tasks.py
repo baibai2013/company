@@ -154,12 +154,18 @@ async def decompose_dispatch(body: DecomposeDispatchRequest):
 
 
 @router.get("", response_model=list[TaskRead])
-async def list_tasks(status: str | None = None, db: AsyncSession = Depends(get_db)):
+async def list_tasks(
+    status: str | None = None,
+    executor: str | None = None,
+    db: AsyncSession = Depends(get_db),
+):
     q = select(Task).order_by(Task.created_at.desc())
     if status:
         if status not in VALID_STATUSES:
             raise HTTPException(status_code=422, detail=f"Invalid status filter '{status}'")
         q = q.where(Task.status == status)
+    if executor:
+        q = q.where(Task.executor == executor)
     result = await db.execute(q)
     return result.scalars().all()
 

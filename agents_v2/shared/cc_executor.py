@@ -123,6 +123,14 @@ async def run_cc_node(
         pool_thread = f"feishu_chat:{employee_key}:{chat_id}"
     elif chat_id.startswith("p2p_") or chat_id.startswith("feishu_p2p_"):
         pool_thread = f"feishu_p2p:{employee_key}:{chat_id}"
+    elif thread_id.startswith("sched_"):
+        # 定时任务每次 fire 的 thread_id 都带新时间戳(sched_<task>_<unix>),那是给
+        # LangGraph checkpoint 做单轮隔离用的。但 claude 进程应按"员工+任务"复用,
+        # 否则每 5 分钟一轮就 spawn 一个新进程、空闲挂 30 分钟,堆出一屋子暖进程。
+        # 剥掉结尾的 _<时间戳> 得到稳定 stem → 同员工同定时任务复用同一常驻 claude。
+        parts = thread_id.rsplit("_", 1)
+        stem = parts[0] if len(parts) == 2 and parts[1].isdigit() else thread_id
+        pool_thread = f"sched_pool:{employee_key}:{stem}"
     if pool.enabled and pool_thread:
         spawn_args = SpawnArgs(
             cwd=cwd, model=model, effort=effort,

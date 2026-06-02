@@ -480,6 +480,26 @@ class AgentScheduler:
 
         return f"triggered {len(triggered)} tasks: {triggered}" if triggered else None
 
+    async def _has_pending_tasks(self) -> bool:
+        """廉价探测:本员工名下是否有 pending/in_progress 任务(走后端 API,不直连 DB)。
+
+        探测失败(后端没起 / 超时)时返回 True —— 宁可多跑一轮也别因探测故障漏掉真有的活。
+        """
+        try:
+            import httpx
+            async with httpx.AsyncClient(timeout=5) as client:
+                resp = await client.get(
+                    "http://localhost:8000/api/tasks",
+                    params={"executor": self.key},
+                )
+            if resp.status_code != 200:
+                return True
+            tasks = resp.json() or []
+            return any(t.get("status") in ("pending", "in_progress") for t in tasks)
+        except Exception as e:
+            log.warning("[%s] _has_pending_tasks 探测失败(按有任务处理): %s", self.key, e)
+            return True
+
     async def _execute(self, task_id: str, cfg: dict) -> str:
         """执行入口：按 execution_mode 分发，完成后持久化状态和执行记录。"""
         mode = cfg.get("execution_mode", "agent")
@@ -491,6 +511,15 @@ class AgentScheduler:
         if self._status.get(task_id, {}).get("running"):
             log.warning("[%s] task %s 上一轮仍在执行,跳过本轮(防重入)", self.key, task_name)
             return "SKIPPED: previous run still in progress"
+
+        # 廉价预检:自主工作循环(skip_if_no_tasks)在拉起昂贵的 claude 之前,先用一次
+        # DB 直查判断名下有没有待办任务。空 → 本轮直接跳过,不 spawn claude。这避免了
+        # 12 个员工每 5 分钟各拉一个 opus claude "查清单发现没活就退" 的空转烧钱。
+        # (id == auto_5min_report 作为旧配置的兜底识别,新配置应显式带 skip_if_no_tasks)
+        if cfg.get("skip_if_no_tasks") or task_id == "auto_5min_report":
+            if not await self._has_pending_tasks():
+                log.info("[%s] task %s: 名下无待办任务,跳过本轮(不 spawn claude)", self.key, task_name)
+                return "SKIPPED: 无待办任务"
 
         self._status[task_id]["running"] = True
         log.info("[%s] executing task: %s (mode=%s)", self.key, task_name, mode)
