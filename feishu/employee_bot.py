@@ -553,12 +553,6 @@ def _render_progress(state: dict) -> tuple[str, str, str]:
 
     lines = [f"**任务**：{state['task']}"]
 
-    route = state.get("route")
-    if route:
-        lines.append(f"**路由**：{_ROUTE_LABEL.get(route, route)}")
-    else:
-        lines.append("**路由**：（判断中…）")
-
     # 方案首句：plan 通常是多步描述，截首句给个全局感
     plan_first = state.get("plan_first")
     if plan_first:
@@ -817,115 +811,66 @@ async def _handle(employee: str, task: str, chat_id: str, client: lark.Client,
             t, c, col = _render_progress(progress_state)
             await apatch_rich_card(client, progress_msg_id, t, c, col)
 
-    # ── 订阅 task_events ──
-    stop_evt = asyncio.Event()
-    subscribed_evt = asyncio.Event()   # 订阅就绪信号:派发前等它,避免漏掉早期事件
+    # ── 回调:把 CLI 的工具调用实时刷进进度卡(直连 run_cc_node,不再绕 Redis 事件流)──
+    async def _cb_tool_start(tool_id: str, name: str, args: dict) -> None:
+        args = args or {}
+        if name in _TASK_TOOLS:
+            if name == "TaskCreate":
+                progress_state["pending_creates"][tool_id] = {
+                    "subject": args.get("subject") or args.get("description") or "(无标题)",
+                    "status": "pending",
+                }
+            else:
+                _apply_task_update(progress_state["task_list"], name, args)
+        else:
+            line = _step_line(name, args)
+            if not progress_state["steps"] or progress_state["steps"][-1] != line:
+                progress_state["steps"].append(line)
+        if progress_state["phase"] == "start":
+            progress_state["phase"] = "execute"
+        await _patch_progress()
 
-    async def _listen_events() -> None:
-        try:
-            async with aioredis.from_url("redis://localhost:6379/0") as rr:
-                pubsub = rr.pubsub()
-                await pubsub.subscribe("task_events")
-                subscribed_evt.set()   # 订阅生效,通知主流程可以派发了
-                async for msg in pubsub.listen():
-                    if stop_evt.is_set():
-                        break
-                    if msg["type"] != "message":
-                        continue
-                    try:
-                        payload = json.loads(msg["data"])
-                    except Exception:
-                        continue
-                    if payload.get("task_id") != thread_id:
-                        continue
-                    typ = payload.get("type")
-                    if typ == "employee_status":
-                        ph = payload.get("phase")
-                        if ph and ph != "done":
-                            progress_state["phase"] = ph
-                            await _patch_progress()
-                    elif typ == "route_decided":
-                        progress_state["route"] = payload.get("route")
-                        await _patch_progress(force=True)
-                    elif typ == "plan_drafted":
-                        # 取 plan 第一行 / 首句，整体一行展示，避开多行噪音
-                        plan_text = (payload.get("plan", "") or "").strip()
-                        first = plan_text.split("\n", 1)[0].strip() if plan_text else ""
-                        progress_state["plan_first"] = (first[:80] + "…") if len(first) > 80 else first
-                        await _patch_progress(force=True)
-                    elif typ == "tool_use":
-                        tn = payload.get("tool_name") or "?"
-                        targs = payload.get("tool_args") or {}
-                        tuid = payload.get("tool_use_id", "")
-                        # TaskCreate / TaskUpdate / TodoWrite 聚合到 task_list，
-                        # 不进 steps（避免散行 "🔧 TaskUpdate" 淹没进度卡）
-                        if tn in _TASK_TOOLS:
-                            if tn == "TaskCreate":
-                                # 真实 task ID 由 claude 主程序分配，等 tool_result
-                                progress_state["pending_creates"][tuid] = {
-                                    "subject": targs.get("subject") or targs.get("description") or "(无标题)",
-                                    "status": "pending",
-                                }
-                            else:
-                                _apply_task_update(progress_state["task_list"], tn, targs)
-                            await _patch_progress()
-                        else:
-                            line = _step_line(tn, targs)
-                            if not progress_state["steps"] or progress_state["steps"][-1] != line:
-                                progress_state["steps"].append(line)
-                            await _patch_progress()
-                    elif typ == "tool_result":
-                        tuid = payload.get("tool_use_id", "")
-                        rtext = payload.get("result_text", "")
-                        if tuid and progress_state["pending_creates"].get(tuid):
-                            if _resolve_task_create(
-                                progress_state["task_list"],
-                                progress_state["pending_creates"],
-                                tuid, rtext,
-                            ):
-                                await _patch_progress()
-        except asyncio.CancelledError:
-            pass
-        except Exception as exc:
-            log.debug("task_events listener failed: %s", exc)
+    async def _cb_tool_result(tool_id: str, text: str) -> None:
+        if tool_id and progress_state["pending_creates"].get(tool_id):
+            if _resolve_task_create(
+                progress_state["task_list"], progress_state["pending_creates"], tool_id, text,
+            ):
+                await _patch_progress()
 
-    listener = asyncio.create_task(_listen_events())
-    # 等订阅真正生效再派发 —— route 启发式后 route_decided 几乎瞬发,
-    # 不等就绪会漏掉早期 route_decided / tool_use 事件(进度卡缺路由和步骤)。
+    # ── 直接跑 CLI(本进程持有该员工常驻 CLI,无需 Redis 兜圈)──
+    from agents_v2.shared.cc_executor import run_cc_node, CCExecutorFailed, _Callbacks
+    from backend.services import registry as _reg
+    _cfg = _reg.get_effective_sync(employee)
+    _cb = _Callbacks()
+    _cb.on_tool_start = _cb_tool_start
+    _cb.on_tool_result = _cb_tool_result
     try:
-        await asyncio.wait_for(subscribed_evt.wait(), timeout=2.0)
-    except asyncio.TimeoutError:
-        log.warning("[%s] task_events 订阅 2s 未就绪,仍继续派发", employee)
-
-    # ── 跑 dispatch ──
-    try:
-        data = await handle_dispatch(employee, task_with_ctx, task_id=thread_id, chat_id=chat_id,
-                                     image_base64=image_base64, image_media_type=image_media_type,
-                                     session_config={"source": source},
-                                     trigger_message_id=message_id)
+        _text, _sid, _logs = await run_cc_node(
+            employee_key=employee, query=task_with_ctx,
+            cwd=(_cfg.cwd if _cfg else "") or "",
+            chat_id=chat_id, thread_id=thread_id,
+            feishu_app_id=(_cfg.feishu_app_id if _cfg else "") or "",
+            feishu_app_secret=(_cfg.feishu_app_secret if _cfg else "") or "",
+            agent_port=(_cfg.agent_port if _cfg else "") or "",
+            trigger_message_id=message_id, callbacks=_cb,
+            self_send=False,   # 由本函数渲染并发送 CLI 的返回文字,避免双重回复
+        )
     except Exception as exc:
-        stop_evt.set()
-        listener.cancel()
         progress_state["finished"] = True
         progress_state["phase"] = "done"
         await _patch_progress(force=True)
         _send_card_sync("❌ 执行出错", f"```\n{exc}\n```", "red")
         return
 
-    stop_evt.set()
-    listener.cancel()
-
-    # 终态 patch（确保 elapsed 准确，phase 标 done）
+    # 终态 patch(elapsed 准确,phase=done)
     progress_state["finished"] = True
     progress_state["phase"] = "done"
     await _patch_progress(force=True)
 
-    route  = data.get("route", "WORK")
-    plan   = data.get("plan", "")
-    # 防御兜底：runner 已经 stringify 一次，这里再保险（旧 dispatch 路径可能未走 runner）
-    result = _stringify_content(data.get("result", "(无输出)")) or "(无输出)"
-    # cc 全员启用：任何员工回复后，data["cc"] 里有专家就展开补充意见
-    cc = data.get("cc", []) or []
+    result = _stringify_content(_text or "(无输出)") or "(无输出)"
+    # 直连无 graph route 概念:短回复走文本气泡,长回复走结果卡
+    route = "CHAT" if len(result) <= 120 else "WORK"
+    cc = []
 
     # ── 结果卡 / 短回复 ──
     # CHAT 路由 + 内容 ≤ 120 字 → 用 reply_message 纯文本短气泡(轻量),
@@ -1496,11 +1441,105 @@ def _start_group_listener(employee: str, client: lark.Client, app_id: str = "", 
 
 # ── 自主工作循环(脱 LangGraph,直连常驻 CLI)──────────────────────────────────
 
-def _start_scheduler(employee: str) -> None:
+async def _run_cli_with_progress(
+    employee: str, client, *, query: str, thread_id: str,
+    dest_chat_id: str = "", reply_to_msg_id: str = "",
+    trigger_message_id: str = "", self_send: bool = False,
+    task_label: str = "",
+) -> str:
+    """跑该员工常驻 CLI,并在飞书渲染**实时进度卡**(工具调用累积流),返回结果文字。
+
+    reply_to_msg_id 优先(卡挂在用户原消息下);否则 dest_chat_id 新建卡;都没有则无卡。
+    self_send=False:CLI 只返回文字(调用方决定怎么发);True:CLI 自己用飞书 MCP 发。
+    """
+    from agents_v2.shared.cc_executor import run_cc_node, _Callbacks
+    from backend.services import registry as _reg
+    cfg = _reg.get_effective_sync(employee)
+    emoji, name = EMPLOYEE_CONFIG.get(employee, ("👤", employee))
+
+    progress_state: dict = {
+        "employee_name": name, "employee_emoji": emoji,
+        "task": (task_label[:80] + "…") if task_label and len(task_label) > 80 else (task_label or "（处理中）"),
+        "phase": "start", "route": None, "plan_first": "",
+        "steps": [], "task_list": OrderedDict(), "pending_creates": {},
+        "started_at": time.monotonic(), "elapsed": 0.0, "finished": False,
+    }
+    t, c, col = _render_progress(progress_state)
+    pmid = None
+    try:
+        if reply_to_msg_id:
+            pmid = await areply_rich_card(client, reply_to_msg_id, t, c, col)
+        elif dest_chat_id:
+            pmid = await acreate_rich_card(client, dest_chat_id, t, c, col)
+    except Exception as exc:
+        log.warning("progress card 创建失败(%s): %s", employee, exc)
+
+    last_patch_at = [0.0]
+    patch_lock = asyncio.Lock()
+
+    async def _patch(force: bool = False) -> None:
+        if not pmid:
+            return
+        async with patch_lock:
+            now = time.monotonic()
+            if not force and now - last_patch_at[0] < 0.4:
+                return
+            last_patch_at[0] = now
+            progress_state["elapsed"] = now - progress_state["started_at"]
+            tt, cc_, cl = _render_progress(progress_state)
+            try:
+                await apatch_rich_card(client, pmid, tt, cc_, cl)
+            except Exception:
+                pass
+
+    async def _on_ts(tool_id: str, tname: str, targs: dict) -> None:
+        targs = targs or {}
+        if tname in _TASK_TOOLS:
+            if tname == "TaskCreate":
+                progress_state["pending_creates"][tool_id] = {
+                    "subject": targs.get("subject") or targs.get("description") or "(无标题)",
+                    "status": "pending",
+                }
+            else:
+                _apply_task_update(progress_state["task_list"], tname, targs)
+        else:
+            line = _step_line(tname, targs)
+            if not progress_state["steps"] or progress_state["steps"][-1] != line:
+                progress_state["steps"].append(line)
+        if progress_state["phase"] == "start":
+            progress_state["phase"] = "execute"
+        await _patch()
+
+    async def _on_tr(tool_id: str, text: str) -> None:
+        if tool_id and progress_state["pending_creates"].get(tool_id):
+            if _resolve_task_create(progress_state["task_list"], progress_state["pending_creates"], tool_id, text):
+                await _patch()
+
+    cb = _Callbacks()
+    cb.on_tool_start = _on_ts
+    cb.on_tool_result = _on_tr
+    try:
+        text, _sid, _logs = await run_cc_node(
+            employee_key=employee, query=query, cwd=(cfg.cwd if cfg else "") or "",
+            chat_id=dest_chat_id, thread_id=thread_id,
+            feishu_app_id=(cfg.feishu_app_id if cfg else "") or "",
+            feishu_app_secret=(cfg.feishu_app_secret if cfg else "") or "",
+            agent_port=(cfg.agent_port if cfg else "") or "",
+            trigger_message_id=trigger_message_id, callbacks=cb, self_send=self_send,
+        )
+    finally:
+        progress_state["finished"] = True
+        progress_state["phase"] = "done"
+        await _patch(force=True)
+    return _stringify_content(text or "(无输出)") or "(无输出)"
+
+
+def _start_scheduler(employee: str, client=None) -> None:
     """在统一运行时 loop 上起该员工的 AgentScheduler。
 
     agent_fn 直接 run_cc_node(thread_id=sched_* → is_work=True),不经 agents_v2 graph。
     自主工作和聊天共用同一个常驻 CLI,故聊天能 interrupt 正在跑的工作。
+    接到任务真正开干时,给 CEO 单聊推一张实时进度卡(看得到每个员工在干嘛)。
     """
     from agents_v2.shared.scheduler import AgentScheduler
 
@@ -1510,13 +1549,22 @@ def _start_scheduler(employee: str) -> None:
         cfg = _reg.get_effective_sync(employee)
         if not cfg:
             return "ERROR: 员工未注册"
+        thread_id = context.get("task_id", "") or ""   # sched_* → is_work=True
+        # CEO 单聊地址:有则推实时进度卡,让 CEO 看到该员工在干嘛
+        ceo_chat = (cfg.behavior or {}).get("ceo_dm_chat_id") or ""
+        log.info("[sched %s] 接到任务,client=%s ceo_chat=%s → %s",
+                 employee, client is not None, bool(ceo_chat),
+                 "推CEO进度卡" if (client is not None and ceo_chat) else "无卡(缺ceo_dm_chat_id)")
         try:
+            if client is not None and ceo_chat:
+                return await _run_cli_with_progress(
+                    employee, client, query=prompt, thread_id=thread_id,
+                    dest_chat_id=ceo_chat, task_label="🛠 自主工作中(查任务并推进)",
+                )
+            # 没有 CEO 单聊地址 → 无卡,照常跑
             text, _sid, _logs = await run_cc_node(
-                employee_key=employee,
-                query=prompt,
-                cwd=cfg.cwd,
-                chat_id=context.get("chat_id", "") or "",
-                thread_id=context.get("task_id", "") or "",   # sched_* → is_work=True
+                employee_key=employee, query=prompt, cwd=cfg.cwd,
+                chat_id=context.get("chat_id", "") or "", thread_id=thread_id,
                 feishu_app_id=cfg.feishu_app_id or "",
                 feishu_app_secret=cfg.feishu_app_secret or "",
                 agent_port=cfg.agent_port or "",
@@ -1586,6 +1634,9 @@ def _start_cc_req_listener(employee: str) -> None:
                     feishu_app_id=cfg.feishu_app_id or "",
                     feishu_app_secret=cfg.feishu_app_secret or "",
                     agent_port=cfg.agent_port or "", trigger_message_id=trigger,
+                    # 有 reply_to → 调用方拿结果自己渲染,CLI 别自发;否则(fire-forget
+                    # delegate)CLI 自己用飞书 MCP 把答复发出去。
+                    self_send=not bool(reply_to),
                 )  # is_work=False(thread 非 sched_)→ 会打断正在跑的工作
             except CCExecutorFailed as exc:
                 text = f"❌ {employee} 处理失败: {exc}"
@@ -1660,8 +1711,20 @@ def run_bot(employee: str) -> None:
     ).start()
     print(f"  群聊监听器: 已启动")
 
+    # 启动 registry NOTIFY 监听(运行时 loop):让 bot 缓存随 DB 变更刷新,
+    # 否则启动后才捕获的 ceo_dm_chat_id / 改的配置 bot 看不到(进度卡推不出去等)。
+    async def _boot_registry_listener():
+        try:
+            from backend.services import registry as _reg
+            _reg.start_listener()
+            log.info("registry NOTIFY 监听已启动: %s", employee)
+        except Exception as _e:
+            log.warning("registry listener 启动失败: %s", _e)
+    _submit_bg(_boot_registry_listener())
+
     # 启动自主工作循环(同一运行时 loop,与聊天共用常驻 CLI → 聊天可 interrupt 工作)
-    _start_scheduler(employee)
+    # 传 client:接到任务开干时给 CEO 单聊推实时进度卡
+    _start_scheduler(employee, client)
     print(f"  自主工作循环: 已启动")
 
     # 启动 cc_req 监听(同事 delegate / 派单问答 → 同一常驻 CLI,可打断工作)

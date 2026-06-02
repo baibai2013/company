@@ -50,17 +50,27 @@ class _Callbacks:
 
 
 def _frame_prompt(query: str, chat_id: str, thread_id: str,
-                  trigger_message_id: str, is_work: bool) -> str:
+                  trigger_message_id: str, is_work: bool, self_send: bool = True) -> str:
     """一员工一常驻 CLI 模式:把按消息变化的上下文写进 prompt 头(直接传达)。
 
     常驻进程的 MCP env 冻结在首次 spawn,所以 chat_id/thread_id/trigger 不能靠 env,
     必须每条消息显式告诉 claude,并要求它调工具时显式传参。
+
+    self_send=True:由 claude 自己调 send_feishu_message 把回复发出去(跨进程 delegate 用)。
+    self_send=False:调用方(员工自己的 bot)会渲染卡片并发送,claude 只需**直接输出文字回答**,
+    不要调发送工具,避免双重回复。
     """
     # 工作步(定时循环)不需要发消息回某个会话,prompt 头从简,避免污染工作上下文
     if is_work:
         head = "【本轮是后台自主工作,非对话。如需私聊 CEO 汇报请用 report 工具/脚本。】"
         if thread_id:
             head += f"\n【thread_id={thread_id}】"
+        return f"{head}\n\n{query}"
+
+    if not self_send:
+        head = "【本次是对话,直接输出你的回答文字即可,系统会把它发回飞书;不要调用 send_feishu_message / reply_feishu_short 等发送工具(否则会重复发)。】"
+        if thread_id:
+            head += f"\n【需要翻更早历史时:recall_history(..., thread_id=\"{thread_id}\")】"
         return f"{head}\n\n{query}"
 
     lines = ["【本次对话上下文(常驻进程,务必按此传参,勿用默认值)】"]
@@ -94,8 +104,11 @@ async def run_cc_node(
     model: str = "claude-opus-4-7",
     effort: str = "high",
     trigger_message_id: str = "",
+    self_send: bool = True,
 ) -> tuple[str, str | None, list[str]]:
     """跑一次 claude code CLI 完成员工的 WORK 任务。
+
+    self_send=False:调用方会渲染并发送 claude 的返回文字,claude 不要自己调发送工具。
 
     Args:
         employee_key: 员工 key（注入 MCP server env）
@@ -160,7 +173,7 @@ async def run_cc_node(
             cwd=cwd, model=PER_EMPLOYEE_MODEL, effort=PER_EMPLOYEE_EFFORT,
             extra_cli_args=extra_args, cmd_wrapper=_wrap, employee_key=employee_key,
         )
-        framed = _frame_prompt(query, chat_id, thread_id, trigger_message_id, is_work)
+        framed = _frame_prompt(query, chat_id, thread_id, trigger_message_id, is_work, self_send=self_send)
         if not is_work:
             pool.chat_enter(employee_key)
         try:
